@@ -1,38 +1,38 @@
 # xacpp
 
-[中文](./README.zh-CN.md)
+[English](./README.md)
 
-Agent Control Plane Protocol — Rust implementation.
+Agent Control Plane Protocol — Rust 实现。
 
-xacpp defines the communication protocol between an agent and its peers. It provides a layered architecture for request-response messaging with session management over multiple transport backends.
+xacpp 定义了 Agent 与对端之间的通信协议。它提供了分层架构，支持基于请求-响应的消息传递、会话管理，以及多种传输后端。
 
-## Architecture
+## 架构
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  Peer (protocol layer)                                       │
-│  Typed operations + session routing                          │
+│  Peer（协议层）                                                │
+│  类型化操作 + 会话路由                                          │
 ├──────────────────────────────────────────────────────────────┤
-│  Session (session layer)                                     │
-│  Independent session context, sends directly via Transport   │
+│  Session（会话层）                                             │
+│  独立会话上下文，直达 Transport 收发                              │
 ├──────────────────────────────────────────────────────────────┤
-│  Transport (transport layer)                                 │
-│  Envelope assembly, id correlation, pending matching         │
+│  Transport（传输层）                                           │
+│  信封装拆、id 关联、pending 匹配                                 │
 ├──────────────────────────────────────────────────────────────┤
 │  Stdio / TCP / WebSocket                                     │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-## Usage
+## 使用
 
-Add to `Cargo.toml`:
+在 `Cargo.toml` 中添加：
 
 ```toml
 [dependencies]
 xacpp = "0.1"
 ```
 
-### Establish a session (initiator side)
+### 建立会话（发起方）
 
 ```rust
 use std::sync::Arc;
@@ -44,7 +44,7 @@ use xacpp::peer::XacppPeer;
 use xacpp::transport::stdio::StdioTransport;
 use xacpp::transport::XacppTransport;
 
-// Create transport + peer
+// 创建 Transport + Peer
 let transport: Arc<dyn XacppTransport> = Arc::new(StdioTransport::new(/* ... */));
 
 struct MyEstablishHandler;
@@ -62,15 +62,15 @@ impl EstablishHandler for MyEstablishHandler {
 let peer = XacppPeer::new(transport, Arc::new(MyEstablishHandler));
 peer.connect().await?;
 
-// Establish a logical session
+// 建立逻辑会话
 let session = peer.establish(None, Arc::new(my_session_handler)).await?;
 
-// Send commands/events through the session
+// 通过会话发送命令/事件
 let response = session.request_command(XacppCommand::NewActivity).await?;
 session.request_event(XacppEvent::Think { content: "Hello!".into() }).await?;
 ```
 
-### Handle incoming requests (responder side)
+### 处理入站请求（响应方）
 
 ```rust
 struct MySessionHandler;
@@ -87,52 +87,52 @@ impl XacppSessionHandler for MySessionHandler {
 }
 ```
 
-### TCP Transport (for network communication)
+### TCP 传输（网络通信）
 
 ```rust
 use xacpp::transport::socket::SocketTransport;
 
-// Client
+// 客户端
 let client = SocketTransport::connect_to("127.0.0.1:8080".into());
 
-// Server (with accepted TcpStream)
+// 服务端（使用已 accept 的 TcpStream）
 let server = SocketTransport::new(accepted_stream);
 ```
 
 ## API
 
-### Core Types
+### 核心类型
 
-| Type | Description |
-|------|-------------|
-| `XacppTransport` | Transport trait (`connect`, `disconnect`, `send`, `on_request`) |
-| `XacppPeer` | Protocol endpoint with session routing |
-| `XacppSession` | Logical session, sends via Transport directly |
-| `XacppSessionHandler` | Handles inbound Command/Event for a session |
-| `EstablishHandler` | Handles Establish handshake requests |
-| `XacppCommand` | Protocol commands (`Establish`, `NewActivity`, etc.) |
-| `XacppEvent` | Protocol events (Think, ActionRequest, Question, etc.) |
-| `XacppRequest` | Request payload (Command or Event) |
-| `XacppResponse` | Response payload (Established, Acknowledge, Action, etc.) |
-| `XacppError` | Error enum with machine-readable codes |
-| `PeerState` | Peer state enum (Disconnected, Connected) |
+| 类型 | 说明 |
+|------|------|
+| `XacppTransport` | 传输层 trait（`connect`、`disconnect`、`send`、`on_request`） |
+| `XacppPeer` | 协议端点，含会话路由 |
+| `XacppSession` | 逻辑会话，直达 Transport 收发 |
+| `XacppSessionHandler` | 处理会话内的入站 Command/Event |
+| `EstablishHandler` | 处理 Establish 握手请求 |
+| `XacppCommand` | 协议命令（`Establish`、`NewActivity` 等） |
+| `XacppEvent` | 协议事件（Think、ActionRequest、Question 等） |
+| `XacppRequest` | 请求载荷（Command 或 Event） |
+| `XacppResponse` | 响应载荷（Established、Acknowledge、Action 等） |
+| `XacppError` | 错误枚举，含机器可读错误码 |
+| `PeerState` | Peer 状态枚举（Disconnected、Connected） |
 
-### Transport Implementations
+### 传输实现
 
-| Type | Description |
-|------|-------------|
-| `StdioTransport` | Async stdin/stdout JSONL pipe |
-| `SocketTransport` | TCP transport (`TcpStream`), spawn-per-request concurrency |
+| 类型 | 说明 |
+|------|------|
+| `StdioTransport` | 异步 stdin/stdout JSONL 管道 |
+| `SocketTransport` | TCP 传输（`TcpStream`），spawn-per-request 并发模型 |
 
-## Wire Protocol
+## 线路协议
 
-JSONL (one JSON object per line) with envelope structure:
+JSONL（每行一个 JSON 对象），信封结构：
 
 ```json
 {"type":"request","id":"r1","payload":{"kind":"command","payload":{"establish":{"credentials":null}}}}
 {"type":"response","id":"r1","payload":{"kind":"established","sessionId":"s1"}}
 ```
 
-## License
+## 许可证
 
 MIT
