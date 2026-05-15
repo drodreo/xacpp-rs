@@ -77,10 +77,10 @@ async fn test_concurrent_requests_independent_processing() {
         Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
             let sid = match payload {
-                XacppRequest::Command(XacppCommand::NewActivity) => "new",
-                XacppRequest::Command(XacppCommand::InvokeActivity) => "invoke",
-                XacppRequest::Command(XacppCommand::CompactActivity) => "compact",
-                XacppRequest::Command(XacppCommand::CancelActivity) => "cancel",
+                XacppRequest::Command(XacppCommand::NewActivity { .. }) => "new",
+                XacppRequest::Command(XacppCommand::InvokeActivity { .. }) => "invoke",
+                XacppRequest::Command(XacppCommand::CompactActivity { .. }) => "compact",
+                XacppRequest::Command(XacppCommand::CancelActivity { .. }) => "cancel",
                 XacppRequest::Command(XacppCommand::Establish { .. }) => "establish",
                 _ => "other",
             };
@@ -94,10 +94,10 @@ async fn test_concurrent_requests_independent_processing() {
     let (client, _server) = socket_pair(server_handler).await;
 
     let commands = [
-        XacppCommand::NewActivity,
-        XacppCommand::InvokeActivity,
-        XacppCommand::CompactActivity,
-        XacppCommand::CancelActivity,
+        XacppCommand::NewActivity { title: None },
+        XacppCommand::InvokeActivity { activity: "act-1".into(), messages: vec![] },
+        XacppCommand::CompactActivity { activity: "act-1".into() },
+        XacppCommand::CancelActivity { activity: "act-1".into() },
         XacppCommand::Establish { credentials: None },
     ];
 
@@ -167,7 +167,7 @@ async fn test_concurrent_write_no_data_corruption() {
     for _ in 0..10 {
         let c = Arc::clone(&client);
         handles.push(tokio::spawn(async move {
-            timeout_5s(c.send(None, XacppRequest::Command(XacppCommand::NewActivity)))
+            timeout_5s(c.send(None, XacppRequest::Command(XacppCommand::NewActivity { title: None })))
                 .await
                 .unwrap()
         }));
@@ -216,7 +216,7 @@ async fn test_disconnect_aborts_inflight_no_deadlock() {
     for _ in 0..3 {
         let c = Arc::clone(&client);
         send_handles.push(tokio::spawn(async move {
-            c.send(None, XacppRequest::Command(XacppCommand::NewActivity))
+            c.send(None, XacppRequest::Command(XacppCommand::NewActivity { title: None }))
                 .await
         }));
     }

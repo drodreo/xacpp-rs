@@ -3,6 +3,7 @@
 //! `XacppEvent` fully maps to x-agent's `AgentEvent`,
 //! serving as the standardized event stream between xagent and peers (e.g., xabot).
 
+pub mod activity_event;
 pub mod content;
 pub mod interaction;
 pub mod payload;
@@ -21,3 +22,4 @@ pub use payload::{
 };
 pub use upload::{TokenUsage, UploadEvent};
 pub use xacpp_event::XacppEvent;
+pub use activity_event::XacppActivityEvent;

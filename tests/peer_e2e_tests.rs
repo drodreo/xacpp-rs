@@ -16,7 +16,7 @@ use xacpp::commands::XacppCommand;
 use xacpp::error::XacppError;
 use xacpp::events::interaction::{ActionRequestEvent, ActionResponse};
 use xacpp::events::payload::AlertLevel;
-use xacpp::events::XacppEvent;
+use xacpp::events::{XacppActivityEvent, XacppEvent};
 use xacpp::handler::{EstablishHandler, XacppSessionHandler};
 use xacpp::message::{XacppRequest, XacppResponse};
 use xacpp::peer::{PeerState, XacppPeer};
@@ -34,7 +34,7 @@ impl XacppSessionHandler for TestSessionHandler {
         Ok(XacppResponse::Acknowledge)
     }
 
-    async fn on_event(&self, _event: XacppEvent) -> Result<XacppResponse, XacppError> {
+    async fn on_event(&self, _event: XacppActivityEvent) -> Result<XacppResponse, XacppError> {
         Ok(XacppResponse::Acknowledge)
     }
 }
@@ -67,7 +67,7 @@ impl XacppSessionHandler for IdentifiedHandler {
         })
     }
 
-    async fn on_event(&self, _event: XacppEvent) -> Result<XacppResponse, XacppError> {
+    async fn on_event(&self, _event: XacppActivityEvent) -> Result<XacppResponse, XacppError> {
         Ok(XacppResponse::Established {
             session_id: self.id.clone(),
             credentials: None,
@@ -182,7 +182,7 @@ async fn test_transport_send_establish() {
 async fn test_transport_send_event_acknowledge() {
     let (transport_a, transport_b) = duplex_pair();
 
-    let (notify_tx, mut notify_rx) = mpsc::channel::<XacppEvent>(10);
+    let (notify_tx, mut notify_rx) = mpsc::channel::<XacppActivityEvent>(10);
     transport_b.on_request(Arc::new(move |_session_id, payload| {
         let tx = notify_tx.clone();
         Box::pin(async move {
@@ -199,8 +199,11 @@ async fn test_transport_send_event_acknowledge() {
 
     let response = timeout(transport_a.send(
         Some("s1"),
-        XacppRequest::Event(XacppEvent::Think {
-            content: "hello".into(),
+        XacppRequest::Event(XacppActivityEvent {
+            activity: "test-act".into(),
+            event: XacppEvent::Think {
+                content: "hello".into(),
+            },
         }),
     ))
     .await
@@ -209,7 +212,7 @@ async fn test_transport_send_event_acknowledge() {
     assert!(matches!(response, XacppResponse::Acknowledge));
 
     let evt = timeout(notify_rx.recv()).await.unwrap();
-    match evt {
+    match evt.event {
         XacppEvent::Think { content } => assert_eq!(content, "hello"),
         other => panic!("expected Think, got: {other:?}"),
     }
@@ -219,10 +222,10 @@ async fn test_transport_send_event_acknowledge() {
 async fn test_transport_send_interactive_event() {
     let (transport_a, transport_b) = duplex_pair();
 
-    transport_b.on_request(Arc::new(|session_id, payload| {
+    transport_b.on_request(Arc::new(move |_session_id, payload| {
         Box::pin(async move {
-            match (session_id, payload) {
-                (Some(_), XacppRequest::Event(XacppEvent::ActionRequest(e))) => {
+            match payload {
+                XacppRequest::Event(XacppActivityEvent { event: XacppEvent::ActionRequest(e), .. }) => {
                     Ok(XacppResponse::Action {
                         request_id: e.request_id.clone(),
                         response: ActionResponse::Approve,
@@ -239,15 +242,18 @@ async fn test_transport_send_interactive_event() {
 
     let response = timeout(transport_a.send(
         Some("s1"),
-        XacppRequest::Event(XacppEvent::ActionRequest(ActionRequestEvent {
-            request_id: "req-1".into(),
-            tool_name: "bash".into(),
-            arguments: "{}".into(),
-            action_id: "act-1".into(),
-            description: "test".into(),
-            alert: AlertLevel::Info,
-            responder: None,
-        })),
+        XacppRequest::Event(XacppActivityEvent {
+            activity: "test-act".into(),
+            event: XacppEvent::ActionRequest(ActionRequestEvent {
+                request_id: "req-1".into(),
+                tool_name: "bash".into(),
+                arguments: "{}".into(),
+                action_id: "act-1".into(),
+                description: "test".into(),
+                alert: AlertLevel::Info,
+                responder: None,
+            }),
+        }),
     ))
     .await
     .unwrap();
@@ -401,7 +407,7 @@ async fn test_session_request_command() {
     let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
     let session = timeout(peer_a.establish(None, handler)).await.unwrap();
 
-    let response = timeout(session.request_command(XacppCommand::NewActivity))
+    let response = timeout(session.request_command(XacppCommand::NewActivity { title: None }))
         .await
         .unwrap();
 
@@ -415,8 +421,11 @@ async fn test_session_request_event() {
     let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
     let session = timeout(peer_a.establish(None, handler)).await.unwrap();
 
-    let response = timeout(session.request_event(XacppEvent::Think {
-        content: "hi".into(),
+    let response = timeout(session.request_event(XacppActivityEvent {
+        activity: "test-act".into(),
+        event: XacppEvent::Think {
+            content: "hi".into(),
+        },
     }))
     .await
     .unwrap();
@@ -515,10 +524,10 @@ async fn test_concurrent_requests_id_matching() {
             let sid = if let XacppRequest::Command(cmd) = payload {
                 match cmd {
                     XacppCommand::Establish { .. } => "establish",
-                    XacppCommand::NewActivity => "new",
-                    XacppCommand::InvokeActivity => "invoke",
-                    XacppCommand::CompactActivity => "compact",
-                    XacppCommand::CancelActivity => "cancel",
+                    XacppCommand::NewActivity { .. } => "new",
+                    XacppCommand::InvokeActivity { .. } => "invoke",
+                    XacppCommand::CompactActivity { .. } => "compact",
+                    XacppCommand::CancelActivity { .. } => "cancel",
                 }
             } else {
                 "event"
@@ -536,10 +545,10 @@ async fn test_concurrent_requests_id_matching() {
 
     let commands = [
         XacppCommand::Establish { credentials: None },
-        XacppCommand::NewActivity,
-        XacppCommand::InvokeActivity,
-        XacppCommand::CompactActivity,
-        XacppCommand::CancelActivity,
+        XacppCommand::NewActivity { title: None },
+        XacppCommand::InvokeActivity { activity: "act-1".into(), messages: vec![] },
+        XacppCommand::CompactActivity { activity: "act-1".into() },
+        XacppCommand::CancelActivity { activity: "act-1".into() },
     ];
 
     // Concurrently send 5 requests
@@ -637,7 +646,7 @@ async fn test_multi_session_routing_isolation() {
     assert_ne!(sid_1, sid_2, "two sessions must have different IDs");
 
     // Send command via session_1 → B side routes to handler-1 → response session_id = "handler-1"
-    let resp_1 = timeout(session_1.request_command(XacppCommand::NewActivity))
+    let resp_1 = timeout(session_1.request_command(XacppCommand::NewActivity { title: None }))
         .await
         .unwrap();
     match resp_1 {
@@ -648,7 +657,7 @@ async fn test_multi_session_routing_isolation() {
     }
 
     // Send command via session_2 → B side routes to handler-2 → response session_id = "handler-2"
-    let resp_2 = timeout(session_2.request_command(XacppCommand::NewActivity))
+    let resp_2 = timeout(session_2.request_command(XacppCommand::NewActivity { title: None }))
         .await
         .unwrap();
     match resp_2 {
@@ -659,7 +668,7 @@ async fn test_multi_session_routing_isolation() {
     }
 
     // Cross-validation: session_1 sends again, still routes to handler-1
-    let resp_1_again = timeout(session_1.request_command(XacppCommand::CancelActivity))
+    let resp_1_again = timeout(session_1.request_command(XacppCommand::CancelActivity { activity: "act-1".into() }))
         .await
         .unwrap();
     match resp_1_again {

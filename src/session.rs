@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::commands::XacppCommand;
 use crate::error::XacppError;
-use crate::events::XacppEvent;
+use crate::events::XacppActivityEvent;
 use crate::message::{XacppRequest, XacppResponse};
 use crate::transport::XacppTransport;
 
@@ -59,7 +59,7 @@ impl XacppSession {
     /// Sends an event and waits for a response.
     pub async fn request_event(
         &self,
-        event: XacppEvent,
+        event: XacppActivityEvent,
     ) -> Result<XacppResponse, XacppError> {
         self.transport
             .send(Some(&self.session_id), XacppRequest::Event(event))

@@ -108,7 +108,7 @@ pub struct ActivityStartEvent {
     /// Task goal summary.
     pub goal: String,
     /// SubActivity unique identifier.
-    pub activity_id: String,
+    pub activity: String,
     /// Additional metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<std::collections::HashMap<String, String>>,

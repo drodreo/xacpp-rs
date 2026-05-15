@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::commands::XacppCommand;
 use crate::error::XacppError;
-use crate::events::XacppEvent;
+use crate::events::XacppActivityEvent;
 use crate::handler::{EstablishHandler, XacppSessionHandler};
 use crate::message::{XacppRequest, XacppResponse};
 use crate::session::XacppSession;
@@ -133,7 +133,7 @@ impl XacppPeer {
                     }
                 }
             })
-        }))?;;
+        }))?;
 
         self.transport.connect().await?;
         let mut inner = self.inner.lock().await;
@@ -213,7 +213,7 @@ impl XacppPeer {
     pub async fn request_event(
         &self,
         session_id: Option<&str>,
-        event: XacppEvent,
+        event: XacppActivityEvent,
     ) -> Result<XacppResponse, XacppError> {
         self.transport
             .send(session_id, XacppRequest::Event(event))

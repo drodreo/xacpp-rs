@@ -55,9 +55,9 @@ pub enum XacppEvent {
     /// SubActivity task started execution.
     ActivityStart(ActivityStartEvent),
     /// SubActivity task completed.
-    ActivityDone { activity_id: String },
+    ActivityDone { activity: String },
     /// SubActivity aborted by user.
-    ActivityAborted { activity_id: String, reason: String },
+    ActivityAborted { activity: String, reason: String },
 
     // ---- Tool Calls ----
 

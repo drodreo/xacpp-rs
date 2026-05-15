@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::events::content::ContentPart;
+
 /// XACPP protocol command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,14 +23,28 @@ pub enum XacppCommand {
     },
 
     /// Create a new Activity session.
-    NewActivity,
+    NewActivity {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
 
     /// Invoke an existing Activity to perform operations.
-    InvokeActivity,
+    InvokeActivity {
+        /// Target activity identifier.
+        activity: String,
+        /// Input messages for the activity.
+        messages: Vec<ContentPart>,
+    },
 
     /// Compact Activity (reclaim resources / generate snapshot summary).
-    CompactActivity,
+    CompactActivity {
+        /// Target activity identifier.
+        activity: String,
+    },
 
     /// Cancel Activity.
-    CancelActivity,
+    CancelActivity {
+        /// Target activity identifier.
+        activity: String,
+    },
 }

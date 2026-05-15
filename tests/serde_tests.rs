@@ -3,7 +3,7 @@
 //! Verifies round-trip of envelope layer + payload layer, including type tag routing and payload nested structures.
 
 use xacpp::commands::XacppCommand;
-use xacpp::events::XacppEvent;
+use xacpp::events::{XacppActivityEvent, XacppEvent};
 use xacpp::events::interaction::{
     ActionRequestEvent, ActionResponse, QuestionEvent,
     SensitiveInfoOperationEvent, SensitiveInfoOperation, SensitiveInfoType,
@@ -121,7 +121,7 @@ fn test_wire_request_command_roundtrip() {
 
 #[test]
 fn test_wire_request_event_roundtrip() {
-    let event = XacppEvent::ActionRequest(ActionRequestEvent {
+    let inner_event = XacppEvent::ActionRequest(ActionRequestEvent {
         request_id: "req-1".into(),
         tool_name: "bash".into(),
         arguments: "{}".into(),
@@ -133,7 +133,10 @@ fn test_wire_request_event_roundtrip() {
     let wire = XacppEnvelope::Request {
         id: "r2".into(),
         session_id: None,
-        payload: XacppRequest::Event(event),
+        payload: XacppRequest::Event(XacppActivityEvent {
+            activity: "test-act".into(),
+            event: inner_event,
+        }),
     };
     let json = serde_json::to_string(&wire).unwrap();
     assert!(json.contains(r#""type":"request""#), "json: {json}");
@@ -146,7 +149,7 @@ fn test_wire_request_event_roundtrip() {
         XacppEnvelope::Request { id, session_id: _, payload } => {
             assert_eq!(id, "r2");
             match payload {
-                XacppRequest::Event(XacppEvent::ActionRequest(e)) => {
+                XacppRequest::Event(XacppActivityEvent { event: XacppEvent::ActionRequest(e), .. }) => {
                     assert_eq!(e.request_id, "req-1");
                 }
                 other => panic!("unexpected: {other:?}"),

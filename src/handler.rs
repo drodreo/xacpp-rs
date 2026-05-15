@@ -14,7 +14,7 @@ use async_trait::async_trait;
 
 use crate::commands::XacppCommand;
 use crate::error::XacppError;
-use crate::events::XacppEvent;
+use crate::events::XacppActivityEvent;
 use crate::message::{XacppRequest, XacppResponse};
 use crate::transport::XacppTransport;
 
@@ -44,7 +44,7 @@ pub trait XacppSessionHandler: Send + Sync {
     async fn on_command(&self, command: XacppCommand) -> Result<XacppResponse, XacppError>;
 
     /// Handles Event.
-    async fn on_event(&self, event: XacppEvent) -> Result<XacppResponse, XacppError>;
+    async fn on_event(&self, event: XacppActivityEvent) -> Result<XacppResponse, XacppError>;
 }
 
 /// Peer Establish request handler — serve main function.
@@ -52,6 +52,17 @@ pub trait XacppSessionHandler: Send + Sync {
 /// Responder invokes this when receiving Establish command from the peer.
 /// Developer completes credential verification, creates and holds Session (for subsequent outgoing messages),
 /// creates SessionHandler and returns it. Returning Err rejects the handshake.
+///
+/// ## Identity Contract
+///
+/// `credentials` is an identity **anchor** — it never carries user/agent identity directly.
+/// Both sides maintain their own internal identity mapping:
+///
+/// - On first connection (`credentials == None`): the responder performs a trust process,
+///   internally associates this connection with a specific user and agent, then issues credentials
+///   as an opaque handle to that identity. Neither side transmits user/agent over the wire.
+/// - On subsequent connections: the initiator presents saved credentials, the responder looks up
+///   the previously associated identity and routes accordingly.
 #[async_trait]
 pub trait EstablishHandler: Send + Sync {
     /// Handles Establish request.

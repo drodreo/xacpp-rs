@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::commands::XacppCommand;
-use crate::events::XacppEvent;
+use crate::events::XacppActivityEvent;
 use crate::events::{ActionResponse, QuestionResponse, SensitiveInfoOperationResponse};
 
 // ---- Payload Types ----
@@ -32,7 +32,7 @@ pub enum XacppRequest {
     /// Protocol command.
     Command(XacppCommand),
     /// Protocol event.
-    Event(XacppEvent),
+    Event(XacppActivityEvent),
 }
 
 /// Response payload.
@@ -69,6 +69,13 @@ pub enum XacppResponse {
         request_id: String,
         #[serde(flatten)]
         response: SensitiveInfoOperationResponse,
+    },
+    /// Activity created response.
+    ActivityCreated {
+        activity: String,
+        agent: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
     },
     /// Generic acknowledge: request processed successfully, no data returned.
     Acknowledge,
