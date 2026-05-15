@@ -98,11 +98,11 @@ impl XacppPeer {
                                 crate::handler::EstablishDecision::ChallengeRequired { challenge } => {
                                     Ok(XacppResponse::EstablishPrepare { challenge })
                                 }
-                                crate::handler::EstablishDecision::Established { session_id, handler } => {
+                                crate::handler::EstablishDecision::Established { session_id, handler, credentials } => {
                                     sessions.write().await.insert(session_id.clone(), handler);
                                     Ok(XacppResponse::Established {
                                         session_id,
-                                        credentials: None,
+                                        credentials,
                                     })
                                 }
                             },
@@ -112,11 +112,11 @@ impl XacppPeer {
                     // Pre-session EstablishConfirm request
                     (None, XacppRequest::Command(XacppCommand::EstablishConfirm)) => {
                         match establish_handler.on_establish_confirm(transport).await {
-                            Ok((sid, handler)) => {
+                            Ok((sid, handler, creds)) => {
                                 sessions.write().await.insert(sid.clone(), handler);
                                 Ok(XacppResponse::Established {
                                     session_id: sid,
-                                    credentials: None,
+                                    credentials: creds,
                                 })
                             }
                             Err(e) => Err(e),

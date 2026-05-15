@@ -45,8 +45,7 @@ pub enum XacppResponse {
     /// Handshake successful: session identifier and credentials issued.
     Established {
         session_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        credentials: Option<String>,
+        credentials: String,
     },
     /// Challenge issued during first-time establishment.
     EstablishPrepare {

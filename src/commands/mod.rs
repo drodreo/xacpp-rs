@@ -50,4 +50,9 @@ pub enum XacppCommand {
         /// Target activity identifier.
         activity: String,
     },
+
+    /// Send a message outside of any activity context.
+    Message {
+        content: Vec<ContentPart>,
+    },
 }

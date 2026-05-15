@@ -86,7 +86,7 @@ async fn test_concurrent_requests_independent_processing() {
             };
             Ok(XacppResponse::Established {
                 session_id: sid.into(),
-                credentials: None,
+                credentials: "auto-creds".into(),
             })
         }) as _
     });
@@ -155,7 +155,7 @@ async fn test_concurrent_write_no_data_corruption() {
         Box::pin(async move {
             Ok(XacppResponse::Established {
                 session_id: text,
-                credentials: None,
+                credentials: "auto-creds".into(),
             })
         }) as _
     });

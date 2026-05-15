@@ -164,7 +164,7 @@ fn test_wire_response_established_roundtrip() {
     let wire = XacppEnvelope::Response {
         id: "r1".into(),
         session_id: None,
-        payload: XacppResponse::Established { session_id: "123456".into(), credentials: None },
+        payload: XacppResponse::Established { session_id: "123456".into(), credentials: "test-creds".into() },
     };
     let json = serde_json::to_string(&wire).unwrap();
     assert!(json.contains(r#""type":"response""#), "json: {json}");
@@ -322,7 +322,7 @@ fn test_deserialize_request_from_json() {
 
 #[test]
 fn test_deserialize_response_from_json() {
-    let json = br#"{"type":"response","id":"r1","payload":{"kind":"established","sessionId":"s1","credentials":null}}"#;
+    let json = br#"{"type":"response","id":"r1","payload":{"kind":"established","sessionId":"s1","credentials":"test-creds"}}"#;
     let de: XacppEnvelope = serde_json::from_slice(json).unwrap();
     match de {
         XacppEnvelope::Response { id, session_id: _, .. } => assert_eq!(id, "r1"),

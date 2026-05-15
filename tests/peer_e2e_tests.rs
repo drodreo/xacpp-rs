@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 
 use xacpp::commands::XacppCommand;
 use xacpp::error::XacppError;
+use xacpp::events::content::{ContentPart, TextPart};
 use xacpp::events::interaction::{ActionRequestEvent, ActionResponse};
 use xacpp::events::payload::AlertLevel;
 use xacpp::events::{XacppActivityEvent, XacppEvent};
@@ -52,18 +53,19 @@ impl EstablishHandler for AutoApproveEstablishHandler {
         Ok(EstablishDecision::Established {
             session_id: "auto-sid".into(),
             handler: Arc::new(TestSessionHandler),
+            credentials: "auto-creds".into(),
         })
     }
 
     async fn on_establish_confirm(
         &self,
         _transport: Arc<dyn XacppTransport>,
-    ) -> Result<(String, Arc<dyn XacppSessionHandler>), XacppError> {
-        Ok(("auto-sid".into(), Arc::new(TestSessionHandler)))
+    ) -> Result<(String, Arc<dyn XacppSessionHandler>, String), XacppError> {
+        Ok(("auto-sid".into(), Arc::new(TestSessionHandler), "issued-creds".into()))
     }
 }
 
-/// Challenge-aware handler: on_establish returns ChallengeRequired, on_establish_confirm returns (sid, handler).
+/// Challenge-aware handler: on_establish returns ChallengeRequired, on_establish_confirm returns (sid, handler, creds).
 struct ChallengeEstablishHandler;
 
 #[async_trait::async_trait]
@@ -81,8 +83,8 @@ impl EstablishHandler for ChallengeEstablishHandler {
     async fn on_establish_confirm(
         &self,
         _transport: Arc<dyn XacppTransport>,
-    ) -> Result<(String, Arc<dyn XacppSessionHandler>), XacppError> {
-        Ok(("challenge-sid".into(), Arc::new(TestSessionHandler)))
+    ) -> Result<(String, Arc<dyn XacppSessionHandler>, String), XacppError> {
+        Ok(("challenge-sid".into(), Arc::new(TestSessionHandler), "issued-creds".into()))
     }
 }
 
@@ -96,14 +98,14 @@ impl XacppSessionHandler for IdentifiedHandler {
     async fn on_command(&self, _command: XacppCommand) -> Result<XacppResponse, XacppError> {
         Ok(XacppResponse::Established {
             session_id: self.id.clone(),
-            credentials: None,
+            credentials: "auto-creds".into(),
         })
     }
 
     async fn on_event(&self, _event: XacppActivityEvent) -> Result<XacppResponse, XacppError> {
         Ok(XacppResponse::Established {
             session_id: self.id.clone(),
-            credentials: None,
+            credentials: "auto-creds".into(),
         })
     }
 }
@@ -133,16 +135,17 @@ impl EstablishHandler for SequencedEstablishHandler {
         Ok(EstablishDecision::Established {
             session_id: sid.clone(),
             handler: Arc::new(IdentifiedHandler { id: sid }),
+            credentials: "auto-creds".into(),
         })
     }
 
     async fn on_establish_confirm(
         &self,
         _transport: Arc<dyn XacppTransport>,
-    ) -> Result<(String, Arc<dyn XacppSessionHandler>), XacppError> {
+    ) -> Result<(String, Arc<dyn XacppSessionHandler>, String), XacppError> {
         let n = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sid = format!("handler-{n}");
-        Ok((sid.clone(), Arc::new(IdentifiedHandler { id: sid })))
+        Ok((sid.clone(), Arc::new(IdentifiedHandler { id: sid }), "issued-creds".into()))
     }
 }
 
@@ -198,7 +201,7 @@ async fn test_transport_send_establish() {
                 (None, XacppRequest::Command(XacppCommand::Establish { .. })) => {
                     Ok(XacppResponse::Established {
                         session_id: "sid-1".into(),
-                        credentials: None,
+                        credentials: "auto-creds".into(),
                     })
                 }
                 _ => Ok(XacppResponse::Acknowledge),
@@ -375,7 +378,7 @@ async fn test_transport_bidirectional() {
         Box::pin(async move {
             Ok(XacppResponse::Established {
                 session_id: "from-a".into(),
-                credentials: None,
+                credentials: "auto-creds".into(),
             })
         })
     }))
@@ -385,7 +388,7 @@ async fn test_transport_bidirectional() {
         Box::pin(async move {
             Ok(XacppResponse::Established {
                 session_id: "from-b".into(),
-                credentials: None,
+                credentials: "auto-creds".into(),
             })
         })
     }))
@@ -442,7 +445,7 @@ async fn test_peer_establish() {
     let session = timeout(peer_a.establish(None, handler, |_| Ok(()))).await.unwrap();
 
     assert!(!session.session_id().is_empty());
-    assert!(session.credentials().is_none());
+    assert_eq!(session.credentials(), "auto-creds");
 }
 
 #[tokio::test]
@@ -574,13 +577,14 @@ async fn test_concurrent_requests_id_matching() {
                     XacppCommand::InvokeActivity { .. } => "invoke",
                     XacppCommand::CompactActivity { .. } => "compact",
                     XacppCommand::CancelActivity { .. } => "cancel",
+                    XacppCommand::Message { .. } => "message",
                 }
             } else {
                 "event"
             };
             Ok(XacppResponse::Established {
                 session_id: sid.into(),
-                credentials: None,
+                credentials: "auto-creds".into(),
             })
         })
     }))
@@ -747,4 +751,38 @@ async fn test_peer_establish_challenge_flow() {
 
     assert!(challenge_received, "verify_challenge must be called");
     assert_eq!(session.session_id(), "challenge-sid");
+}
+
+#[tokio::test]
+async fn test_peer_establish_challenge_issues_credentials() {
+    let (transport_a, transport_b) = duplex_pair();
+    let peer_a = XacppPeer::new(transport_a, Arc::new(ChallengeEstablishHandler));
+    let peer_b = XacppPeer::new(transport_b, Arc::new(ChallengeEstablishHandler));
+    peer_a.connect().await.unwrap();
+    peer_b.connect().await.unwrap();
+
+    let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
+    let session = timeout(peer_a.establish(None, handler, |challenge| {
+        assert_eq!(challenge, "test-challenge");
+        Ok(())
+    }))
+    .await
+    .unwrap();
+
+    assert_eq!(session.session_id(), "challenge-sid");
+    assert_eq!(session.credentials(), "issued-creds");
+}
+
+#[tokio::test]
+async fn test_session_send_message() {
+    let (peer_a, _peer_b) = connected_peers().await;
+    let session = timeout(peer_a.establish(None, Arc::new(TestSessionHandler), |_| Ok(())))
+        .await
+        .unwrap();
+    let response = timeout(session.request_command(
+        XacppCommand::Message { content: vec![ContentPart::Text(TextPart { text: "hello".into(), part_id: None })] }
+    ))
+    .await
+    .unwrap();
+    assert!(matches!(response, XacppResponse::Acknowledge));
 }

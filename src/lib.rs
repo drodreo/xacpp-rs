@@ -35,9 +35,9 @@
 //! the `type` field routes requests/responses, `payload` carries the payload:
 //!
 //! ```json
-//! Request: {"type":"request","id":"r1","payload":{"kind":"command","payload":{"establish":{"credentials":null}}}}
-//! Request: {"type":"request","id":"r2","session_id":"s1","payload":{"kind":"event","payload":{"type":"think","content":"hi"}}}
-//! Response: {"type":"response","id":"r1","payload":{"kind":"established","sessionId":"s1","credentials":null}}
+//! Request: {"type":"request","id":"r1","payload":{"kind":"command","payload":{"establish":{}}}}
+//! Request: {"type":"request","id":"r2","session_id":"s1","payload":{"kind":"event","payload":{"activity":"act-1","event":{"type":"think","content":"hi"}}}}
+//! Response: {"type":"response","id":"r1","payload":{"kind":"established","sessionId":"s1","credentials":"issued-creds"}}
 //! Response: {"type":"response","id":"r2","session_id":"s1","payload":{"kind":"action","requestId":"req-1","type":"approve"}}
 //! ```
 //!

@@ -57,6 +57,7 @@ pub enum EstablishDecision {
     Established {
         session_id: String,
         handler: Arc<dyn XacppSessionHandler>,
+        credentials: String,
     },
 }
 
@@ -89,9 +90,9 @@ pub trait EstablishHandler: Send + Sync {
     ) -> Result<EstablishDecision, XacppError>;
 
     /// Phase 3: EstablishConfirm received (challenge path only).
-    /// Returns the session_id and handler for the newly created session.
+    /// Returns the session_id, handler, and issued credentials for the newly created session.
     async fn on_establish_confirm(
         &self,
         transport: Arc<dyn XacppTransport>,
-    ) -> Result<(String, Arc<dyn XacppSessionHandler>), XacppError>;
+    ) -> Result<(String, Arc<dyn XacppSessionHandler>, String), XacppError>;
 }

@@ -18,14 +18,14 @@ use crate::transport::XacppTransport;
 pub struct XacppSession {
     transport: Arc<dyn XacppTransport>,
     session_id: String,
-    credentials: Option<String>,
+    credentials: String,
 }
 
 impl XacppSession {
     pub(crate) fn new(
         transport: Arc<dyn XacppTransport>,
         session_id: String,
-        credentials: Option<String>,
+        credentials: String,
     ) -> Self {
         Self {
             transport,
@@ -42,8 +42,8 @@ impl XacppSession {
     /// Credentials issued by the responder.
     ///
     /// Caller can save them and pass them in during next `establish`.
-    pub fn credentials(&self) -> Option<&str> {
-        self.credentials.as_deref()
+    pub fn credentials(&self) -> &str {
+        &self.credentials
     }
 
     /// Sends a command and waits for a response.
