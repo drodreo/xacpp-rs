@@ -18,6 +18,9 @@ use super::{RequestHandler, XacppTransport};
 use crate::error::XacppError;
 use crate::message::{XacppEnvelope, XacppRequest, XacppResponse};
 
+type BoxedWriter = Pin<Box<dyn AsyncWrite + Send>>;
+type BoxedReader = Pin<Box<dyn AsyncBufRead + Send>>;
+
 /// Shared state: accessed via Arc between reader task and inflight handler tasks.
 struct SharedState {
     request_handler: RwLock<Option<RequestHandler>>,
@@ -31,8 +34,8 @@ struct SharedState {
 
 /// Socket Transport Implementation.
 pub struct SocketTransport {
-    writer: Arc<Mutex<Option<Pin<Box<dyn AsyncWrite + Send>>>>>,
-    reader: Mutex<Option<Pin<Box<dyn AsyncBufRead + Send>>>>,
+    writer: Arc<Mutex<Option<BoxedWriter>>>,
+    reader: Mutex<Option<BoxedReader>>,
     shared: Arc<SharedState>,
     next_id: Arc<AtomicU64>,
     /// Remote address for client mode, used during connect.
@@ -89,7 +92,7 @@ impl SocketTransport {
 
     /// Serialize wire message and send (JSONL format).
     async fn send_envelope(
-        writer: &Arc<Mutex<Option<Pin<Box<dyn AsyncWrite + Send>>>>>,
+        writer: &Arc<Mutex<Option<BoxedWriter>>>,
         msg: &XacppEnvelope,
     ) -> Result<(), XacppError> {
         let json = serde_json::to_vec(msg).map_err(|e| XacppError::Internal(e.to_string()))?;
@@ -106,7 +109,7 @@ impl SocketTransport {
     /// Reader task: read frames from TCP connection, parse, dispatch.
     async fn reader_task(
         mut frame_rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
-        writer: Arc<Mutex<Option<Pin<Box<dyn AsyncWrite + Send>>>>>,
+        writer: Arc<Mutex<Option<BoxedWriter>>>,
         shared: Arc<SharedState>,
     ) {
         while let Some(result) = frame_rx.recv().await {
@@ -208,7 +211,7 @@ impl XacppTransport for SocketTransport {
             let (read_half, write_half) = tokio::io::split(stream);
             *self.writer.lock().await = Some(Box::pin(write_half));
             Box::pin(tokio::io::BufReader::new(read_half))
-                as Pin<Box<dyn AsyncBufRead + Send>>
+                as BoxedReader
         } else {
             self.reader
                 .lock()

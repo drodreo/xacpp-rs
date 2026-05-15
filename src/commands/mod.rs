@@ -22,6 +22,9 @@ pub enum XacppCommand {
         credentials: Option<String>,
     },
 
+    /// Confirm establishment after challenge verification (phase 3 of 3-way handshake).
+    EstablishConfirm,
+
     /// Create a new Activity session.
     NewActivity {
         #[serde(skip_serializing_if = "Option::is_none")]

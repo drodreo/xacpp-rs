@@ -94,6 +94,24 @@ impl XacppPeer {
                     // Pre-session Establish request
                     (None, XacppRequest::Command(XacppCommand::Establish { credentials })) => {
                         match establish_handler.on_establish(transport, credentials).await {
+                            Ok(decision) => match decision {
+                                crate::handler::EstablishDecision::ChallengeRequired { challenge } => {
+                                    Ok(XacppResponse::EstablishPrepare { challenge })
+                                }
+                                crate::handler::EstablishDecision::Established { session_id, handler } => {
+                                    sessions.write().await.insert(session_id.clone(), handler);
+                                    Ok(XacppResponse::Established {
+                                        session_id,
+                                        credentials: None,
+                                    })
+                                }
+                            },
+                            Err(e) => Err(e),
+                        }
+                    }
+                    // Pre-session EstablishConfirm request
+                    (None, XacppRequest::Command(XacppCommand::EstablishConfirm)) => {
+                        match establish_handler.on_establish_confirm(transport).await {
                             Ok((sid, handler)) => {
                                 sessions.write().await.insert(sid.clone(), handler);
                                 Ok(XacppResponse::Established {
@@ -147,10 +165,14 @@ impl XacppPeer {
     ///
     /// Sends Establish command to the peer with optional authentication credentials and session handler.
     /// Handler is registered to Peer routing table, Session is responsible for sending.
+    ///
+    /// If the responder returns `EstablishPrepare` (challenge path), `verify_challenge` is invoked
+    /// to validate the challenge; on success, an `EstablishConfirm` is sent to complete the handshake.
     pub async fn establish(
         &self,
         credentials: Option<String>,
         handler: Arc<dyn XacppSessionHandler>,
+        verify_challenge: impl FnOnce(String) -> Result<(), XacppError>,
     ) -> Result<XacppSession, XacppError> {
         let response = self
             .transport
@@ -174,6 +196,41 @@ impl XacppPeer {
                     session_id,
                     credentials,
                 ))
+            }
+            XacppResponse::EstablishPrepare { challenge } => {
+                verify_challenge(challenge)?;
+                let confirm_response = self
+                    .transport
+                    .send(
+                        None,
+                        XacppRequest::Command(XacppCommand::EstablishConfirm),
+                    )
+                    .await?;
+                match confirm_response {
+                    XacppResponse::Established {
+                        session_id,
+                        credentials,
+                    } => {
+                        self.sessions
+                            .write()
+                            .await
+                            .insert(session_id.clone(), Arc::clone(&handler));
+                        Ok(XacppSession::new(
+                            Arc::clone(&self.transport),
+                            session_id,
+                            credentials,
+                        ))
+                    }
+                    XacppResponse::EstablishReject { reason } => {
+                        Err(XacppError::EstablishReject { reason })
+                    }
+                    XacppResponse::Error { code, message } => {
+                        Err(XacppError::Application { code, message })
+                    }
+                    other => Err(XacppError::Internal(format!(
+                        "unexpected response to establish_confirm: {other:?}"
+                    ))),
+                }
             }
             XacppResponse::EstablishReject { reason } => {
                 Err(XacppError::EstablishReject { reason })

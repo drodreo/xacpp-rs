@@ -47,6 +47,19 @@ pub trait XacppSessionHandler: Send + Sync {
     async fn on_event(&self, event: XacppActivityEvent) -> Result<XacppResponse, XacppError>;
 }
 
+/// Decision made by the responder upon receiving an Establish request.
+pub enum EstablishDecision {
+    /// First connection: challenge required → responder returns EstablishPrepare.
+    ChallengeRequired {
+        challenge: String,
+    },
+    /// Credentials valid: direct establishment → responder returns Established.
+    Established {
+        session_id: String,
+        handler: Arc<dyn XacppSessionHandler>,
+    },
+}
+
 /// Peer Establish request handler — serve main function.
 ///
 /// Responder invokes this when receiving Establish command from the peer.
@@ -68,11 +81,17 @@ pub trait EstablishHandler: Send + Sync {
     /// Handles Establish request.
     ///
     /// `transport` is passed by Peer, for `on_establish` to create `XacppSession` internally.
-    /// Returns `(session_id, handler)`: session_id identifies this session,
-    /// handler processes inbound Command/Event for this session.
+    /// Returns [`EstablishDecision`] indicating whether to challenge or directly establish.
     async fn on_establish(
         &self,
         transport: Arc<dyn XacppTransport>,
         credentials: Option<String>,
+    ) -> Result<EstablishDecision, XacppError>;
+
+    /// Phase 3: EstablishConfirm received (challenge path only).
+    /// Returns the session_id and handler for the newly created session.
+    async fn on_establish_confirm(
+        &self,
+        transport: Arc<dyn XacppTransport>,
     ) -> Result<(String, Arc<dyn XacppSessionHandler>), XacppError>;
 }

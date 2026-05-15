@@ -48,6 +48,10 @@ pub enum XacppResponse {
         #[serde(skip_serializing_if = "Option::is_none")]
         credentials: Option<String>,
     },
+    /// Challenge issued during first-time establishment.
+    EstablishPrepare {
+        challenge: String,
+    },
     /// Handshake rejected.
     EstablishReject {
         reason: String,

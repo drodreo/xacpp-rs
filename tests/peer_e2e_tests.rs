@@ -17,7 +17,7 @@ use xacpp::error::XacppError;
 use xacpp::events::interaction::{ActionRequestEvent, ActionResponse};
 use xacpp::events::payload::AlertLevel;
 use xacpp::events::{XacppActivityEvent, XacppEvent};
-use xacpp::handler::{EstablishHandler, XacppSessionHandler};
+use xacpp::handler::{EstablishDecision, EstablishHandler, XacppSessionHandler};
 use xacpp::message::{XacppRequest, XacppResponse};
 use xacpp::peer::{PeerState, XacppPeer};
 use xacpp::transport::stdio::StdioTransport;
@@ -48,8 +48,41 @@ impl EstablishHandler for AutoApproveEstablishHandler {
         &self,
         _transport: Arc<dyn XacppTransport>,
         _credentials: Option<String>,
+    ) -> Result<EstablishDecision, XacppError> {
+        Ok(EstablishDecision::Established {
+            session_id: "auto-sid".into(),
+            handler: Arc::new(TestSessionHandler),
+        })
+    }
+
+    async fn on_establish_confirm(
+        &self,
+        _transport: Arc<dyn XacppTransport>,
     ) -> Result<(String, Arc<dyn XacppSessionHandler>), XacppError> {
         Ok(("auto-sid".into(), Arc::new(TestSessionHandler)))
+    }
+}
+
+/// Challenge-aware handler: on_establish returns ChallengeRequired, on_establish_confirm returns (sid, handler).
+struct ChallengeEstablishHandler;
+
+#[async_trait::async_trait]
+impl EstablishHandler for ChallengeEstablishHandler {
+    async fn on_establish(
+        &self,
+        _transport: Arc<dyn XacppTransport>,
+        _credentials: Option<String>,
+    ) -> Result<EstablishDecision, XacppError> {
+        Ok(EstablishDecision::ChallengeRequired {
+            challenge: "test-challenge".into(),
+        })
+    }
+
+    async fn on_establish_confirm(
+        &self,
+        _transport: Arc<dyn XacppTransport>,
+    ) -> Result<(String, Arc<dyn XacppSessionHandler>), XacppError> {
+        Ok(("challenge-sid".into(), Arc::new(TestSessionHandler)))
     }
 }
 
@@ -94,6 +127,18 @@ impl EstablishHandler for SequencedEstablishHandler {
         &self,
         _transport: Arc<dyn XacppTransport>,
         _credentials: Option<String>,
+    ) -> Result<EstablishDecision, XacppError> {
+        let n = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sid = format!("handler-{n}");
+        Ok(EstablishDecision::Established {
+            session_id: sid.clone(),
+            handler: Arc::new(IdentifiedHandler { id: sid }),
+        })
+    }
+
+    async fn on_establish_confirm(
+        &self,
+        _transport: Arc<dyn XacppTransport>,
     ) -> Result<(String, Arc<dyn XacppSessionHandler>), XacppError> {
         let n = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sid = format!("handler-{n}");
@@ -394,7 +439,7 @@ async fn test_peer_establish() {
     let (peer_a, _peer_b) = connected_peers().await;
 
     let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
-    let session = timeout(peer_a.establish(None, handler)).await.unwrap();
+    let session = timeout(peer_a.establish(None, handler, |_| Ok(()))).await.unwrap();
 
     assert!(!session.session_id().is_empty());
     assert!(session.credentials().is_none());
@@ -405,7 +450,7 @@ async fn test_session_request_command() {
     let (peer_a, _peer_b) = connected_peers().await;
 
     let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
-    let session = timeout(peer_a.establish(None, handler)).await.unwrap();
+    let session = timeout(peer_a.establish(None, handler, |_| Ok(()))).await.unwrap();
 
     let response = timeout(session.request_command(XacppCommand::NewActivity { title: None }))
         .await
@@ -419,7 +464,7 @@ async fn test_session_request_event() {
     let (peer_a, _peer_b) = connected_peers().await;
 
     let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
-    let session = timeout(peer_a.establish(None, handler)).await.unwrap();
+    let session = timeout(peer_a.establish(None, handler, |_| Ok(()))).await.unwrap();
 
     let response = timeout(session.request_event(XacppActivityEvent {
         activity: "test-act".into(),
@@ -524,6 +569,7 @@ async fn test_concurrent_requests_id_matching() {
             let sid = if let XacppRequest::Command(cmd) = payload {
                 match cmd {
                     XacppCommand::Establish { .. } => "establish",
+                    XacppCommand::EstablishConfirm => "establish_confirm",
                     XacppCommand::NewActivity { .. } => "new",
                     XacppCommand::InvokeActivity { .. } => "invoke",
                     XacppCommand::CompactActivity { .. } => "compact",
@@ -634,10 +680,10 @@ async fn test_multi_session_routing_isolation() {
 
     // A initiator: establish two sessions, handler returns Acknowledge for commands (doesn't matter)
     let handler_a: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
-    let session_1 = timeout(peer_a.establish(None, Arc::clone(&handler_a)))
+    let session_1 = timeout(peer_a.establish(None, Arc::clone(&handler_a), |_| Ok(())))
         .await
         .unwrap();
-    let session_2 = timeout(peer_a.establish(None, Arc::clone(&handler_a)))
+    let session_2 = timeout(peer_a.establish(None, Arc::clone(&handler_a), |_| Ok(())))
         .await
         .unwrap();
 
@@ -677,4 +723,28 @@ async fn test_multi_session_routing_isolation() {
         }
         other => panic!("expected Established (handler identity), got: {other:?}"),
     }
+}
+
+// ---- Challenge Handshake Flow Tests ----
+
+#[tokio::test]
+async fn test_peer_establish_challenge_flow() {
+    let (transport_a, transport_b) = duplex_pair();
+    let peer_a = XacppPeer::new(transport_a, Arc::new(ChallengeEstablishHandler));
+    let peer_b = XacppPeer::new(transport_b, Arc::new(ChallengeEstablishHandler));
+    peer_a.connect().await.unwrap();
+    peer_b.connect().await.unwrap();
+
+    let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
+    let mut challenge_received = false;
+    let session = timeout(peer_a.establish(None, handler, |challenge| {
+        assert_eq!(challenge, "test-challenge");
+        challenge_received = true;
+        Ok(())
+    }))
+    .await
+    .unwrap();
+
+    assert!(challenge_received, "verify_challenge must be called");
+    assert_eq!(session.session_id(), "challenge-sid");
 }
