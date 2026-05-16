@@ -82,6 +82,9 @@ async fn test_concurrent_requests_independent_processing() {
                 XacppRequest::Command(XacppCommand::CompactActivity { .. }) => "compact",
                 XacppRequest::Command(XacppCommand::CancelActivity { .. }) => "cancel",
                 XacppRequest::Command(XacppCommand::Establish { .. }) => "establish",
+                XacppRequest::Command(XacppCommand::LastActivity) => "last",
+                XacppRequest::Command(XacppCommand::ListActivity { .. }) => "list",
+                XacppRequest::Command(XacppCommand::SwitchActivity { .. }) => "switch",
                 _ => "other",
             };
             Ok(XacppResponse::Established {
@@ -99,6 +102,9 @@ async fn test_concurrent_requests_independent_processing() {
         XacppCommand::CompactActivity { activity: "act-1".into() },
         XacppCommand::CancelActivity { activity: "act-1".into() },
         XacppCommand::Establish { credentials: None },
+        XacppCommand::LastActivity,
+        XacppCommand::ListActivity { query: None, page_num: 1, page_size: 10 },
+        XacppCommand::SwitchActivity { activity: "act-1".into() },
     ];
 
     // Concurrently send 5 requests, measure time
@@ -129,16 +135,16 @@ async fn test_concurrent_requests_independent_processing() {
         .collect();
     sids.sort();
 
-    // All 5 responses received, no crosstalk
+    // All 8 responses received, no crosstalk
     assert_eq!(
         sids,
-        ["cancel", "compact", "establish", "invoke", "new"],
+        ["cancel", "compact", "establish", "invoke", "last", "list", "new", "switch"],
         "all 5 responses must match their commands"
     );
 
-    // Concurrent time < 30ms (serial would need 5×10ms=50ms)
+    // Concurrent time < 50ms (serial would need 8×10ms=80ms)
     assert!(
-        elapsed < Duration::from_millis(30),
+        elapsed < Duration::from_millis(50),
         "concurrent processing should be faster than serial, took {:?}",
         elapsed
     );

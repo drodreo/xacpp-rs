@@ -10,8 +10,8 @@ use super::interaction::{
     ActionRequestEvent, NotifyEvent, QuestionEvent, SensitiveInfoOperationEvent,
 };
 use super::payload::{
-    ActivityStartEvent, ContentDeltaEvent, ContentPartEvent, SecurityAlertEvent, ToolResultEvent,
-    ToolUseEvent, TraceableEvent,
+    ActivityInfo, ActivityStartEvent, ContentDeltaEvent, ContentPartEvent, SecurityAlertEvent,
+    ToolResultEvent, ToolUseEvent, TraceableEvent,
 };
 use super::upload::{TokenUsage, UploadEvent};
 
@@ -54,6 +54,8 @@ pub enum XacppEvent {
     WaitingCommand,
     /// SubActivity task started execution.
     ActivityStart(ActivityStartEvent),
+    /// Activity metadata updated.
+    ActivityUpdates(ActivityInfo),
     /// SubActivity task completed.
     ActivityDone { activity: String },
     /// SubActivity aborted by user.

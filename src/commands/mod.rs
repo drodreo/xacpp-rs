@@ -9,7 +9,7 @@ use crate::events::content::ContentPart;
 
 /// XACPP protocol command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum XacppCommand {
     /// Establish a logical session.
     ///
@@ -25,10 +25,27 @@ pub enum XacppCommand {
     /// Confirm establishment after challenge verification (phase 3 of 3-way handshake).
     EstablishConfirm,
 
+    /// Resume the last active Activity.
+    LastActivity,
+
     /// Create a new Activity session.
     NewActivity {
         #[serde(skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+    },
+
+    /// List available Activities with pagination.
+    ListActivity {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+        page_num: u32,
+        page_size: u32,
+    },
+
+    /// Switch to an existing Activity.
+    SwitchActivity {
+        /// Target activity unique identifier.
+        activity: String,
     },
 
     /// Invoke an existing Activity to perform operations.

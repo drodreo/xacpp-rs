@@ -578,6 +578,9 @@ async fn test_concurrent_requests_id_matching() {
                     XacppCommand::CompactActivity { .. } => "compact",
                     XacppCommand::CancelActivity { .. } => "cancel",
                     XacppCommand::Message { .. } => "message",
+                    XacppCommand::LastActivity => "last",
+                    XacppCommand::ListActivity { .. } => "list",
+                    XacppCommand::SwitchActivity { .. } => "switch",
                 }
             } else {
                 "event"
@@ -599,6 +602,9 @@ async fn test_concurrent_requests_id_matching() {
         XacppCommand::InvokeActivity { activity: "act-1".into(), messages: vec![] },
         XacppCommand::CompactActivity { activity: "act-1".into() },
         XacppCommand::CancelActivity { activity: "act-1".into() },
+        XacppCommand::LastActivity,
+        XacppCommand::ListActivity { query: None, page_num: 1, page_size: 10 },
+        XacppCommand::SwitchActivity { activity: "act-1".into() },
     ];
 
     // Concurrently send 5 requests
@@ -626,13 +632,13 @@ async fn test_concurrent_requests_id_matching() {
         })
         .collect();
 
-    // All 5 different sids received, no duplicates, no missing
+    // All 8 different sids received, no duplicates, no missing
     let mut sorted = sids.clone();
     sorted.sort();
     assert_eq!(
         sorted,
-        ["cancel", "compact", "establish", "invoke", "new"],
-        "all 5 responses must be present and matched correctly"
+        ["cancel", "compact", "establish", "invoke", "last", "list", "new", "switch"],
+        "all 8 responses must be present and matched correctly"
     );
 }
 

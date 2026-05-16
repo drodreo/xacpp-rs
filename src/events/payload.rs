@@ -113,3 +113,13 @@ pub struct ActivityStartEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<std::collections::HashMap<String, String>>,
 }
+
+/// Activity metadata shared across commands, responses, and events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityInfo {
+    pub activity: String,
+    pub agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}

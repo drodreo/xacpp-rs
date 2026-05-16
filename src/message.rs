@@ -10,13 +10,14 @@
 //! ## JSON Format Examples
 //!
 //! ```json
-//! Request (Command): {"id":"r1","type":"request","payload":{"kind":"command","payload":"authenticate"}}
-//! Response (Pairing):  {"id":"r1","type":"response","payload":{"kind":"pairing","code":"123456"}}
+//! Request (Command): {"id":"r1","type":"request","payload":{"kind":"command","payload":{"establish":{}}}}
+//! Response (Established): {"id":"r1","type":"response","payload":{"kind":"established","sessionId":"s1","credentials":"issued-creds"}}
 //! ```
 
 use serde::{Deserialize, Serialize};
 
 use crate::commands::XacppCommand;
+use crate::events::ActivityInfo;
 use crate::events::XacppActivityEvent;
 use crate::events::{ActionResponse, QuestionResponse, SensitiveInfoOperationResponse};
 
@@ -73,12 +74,17 @@ pub enum XacppResponse {
         #[serde(flatten)]
         response: SensitiveInfoOperationResponse,
     },
-    /// Activity created response.
-    ActivityCreated {
-        activity: String,
-        agent: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        title: Option<String>,
+    /// Activity ready for interaction.
+    ActivityReady {
+        #[serde(flatten)]
+        info: ActivityInfo,
+    },
+    /// Activity not found.
+    ActivityNotFound,
+    /// Available activities list.
+    AvailableActivities {
+        total: u32,
+        activities: Vec<ActivityInfo>,
     },
     /// Generic acknowledge: request processed successfully, no data returned.
     Acknowledge,
