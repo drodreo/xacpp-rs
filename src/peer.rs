@@ -174,6 +174,8 @@ impl XacppPeer {
         handler: Arc<dyn XacppSessionHandler>,
         verify_challenge: impl FnOnce(String) -> Result<(), XacppError>,
     ) -> Result<XacppSession, XacppError> {
+        log::debug!("establish: sending Establish (credentials: {})", if credentials.is_some() { "present" } else { "none" });
+
         let response = self
             .transport
             .send(
@@ -187,6 +189,7 @@ impl XacppPeer {
                 session_id,
                 credentials,
             } => {
+                log::debug!("establish: received Established (session_id: {}, credentials: {})", session_id, if credentials.is_empty() { "empty" } else { "present" });
                 self.sessions
                     .write()
                     .await
@@ -198,7 +201,9 @@ impl XacppPeer {
                 ))
             }
             XacppResponse::EstablishPrepare { challenge } => {
+                log::debug!("establish: received EstablishPrepare (challenge: {})", challenge);
                 verify_challenge(challenge)?;
+                log::debug!("establish: sending EstablishConfirm");
                 let confirm_response = self
                     .transport
                     .send(
@@ -211,6 +216,7 @@ impl XacppPeer {
                         session_id,
                         credentials,
                     } => {
+                        log::debug!("establish: received Established after confirm (session_id: {}, credentials: {})", session_id, if credentials.is_empty() { "empty" } else { "present" });
                         self.sessions
                             .write()
                             .await
@@ -222,25 +228,35 @@ impl XacppPeer {
                         ))
                     }
                     XacppResponse::EstablishReject { reason } => {
+                        log::debug!("establish: received EstablishReject after confirm (reason: {reason})");
                         Err(XacppError::EstablishReject { reason })
                     }
                     XacppResponse::Error { code, message } => {
+                        log::debug!("establish: received Error after confirm (code: {code}, message: {message})");
                         Err(XacppError::Application { code, message })
                     }
-                    other => Err(XacppError::Internal(format!(
-                        "unexpected response to establish_confirm: {other:?}"
-                    ))),
+                    other => {
+                        log::debug!("establish: received unexpected response after confirm: {other:?}");
+                        Err(XacppError::Internal(format!(
+                            "unexpected response to establish_confirm: {other:?}"
+                        )))
+                    }
                 }
             }
             XacppResponse::EstablishReject { reason } => {
+                log::debug!("establish: received EstablishReject (reason: {reason})");
                 Err(XacppError::EstablishReject { reason })
             }
             XacppResponse::Error { code, message } => {
+                log::debug!("establish: received Error (code: {code}, message: {message})");
                 Err(XacppError::Application { code, message })
             }
-            other => Err(XacppError::Internal(format!(
-                "unexpected response to establish: {other:?}"
-            ))),
+            other => {
+                log::debug!("establish: received unexpected response: {other:?}");
+                Err(XacppError::Internal(format!(
+                    "unexpected response to establish: {other:?}"
+                )))
+            }
         }
     }
 

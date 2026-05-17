@@ -98,7 +98,8 @@ impl StdioTransport {
             let envelope = match serde_json::from_slice::<XacppEnvelope>(&data) {
                 Ok(msg) => msg,
                 Err(e) => {
-                    log::warn!("accept: failed to parse envelope ({} bytes): {e}", data.len());
+                    let text = String::from_utf8_lossy(&data);
+                    log::warn!("accept: failed to parse envelope ({} bytes): {e}\n  raw: {text}", data.len());
                     continue;
                 }
             };
