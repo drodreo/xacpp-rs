@@ -96,6 +96,17 @@ pub struct VideoPart {
     pub part_id: Option<String>,
 }
 
+/// File content part.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FilePart {
+    /// File source.
+    pub source: FileRef,
+    /// Part unique identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_id: Option<String>,
+}
+
 /// Unified multimodal content part.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -104,4 +115,5 @@ pub enum ContentPart {
     Image(ImagePart),
     Audio(AudioPart),
     Video(VideoPart),
+    File(FilePart),
 }

@@ -10,7 +10,7 @@ pub mod payload;
 pub mod upload;
 pub mod xacpp_event;
 
-pub use content::{AudioPart, ContentPart, FileRef, ImagePart, TextPart, VideoPart};
+pub use content::{AudioPart, ContentPart, FilePart, FileRef, ImagePart, TextPart, VideoPart};
 pub use interaction::{
     ActionRequestEvent, ActionResponse, NotifyEvent, QuestionEvent, QuestionResponse,
     SensitiveInfoItem, SensitiveInfoOperation, SensitiveInfoOperationEvent,
