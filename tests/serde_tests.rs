@@ -3,7 +3,7 @@
 //! Verifies round-trip of envelope layer + payload layer, including type tag routing and payload nested structures.
 
 use xacpp::commands::XacppCommand;
-use xacpp::events::{XacppActivityEvent, XacppEvent};
+use xacpp::events::{FileRef, XacppActivityEvent, XacppEvent};
 use xacpp::events::interaction::{
     ActionRequestEvent, ActionResponse, QuestionEvent,
     SensitiveInfoOperationEvent, SensitiveInfoOperation, SensitiveInfoType,
@@ -536,4 +536,65 @@ fn test_event_activity_updates_roundtrip() {
         }
         other => panic!("unexpected: {other:?}"),
     }
+}
+
+// ---- FileRef round-trip tests ----
+
+#[test]
+fn test_fileref_full_roundtrip() {
+    let file_ref = FileRef {
+        remote_url: "https://example.com/file.png".into(),
+        local_uri: "/tmp/file.png".into(),
+        remote_expires_at: Some("2026-05-18T12:00:00Z".into()),
+        mime_type: "image/png".into(),
+        require_organized: true,
+        size_bytes: 1024,
+        sha256: "abc123".into(),
+    };
+
+    let json = serde_json::to_string(&file_ref).unwrap();
+    assert!(json.contains(r#""remoteUrl":"https://example.com/file.png""#), "json: {json}");
+    assert!(json.contains(r#""localUri":"/tmp/file.png""#), "json: {json}");
+    assert!(json.contains(r#""remoteExpiresAt":"2026-05-18T12:00:00Z""#), "json: {json}");
+    assert!(json.contains(r#""mimeType":"image/png""#), "json: {json}");
+    assert!(json.contains(r#""requireOrganized":true"#), "json: {json}");
+    assert!(json.contains(r#""sizeBytes":1024"#), "json: {json}");
+    assert!(json.contains(r#""sha256":"abc123""#), "json: {json}");
+
+    let de: FileRef = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, file_ref);
+}
+
+#[test]
+fn test_fileref_defaults_roundtrip() {
+    let file_ref = FileRef {
+        remote_url: "https://example.com/file.png".into(),
+        local_uri: "/tmp/file.png".into(),
+        remote_expires_at: None,
+        mime_type: "image/png".into(),
+        require_organized: false,
+        size_bytes: 1024,
+        sha256: "".into(),
+    };
+
+    let json = serde_json::to_string(&file_ref).unwrap();
+    assert!(!json.contains("remoteExpiresAt"), "json: {json}");
+    assert!(json.contains(r#""requireOrganized":false"#), "json: {json}");
+    assert!(json.contains(r#""sha256":"""#), "json: {json}");
+
+    let de: FileRef = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, file_ref);
+}
+
+#[test]
+fn test_fileref_deserialize_legacy_format() {
+    let json = r#"{"remoteUrl":"https://example.com/old.png","localUri":"/tmp/old.png","mimeType":"image/png","sizeBytes":512}"#;
+    let de: FileRef = serde_json::from_str(json).unwrap();
+    assert_eq!(de.remote_url, "https://example.com/old.png");
+    assert_eq!(de.local_uri, "/tmp/old.png");
+    assert_eq!(de.remote_expires_at, None);
+    assert_eq!(de.mime_type, "image/png");
+    assert_eq!(de.require_organized, false);
+    assert_eq!(de.size_bytes, 512);
+    assert_eq!(de.sha256, "");
 }

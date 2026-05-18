@@ -14,12 +14,21 @@ pub struct FileRef {
     /// Local file path.
     #[serde(default)]
     pub local_uri: String,
+    /// Remote URL expiration time (UTC ISO 8601).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_expires_at: Option<String>,
     /// MIME type.
     #[serde(default)]
     pub mime_type: String,
+    /// Whether the file needs to be organized from a temp directory to a permanent location.
+    #[serde(default)]
+    pub require_organized: bool,
     /// File size in bytes.
     #[serde(default)]
     pub size_bytes: u64,
+    /// SHA-256 hash of the file content.
+    #[serde(default)]
+    pub sha256: String,
 }
 
 /// Text content part.
