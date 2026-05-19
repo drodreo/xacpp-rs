@@ -1,6 +1,6 @@
 [package]
 name = "xacpp"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 description = "Agent Control Plane Protocol — Rust implementation"
 license = "MIT"
