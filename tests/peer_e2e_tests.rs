@@ -299,6 +299,7 @@ async fn test_transport_send_interactive_event() {
                 action_id: "act-1".into(),
                 description: "test".into(),
                 alert: AlertLevel::Info,
+                intent: "test".into(),
                 responder: None,
             }),
         }),

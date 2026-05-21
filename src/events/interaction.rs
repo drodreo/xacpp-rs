@@ -37,6 +37,7 @@ pub struct ActionRequestEvent {
     pub action_id: String,
     pub description: String,
     pub alert: AlertLevel,
+    pub intent: String,
     /// Callback channel. Consumer sends authorization decision via this channel.
     #[serde(skip)]
     pub responder: Option<oneshot::Sender<XacppResponse>>,

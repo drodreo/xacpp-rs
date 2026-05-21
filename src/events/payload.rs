@@ -61,6 +61,8 @@ pub struct ToolUseEvent {
     pub index: u32,
     /// Human-readable summary of tool arguments (may be truncated, not guaranteed parseable).
     pub arguments: String,
+    /// Intent description of the tool call.
+    pub intent: String,
 }
 
 /// Tool call finished event payload.

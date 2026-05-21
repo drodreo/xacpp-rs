@@ -24,6 +24,7 @@ fn test_event_action_request_roundtrip() {
         action_id: "act-1".into(),
         description: "list files".into(),
         alert: AlertLevel::Warn,
+        intent: "list files".into(),
         responder: None,
     });
 
@@ -129,6 +130,7 @@ fn test_wire_request_event_roundtrip() {
         action_id: "act-1".into(),
         description: "test".into(),
         alert: AlertLevel::Info,
+        intent: "test".into(),
         responder: None,
     });
     let wire = XacppEnvelope::Request {
@@ -343,6 +345,7 @@ fn test_action_request_with_responder_serializes_without_it() {
         action_id: "act-r".into(),
         description: "test".into(),
         alert: AlertLevel::Info,
+        intent: "test".into(),
         responder: Some(tx),
     });
 
