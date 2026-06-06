@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::capability::Capabilities;
 use crate::commands::XacppCommand;
 use crate::events::ActivityInfo;
 use crate::events::XacppActivityEvent;
@@ -43,6 +44,12 @@ pub enum XacppRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum XacppResponse {
+    /// Capability negotiation response.
+    /// Responder returns its own capability list after processing the initiator's.
+    Negotiated {
+        capabilities: Capabilities,
+    },
+
     /// Handshake successful: session identifier and credentials issued.
     Established {
         session_id: String,

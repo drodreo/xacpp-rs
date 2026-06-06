@@ -50,6 +50,7 @@
 //! - **Peer to upper**: exposes typed `establish` / `request_command` / `request_event`
 //! - **Session to upper**: holds `XacppSessionHandler`, sends/receives directly through Transport
 
+pub mod capability;
 pub mod commands;
 pub mod error;
 pub mod events;

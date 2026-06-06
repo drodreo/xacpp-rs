@@ -13,12 +13,13 @@ use tokio::io::BufReader;
 use tokio::sync::mpsc;
 
 use xacpp::commands::XacppCommand;
+use xacpp::capability::Capabilities;
 use xacpp::error::XacppError;
 use xacpp::events::content::{ContentPart, TextPart};
 use xacpp::events::interaction::{ActionRequestEvent, ActionResponse};
 use xacpp::events::payload::AlertLevel;
 use xacpp::events::{XacppActivityEvent, XacppEvent};
-use xacpp::handler::{EstablishDecision, EstablishHandler, XacppSessionHandler};
+use xacpp::handler::{EstablishDecision, EstablishHandler, NegotiateHandler, XacppSessionHandler};
 use xacpp::message::{XacppRequest, XacppResponse};
 use xacpp::peer::{PeerState, XacppPeer};
 use xacpp::transport::stdio::StdioTransport;
@@ -37,6 +38,41 @@ impl XacppSessionHandler for TestSessionHandler {
 
     async fn on_event(&self, _event: XacppActivityEvent) -> Result<XacppResponse, XacppError> {
         Ok(XacppResponse::Acknowledge)
+    }
+}
+
+/// Accepts any negotiation (records capabilities).
+struct AcceptNegotiateHandler {
+    received: std::sync::Mutex<Option<Capabilities>>,
+}
+
+impl AcceptNegotiateHandler {
+    fn new() -> Self {
+        Self {
+            received: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn get_received(&self) -> Option<Capabilities> {
+        self.received.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl NegotiateHandler for AcceptNegotiateHandler {
+    async fn on_negotiate(&self, capabilities: Capabilities) -> Result<(), XacppError> {
+        *self.received.lock().unwrap() = Some(capabilities);
+        Ok(())
+    }
+}
+
+/// Rejects all negotiations.
+struct RejectNegotiateHandler;
+
+#[async_trait::async_trait]
+impl NegotiateHandler for RejectNegotiateHandler {
+    async fn on_negotiate(&self, _capabilities: Capabilities) -> Result<(), XacppError> {
+        Err(XacppError::Internal("negotiation rejected".into()))
     }
 }
 
@@ -169,13 +205,74 @@ fn duplex_pair() -> (Arc<dyn XacppTransport>, Arc<dyn XacppTransport>) {
     (transport_a, transport_b)
 }
 
-/// Creates a pair of connected Peers (B side auto-approves Establish).
+/// Creates a pair of connected Peers (B side auto-approves Establish, accepts negotiation).
+///
+/// peer_a simulates x-agent side (handles all activity commands, emits all events).
+/// peer_b simulates xabot side (handles no commands, emits no events).
 async fn connected_peers() -> (XacppPeer, XacppPeer) {
     let (transport_a, transport_b) = duplex_pair();
-    let peer_a = XacppPeer::new(transport_a, Arc::new(AutoApproveEstablishHandler));
-    let peer_b = XacppPeer::new(transport_b, Arc::new(AutoApproveEstablishHandler));
+
+    let caps_agent = Capabilities {
+        commands: vec![
+            serde_json::json!({"name": "new_activity"}),
+            serde_json::json!({"name": "last_activity"}),
+            serde_json::json!({"name": "list_activity"}),
+            serde_json::json!({"name": "switch_activity"}),
+            serde_json::json!({"name": "invoke_activity"}),
+            serde_json::json!({"name": "compact_activity"}),
+            serde_json::json!({"name": "cancel_activity"}),
+            serde_json::json!({"name": "message"}),
+        ],
+        events: vec![
+            serde_json::json!({"name": "content_delta"}),
+            serde_json::json!({"name": "content_part"}),
+            serde_json::json!({"name": "think"}),
+            serde_json::json!({"name": "info"}),
+            serde_json::json!({"name": "warn"}),
+            serde_json::json!({"name": "error"}),
+            serde_json::json!({"name": "action_request"}),
+            serde_json::json!({"name": "notify"}),
+            serde_json::json!({"name": "question"}),
+            serde_json::json!({"name": "sensitive_info_operation"}),
+            serde_json::json!({"name": "waiting_command"}),
+            serde_json::json!({"name": "activity_start"}),
+            serde_json::json!({"name": "activity_updates"}),
+            serde_json::json!({"name": "activity_done"}),
+            serde_json::json!({"name": "activity_aborted"}),
+            serde_json::json!({"name": "tool_use"}),
+            serde_json::json!({"name": "tool_result"}),
+            serde_json::json!({"name": "security_alert"}),
+            serde_json::json!({"name": "upload"}),
+            serde_json::json!({"name": "pair_complete"}),
+            serde_json::json!({"name": "complete"}),
+        ],
+    };
+    let caps_bot = Capabilities {
+        commands: Vec::new(),
+        events: Vec::new(),
+    };
+
+    let peer_a = XacppPeer::new(
+        caps_agent,
+        transport_a,
+        Arc::new(AcceptNegotiateHandler::new()),
+        Arc::new(AutoApproveEstablishHandler),
+    );
+    let peer_b = XacppPeer::new(
+        caps_bot,
+        transport_b,
+        Arc::new(AcceptNegotiateHandler::new()),
+        Arc::new(AutoApproveEstablishHandler),
+    );
     peer_a.connect().await.unwrap();
     peer_b.connect().await.unwrap();
+    (peer_a, peer_b)
+}
+
+/// Creates a pair of connected + negotiated Peers ready for Establish.
+async fn negotiated_peers() -> (XacppPeer, XacppPeer) {
+    let (peer_a, peer_b) = connected_peers().await;
+    peer_a.negotiate().await.unwrap();
     (peer_a, peer_b)
 }
 
@@ -440,7 +537,7 @@ async fn test_peer_disconnect_state() {
 
 #[tokio::test]
 async fn test_peer_establish() {
-    let (peer_a, _peer_b) = connected_peers().await;
+    let (peer_a, _peer_b) = negotiated_peers().await;
 
     let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
     let session = timeout(peer_a.establish(None, handler, |_| Ok(()))).await.unwrap();
@@ -451,7 +548,7 @@ async fn test_peer_establish() {
 
 #[tokio::test]
 async fn test_session_request_command() {
-    let (peer_a, _peer_b) = connected_peers().await;
+    let (peer_a, _peer_b) = negotiated_peers().await;
 
     let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
     let session = timeout(peer_a.establish(None, handler, |_| Ok(()))).await.unwrap();
@@ -463,9 +560,206 @@ async fn test_session_request_command() {
     assert!(matches!(response, XacppResponse::Acknowledge));
 }
 
+// ============================================================================
+// Negotiate Phase Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_negotiate_full_flow() {
+    let (transport_a, transport_b) = duplex_pair();
+
+    let caps_a = Capabilities {
+        commands: vec![
+            serde_json::json!({"name": "new_activity"}),
+            serde_json::json!({"name": "switch_activity"}),
+        ],
+        events: vec![
+            serde_json::json!({"name": "content_delta"}),
+            serde_json::json!({"name": "activity_done"}),
+        ],
+    };
+    let caps_b = Capabilities {
+        commands: Vec::new(),
+        events: Vec::new(),
+    };
+
+    let negotiate_a = Arc::new(AcceptNegotiateHandler::new());
+    let negotiate_b = Arc::new(AcceptNegotiateHandler::new());
+    let negotiate_a_clone = negotiate_a.clone();
+    let negotiate_b_clone = negotiate_b.clone();
+
+    let peer_a = XacppPeer::new(
+        caps_a.clone(),
+        transport_a,
+        negotiate_a,
+        Arc::new(AutoApproveEstablishHandler),
+    );
+    let peer_b = XacppPeer::new(
+        caps_b.clone(),
+        transport_b,
+        negotiate_b,
+        Arc::new(AutoApproveEstablishHandler),
+    );
+    peer_a.connect().await.unwrap();
+    peer_b.connect().await.unwrap();
+
+    // Initiator sends negotiate
+    timeout(peer_a.negotiate()).await.unwrap();
+
+    // Verify state
+    assert_eq!(peer_a.state().await, PeerState::Negotiated);
+
+    // Initiator received responder's capabilities (empty bot)
+    let remote_caps_a = peer_a.remote_capabilities().await;
+    assert!(remote_caps_a.commands.is_empty());
+    assert!(remote_caps_a.events.is_empty());
+
+    // Responder received initiator's capabilities via handler
+    let received_by_b = negotiate_b_clone.get_received().unwrap();
+    assert_eq!(received_by_b.commands.len(), 2);
+    assert_eq!(received_by_b.commands[0]["name"], "new_activity");
+    assert_eq!(received_by_b.commands[1]["name"], "switch_activity");
+    assert_eq!(received_by_b.events.len(), 2);
+    assert_eq!(received_by_b.events[0]["name"], "content_delta");
+    assert_eq!(received_by_b.events[1]["name"], "activity_done");
+
+    // Initiator's handler received responder's capabilities (empty bot)
+    let received_by_a = negotiate_a_clone.get_received().unwrap();
+    assert!(received_by_a.commands.is_empty());
+    assert!(received_by_a.events.is_empty());
+
+    // Establish should now succeed
+    let session = timeout(peer_a.establish(None, Arc::new(TestSessionHandler), |_| Ok(())))
+        .await
+        .unwrap();
+    assert!(!session.session_id().is_empty());
+}
+
+#[tokio::test]
+async fn test_negotiate_responder_rejects() {
+    let (transport_a, transport_b) = duplex_pair();
+
+    let caps_a = Capabilities {
+        commands: vec![serde_json::json!({"name": "new_activity"})],
+        events: vec![serde_json::json!({"name": "content_delta"})],
+    };
+    let peer_a = XacppPeer::new(
+        caps_a,
+        transport_a,
+        Arc::new(AcceptNegotiateHandler::new()),
+        Arc::new(AutoApproveEstablishHandler),
+    );
+    let peer_b = XacppPeer::new(
+        Capabilities { commands: Vec::new(), events: Vec::new() },
+        transport_b,
+        Arc::new(RejectNegotiateHandler),
+        Arc::new(AutoApproveEstablishHandler),
+    );
+    peer_a.connect().await.unwrap();
+    peer_b.connect().await.unwrap();
+
+    // Negotiate should fail because responder rejects
+    let result = timeout(peer_a.negotiate()).await;
+    assert!(result.is_err(), "negotiate should fail when responder rejects");
+
+    // State should remain Connected, not Negotiated
+    assert_eq!(peer_a.state().await, PeerState::Connected);
+
+    // Establish should fail because state is not Negotiated
+    let establish_result = timeout(peer_a.establish(None, Arc::new(TestSessionHandler), |_| Ok(()))).await;
+    assert!(establish_result.is_err(), "establish should fail without negotiation");
+}
+
+#[tokio::test]
+async fn test_negotiate_initiator_rejects() {
+    let (transport_a, transport_b) = duplex_pair();
+
+    let peer_a = XacppPeer::new(
+        Capabilities { commands: Vec::new(), events: Vec::new() },
+        transport_a,
+        Arc::new(RejectNegotiateHandler),
+        Arc::new(AutoApproveEstablishHandler),
+    );
+    let caps_b = Capabilities {
+        commands: vec![serde_json::json!({"name": "new_activity"})],
+        events: vec![serde_json::json!({"name": "content_delta"})],
+    };
+    let peer_b = XacppPeer::new(
+        caps_b,
+        transport_b,
+        Arc::new(AcceptNegotiateHandler::new()),
+        Arc::new(AutoApproveEstablishHandler),
+    );
+    peer_a.connect().await.unwrap();
+    peer_b.connect().await.unwrap();
+
+    // Negotiate should fail because initiator's handler rejects responder's capabilities
+    let result = timeout(peer_a.negotiate()).await;
+    assert!(result.is_err(), "negotiate should fail when initiator rejects");
+
+    // State should remain Connected
+    assert_eq!(peer_a.state().await, PeerState::Connected);
+}
+
+#[tokio::test]
+async fn test_establish_without_negotiate_fails() {
+    let (peer_a, _peer_b) = connected_peers().await;
+
+    // Skip negotiate, try establish directly
+    let result = timeout(peer_a.establish(None, Arc::new(TestSessionHandler), |_| Ok(()))).await;
+    assert!(result.is_err(), "establish should fail without negotiate");
+}
+
+#[tokio::test]
+async fn test_negotiate_capabilities_preserved() {
+    let (transport_a, transport_b) = duplex_pair();
+
+    let caps_a = Capabilities {
+        commands: vec![
+            serde_json::json!({"name": "new_activity", "version": "1.0"}),
+            serde_json::json!({"name": "cancel_activity"}),
+        ],
+        events: vec![
+            serde_json::json!({"name": "content_delta"}),
+        ],
+    };
+    let caps_b = Capabilities {
+        commands: Vec::new(),
+        events: vec![
+            serde_json::json!({"name": "action_request", "version": "2.0"}),
+            serde_json::json!({"name": "question"}),
+        ],
+    };
+
+    let peer_a = XacppPeer::new(
+        caps_a,
+        transport_a,
+        Arc::new(AcceptNegotiateHandler::new()),
+        Arc::new(AutoApproveEstablishHandler),
+    );
+    let peer_b = XacppPeer::new(
+        caps_b,
+        transport_b,
+        Arc::new(AcceptNegotiateHandler::new()),
+        Arc::new(AutoApproveEstablishHandler),
+    );
+    peer_a.connect().await.unwrap();
+    peer_b.connect().await.unwrap();
+
+    timeout(peer_a.negotiate()).await.unwrap();
+
+    // Verify initiator has full responder capabilities
+    let remote = peer_a.remote_capabilities().await;
+    assert!(remote.commands.is_empty());
+    assert_eq!(remote.events.len(), 2);
+    assert_eq!(remote.events[0]["name"], "action_request");
+    assert_eq!(remote.events[0]["version"], "2.0");
+    assert_eq!(remote.events[1]["name"], "question");
+}
+
 #[tokio::test]
 async fn test_session_request_event() {
-    let (peer_a, _peer_b) = connected_peers().await;
+    let (peer_a, _peer_b) = negotiated_peers().await;
 
     let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
     let session = timeout(peer_a.establish(None, handler, |_| Ok(()))).await.unwrap();
@@ -582,6 +876,7 @@ async fn test_concurrent_requests_id_matching() {
                     XacppCommand::LastActivity => "last",
                     XacppCommand::ListActivity { .. } => "list",
                     XacppCommand::SwitchActivity { .. } => "switch",
+                    XacppCommand::Negotiate { .. } => "negotiate",
                 }
             } else {
                 "event"
@@ -684,10 +979,11 @@ async fn test_inflight_request_cancelled_on_disconnect() {
 async fn test_multi_session_routing_isolation() {
     // peer_b uses SequencedEstablishHandler, each session gets an ID'd handler
     let (transport_a, transport_b) = duplex_pair();
-    let peer_a = XacppPeer::new(transport_a, Arc::new(SequencedEstablishHandler::new()));
-    let peer_b = XacppPeer::new(transport_b, Arc::new(SequencedEstablishHandler::new()));
+    let peer_a = XacppPeer::new(Capabilities { commands: Vec::new(), events: Vec::new() }, transport_a, Arc::new(AcceptNegotiateHandler::new()), Arc::new(SequencedEstablishHandler::new()));
+    let peer_b = XacppPeer::new(Capabilities { commands: Vec::new(), events: Vec::new() }, transport_b, Arc::new(AcceptNegotiateHandler::new()), Arc::new(SequencedEstablishHandler::new()));
     peer_a.connect().await.unwrap();
     peer_b.connect().await.unwrap();
+    peer_a.negotiate().await.unwrap();
 
     // A initiator: establish two sessions, handler returns Acknowledge for commands (doesn't matter)
     let handler_a: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
@@ -741,10 +1037,11 @@ async fn test_multi_session_routing_isolation() {
 #[tokio::test]
 async fn test_peer_establish_challenge_flow() {
     let (transport_a, transport_b) = duplex_pair();
-    let peer_a = XacppPeer::new(transport_a, Arc::new(ChallengeEstablishHandler));
-    let peer_b = XacppPeer::new(transport_b, Arc::new(ChallengeEstablishHandler));
+    let peer_a = XacppPeer::new(Capabilities { commands: Vec::new(), events: Vec::new() }, transport_a, Arc::new(AcceptNegotiateHandler::new()), Arc::new(ChallengeEstablishHandler));
+    let peer_b = XacppPeer::new(Capabilities { commands: Vec::new(), events: Vec::new() }, transport_b, Arc::new(AcceptNegotiateHandler::new()), Arc::new(ChallengeEstablishHandler));
     peer_a.connect().await.unwrap();
     peer_b.connect().await.unwrap();
+    peer_a.negotiate().await.unwrap();
 
     let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
     let mut challenge_received = false;
@@ -763,10 +1060,11 @@ async fn test_peer_establish_challenge_flow() {
 #[tokio::test]
 async fn test_peer_establish_challenge_issues_credentials() {
     let (transport_a, transport_b) = duplex_pair();
-    let peer_a = XacppPeer::new(transport_a, Arc::new(ChallengeEstablishHandler));
-    let peer_b = XacppPeer::new(transport_b, Arc::new(ChallengeEstablishHandler));
+    let peer_a = XacppPeer::new(Capabilities { commands: Vec::new(), events: Vec::new() }, transport_a, Arc::new(AcceptNegotiateHandler::new()), Arc::new(ChallengeEstablishHandler));
+    let peer_b = XacppPeer::new(Capabilities { commands: Vec::new(), events: Vec::new() }, transport_b, Arc::new(AcceptNegotiateHandler::new()), Arc::new(ChallengeEstablishHandler));
     peer_a.connect().await.unwrap();
     peer_b.connect().await.unwrap();
+    peer_a.negotiate().await.unwrap();
 
     let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
     let session = timeout(peer_a.establish(None, handler, |challenge| {
@@ -782,7 +1080,7 @@ async fn test_peer_establish_challenge_issues_credentials() {
 
 #[tokio::test]
 async fn test_session_send_message() {
-    let (peer_a, _peer_b) = connected_peers().await;
+    let (peer_a, _peer_b) = negotiated_peers().await;
     let session = timeout(peer_a.establish(None, Arc::new(TestSessionHandler), |_| Ok(())))
         .await
         .unwrap();

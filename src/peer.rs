@@ -18,10 +18,11 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
 
+use crate::capability::Capabilities;
 use crate::commands::XacppCommand;
 use crate::error::XacppError;
 use crate::events::XacppActivityEvent;
-use crate::handler::{EstablishHandler, XacppSessionHandler};
+use crate::handler::{EstablishHandler, NegotiateHandler, XacppSessionHandler};
 use crate::message::{XacppRequest, XacppResponse};
 use crate::session::XacppSession;
 use crate::transport::XacppTransport;
@@ -31,13 +32,16 @@ use crate::transport::XacppTransport;
 pub enum PeerState {
     /// Not connected / connection closed.
     Disconnected,
-    /// Communication channel established, logical session can be created.
+    /// Communication channel established, negotiation pending.
     Connected,
+    /// Capabilities negotiated, logical session can be created.
+    Negotiated,
 }
 
 /// XacppPeer shared state.
 struct PeerInner {
     state: PeerState,
+    remote_capabilities: Capabilities,
 }
 
 /// XACPP protocol endpoint.
@@ -49,6 +53,8 @@ pub struct XacppPeer {
     inner: Arc<Mutex<PeerInner>>,
     sessions: Arc<RwLock<HashMap<String, Arc<dyn XacppSessionHandler>>>>,
     establish_handler: Arc<dyn EstablishHandler>,
+    local_capabilities: Capabilities,
+    negotiate_handler: Arc<dyn NegotiateHandler>,
 }
 
 impl XacppPeer {
@@ -56,22 +62,79 @@ impl XacppPeer {
     ///
     /// Initial state is `Disconnected`; call `connect` to establish a connection.
     pub fn new(
+        capabilities: Capabilities,
         transport: Arc<dyn XacppTransport>,
+        negotiate_handler: Arc<dyn NegotiateHandler>,
         establish_handler: Arc<dyn EstablishHandler>,
     ) -> Self {
         Self {
             transport,
             inner: Arc::new(Mutex::new(PeerInner {
                 state: PeerState::Disconnected,
+                remote_capabilities: Capabilities {
+                    commands: Vec::new(),
+                    events: Vec::new(),
+                },
             })),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             establish_handler,
+            local_capabilities: capabilities,
+            negotiate_handler,
         }
     }
 
     /// Current protocol state.
     pub async fn state(&self) -> PeerState {
         self.inner.lock().await.state
+    }
+
+    /// Queries the remote peer's negotiated capabilities.
+    pub async fn remote_capabilities(&self) -> Capabilities {
+        self.inner.lock().await.remote_capabilities.clone()
+    }
+
+    // ---- Negotiation ----
+
+    /// Initiates capability negotiation.
+    ///
+    /// Must be called after `connect()` and before `establish()`.
+    /// Sends local capabilities to the peer, processes the peer's capabilities
+    /// via the registered `NegotiateHandler`, and transitions to `Negotiated` state.
+    pub async fn negotiate(&self) -> Result<(), XacppError> {
+        let state = self.state().await;
+        if state != PeerState::Connected {
+            return Err(XacppError::Internal(format!(
+                "negotiate requires Connected state, current: {:?}",
+                state
+            )));
+        }
+
+        let response = self
+            .transport
+            .send(
+                None,
+                XacppRequest::Command(XacppCommand::Negotiate {
+                    capabilities: self.local_capabilities.clone(),
+                }),
+            )
+            .await?;
+
+        match response {
+            XacppResponse::Negotiated { capabilities } => {
+                self.negotiate_handler.on_negotiate(capabilities.clone()).await?;
+                let mut inner = self.inner.lock().await;
+                inner.remote_capabilities = capabilities;
+                inner.state = PeerState::Negotiated;
+                Ok(())
+            }
+            XacppResponse::Error { code, message } => {
+                Err(XacppError::Application { code, message })
+            }
+            other => Err(XacppError::Internal(format!(
+                "unexpected response to negotiate: {:?}",
+                other
+            ))),
+        }
     }
 
     // ---- Connection Management ----
@@ -84,13 +147,24 @@ impl XacppPeer {
         let sessions = Arc::clone(&self.sessions);
         let establish_handler = Arc::clone(&self.establish_handler);
         let transport = Arc::clone(&self.transport);
+        let negotiate_handler = Arc::clone(&self.negotiate_handler);
+        let local_capabilities = self.local_capabilities.clone();
 
         self.transport.on_request(Arc::new(move |session_id, payload| {
             let sessions = Arc::clone(&sessions);
             let establish_handler = Arc::clone(&establish_handler);
             let transport = Arc::clone(&transport);
+            let negotiate_handler = Arc::clone(&negotiate_handler);
+            let local_capabilities = local_capabilities.clone();
             Box::pin(async move {
                 match (session_id, payload) {
+                    // Pre-session Negotiate request
+                    (None, XacppRequest::Command(XacppCommand::Negotiate { capabilities })) => {
+                        negotiate_handler.on_negotiate(capabilities).await?;
+                        Ok(XacppResponse::Negotiated {
+                            capabilities: local_capabilities,
+                        })
+                    }
                     // Pre-session Establish request
                     (None, XacppRequest::Command(XacppCommand::Establish { credentials })) => {
                         match establish_handler.on_establish(transport, credentials).await {
@@ -174,6 +248,14 @@ impl XacppPeer {
         handler: Arc<dyn XacppSessionHandler>,
         verify_challenge: impl FnOnce(String) -> Result<(), XacppError>,
     ) -> Result<XacppSession, XacppError> {
+        let state = self.state().await;
+        if state != PeerState::Negotiated {
+            return Err(XacppError::Internal(format!(
+                "establish requires Negotiated state, current: {:?}",
+                state
+            )));
+        }
+
         log::debug!("establish: sending Establish (credentials: {})", if credentials.is_some() { "present" } else { "none" });
 
         let response = self
@@ -265,6 +347,10 @@ impl XacppPeer {
         self.transport.disconnect().await?;
         let mut inner = self.inner.lock().await;
         inner.state = PeerState::Disconnected;
+        inner.remote_capabilities = Capabilities {
+            commands: Vec::new(),
+            events: Vec::new(),
+        };
         self.sessions.write().await.clear();
         Ok(())
     }

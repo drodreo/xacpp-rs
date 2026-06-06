@@ -5,12 +5,21 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::capability::Capabilities;
 use crate::events::content::ContentPart;
 
 /// XACPP protocol command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum XacppCommand {
+    /// Negotiate capabilities (must precede Establish).
+    ///
+    /// Initiator sends its capability list; responder processes them and
+    /// returns its own capability list.
+    Negotiate {
+        capabilities: Capabilities,
+    },
+
     /// Establish a logical session.
     ///
     /// First connection carries no credentials (`credentials` is None), responder asks user for trust;
