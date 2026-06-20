@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 
@@ -19,7 +20,7 @@ use xacpp::transport::XacppTransport;
 
 /// Creates a pair of SocketTransport connected via TCP (client + server).
 ///
-/// Server-side handler is specified by parameter, client handler returns Acknowledge.
+/// Server-side handler is specified by parameter, client handler returns acknowledge.
 async fn socket_pair(
     server_handler: Arc<
         dyn Fn(Option<String>, XacppRequest)
@@ -49,7 +50,7 @@ async fn socket_pair(
     let client: Arc<dyn XacppTransport> = Arc::new(SocketTransport::connect_to(addr_str));
     client
         .on_request(Arc::new(|_session_id, _payload| {
-            Box::pin(async { Ok(XacppResponse::Acknowledge) }) as _
+            Box::pin(async { Ok(XacppResponse::acknowledge()) }) as _
         }))
         .unwrap();
     client.connect().await.unwrap();
@@ -72,42 +73,34 @@ where
 
 #[tokio::test]
 async fn test_concurrent_requests_independent_processing() {
-    // Server handler: sleep 10ms then return Established response with command identifier
+    // Server handler: sleep 10ms then echo the command name back in a Generic response
     let server_handler = Arc::new(|_session_id, payload| {
         Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            let sid = match payload {
-                XacppRequest::Command(XacppCommand::NewActivity { .. }) => "new",
-                XacppRequest::Command(XacppCommand::InvokeActivity { .. }) => "invoke",
-                XacppRequest::Command(XacppCommand::CompactActivity { .. }) => "compact",
-                XacppRequest::Command(XacppCommand::CancelActivity { .. }) => "cancel",
-                XacppRequest::Command(XacppCommand::Establish { .. }) => "establish",
-                XacppRequest::Command(XacppCommand::LastActivity) => "last",
-                XacppRequest::Command(XacppCommand::ListActivity { .. }) => "list",
-                XacppRequest::Command(XacppCommand::SwitchActivity { .. }) => "switch",
-                _ => "other",
+            let name = match payload {
+                XacppRequest::Command(XacppCommand::Generic { name, .. }) => name,
+                XacppRequest::Command(XacppCommand::Establish { .. }) => "establish".to_string(),
+                XacppRequest::Command(XacppCommand::Negotiate { .. }) => "negotiate".to_string(),
+                _ => "other".to_string(),
             };
-            Ok(XacppResponse::Established {
-                session_id: sid.into(),
-                credentials: "auto-creds".into(),
-            })
+            Ok(XacppResponse::generic("echo", json!({ "command": name })))
         }) as _
     });
 
     let (client, _server) = socket_pair(server_handler).await;
 
     let commands = [
-        XacppCommand::NewActivity { title: None },
-        XacppCommand::InvokeActivity { activity: "act-1".into(), messages: vec![] },
-        XacppCommand::CompactActivity { activity: "act-1".into() },
-        XacppCommand::CancelActivity { activity: "act-1".into() },
+        XacppCommand::generic("new_activity", json!({})),
+        XacppCommand::generic("invoke_activity", json!({ "activity": "act-1", "messages": [] })),
+        XacppCommand::generic("compact_activity", json!({ "activity": "act-1" })),
+        XacppCommand::generic("cancel_activity", json!({ "activity": "act-1" })),
         XacppCommand::Establish { credentials: None },
-        XacppCommand::LastActivity,
-        XacppCommand::ListActivity { query: None, page_num: 1, page_size: 10 },
-        XacppCommand::SwitchActivity { activity: "act-1".into() },
+        XacppCommand::generic("last_activity", json!({})),
+        XacppCommand::generic("list_activity", json!({ "pageNum": 1, "pageSize": 10 })),
+        XacppCommand::generic("switch_activity", json!({ "activity": "act-1" })),
     ];
 
-    // Concurrently send 5 requests, measure time
+    // Concurrently send all requests, measure time
     let start = Instant::now();
     let mut handles = Vec::new();
     for cmd in commands {
@@ -125,21 +118,32 @@ async fn test_concurrent_requests_independent_processing() {
     }
     let elapsed = start.elapsed();
 
-    // Collect session_id (command identifier) from responses
-    let mut sids: Vec<&str> = responses
+    // Collect command name from Generic responses
+    let mut names: Vec<String> = responses
         .iter()
         .map(|r| match r {
-            XacppResponse::Established { session_id, .. } => session_id.as_str(),
-            other => panic!("expected Established, got: {other:?}"),
+            XacppResponse::Generic { name: _, data } => {
+                data["command"].as_str().unwrap().to_string()
+            }
+            other => panic!("expected Generic echo, got: {other:?}"),
         })
         .collect();
-    sids.sort();
+    names.sort();
 
     // All 8 responses received, no crosstalk
     assert_eq!(
-        sids,
-        ["cancel", "compact", "establish", "invoke", "last", "list", "new", "switch"],
-        "all 5 responses must match their commands"
+        names,
+        [
+            "cancel_activity",
+            "compact_activity",
+            "establish",
+            "invoke_activity",
+            "last_activity",
+            "list_activity",
+            "new_activity",
+            "switch_activity",
+        ],
+        "all responses must match their commands"
     );
 
     // Concurrent time < 50ms (serial would need 8×10ms=80ms)
@@ -154,15 +158,12 @@ async fn test_concurrent_requests_independent_processing() {
 
 #[tokio::test]
 async fn test_concurrent_write_no_data_corruption() {
-    // Server handler: returns 1KB text
+    // Server handler: returns 1KB text in Generic data
     let large_content = "A".repeat(1024);
     let server_handler = Arc::new(move |_session_id, _payload| {
         let text = large_content.clone();
         Box::pin(async move {
-            Ok(XacppResponse::Established {
-                session_id: text,
-                credentials: "auto-creds".into(),
-            })
+            Ok(XacppResponse::generic("large", json!({ "content": text })))
         }) as _
     });
 
@@ -173,9 +174,14 @@ async fn test_concurrent_write_no_data_corruption() {
     for _ in 0..10 {
         let c = Arc::clone(&client);
         handles.push(tokio::spawn(async move {
-            timeout_5s(c.send(None, XacppRequest::Command(XacppCommand::NewActivity { title: None })))
-                .await
-                .unwrap()
+            timeout_5s(
+                c.send(
+                    None,
+                    XacppRequest::Command(XacppCommand::generic("ping", json!({}))),
+                ),
+            )
+            .await
+            .unwrap()
         }));
     }
 
@@ -187,19 +193,20 @@ async fn test_concurrent_write_no_data_corruption() {
     // Each response content is complete (1KB, no truncation)
     for (i, resp) in responses.iter().enumerate() {
         match resp {
-            XacppResponse::Established { session_id, .. } => {
+            XacppResponse::Generic { name: _, data } => {
+                let content = data["content"].as_str().unwrap();
                 assert_eq!(
-                    session_id.len(),
+                    content.len(),
                     1024,
                     "response {i} truncated: {} bytes",
-                    session_id.len()
+                    content.len()
                 );
                 assert!(
-                    session_id.chars().all(|c| c == 'A'),
+                    content.chars().all(|c| c == 'A'),
                     "response {i} corrupted"
                 );
             }
-            other => panic!("response {i}: expected Established, got: {other:?}"),
+            other => panic!("response {i}: expected Generic, got: {other:?}"),
         }
     }
 }
@@ -222,8 +229,11 @@ async fn test_disconnect_aborts_inflight_no_deadlock() {
     for _ in 0..3 {
         let c = Arc::clone(&client);
         send_handles.push(tokio::spawn(async move {
-            c.send(None, XacppRequest::Command(XacppCommand::NewActivity { title: None }))
-                .await
+            c.send(
+                None,
+                XacppRequest::Command(XacppCommand::generic("ping", json!({}))),
+            )
+            .await
         }));
     }
 

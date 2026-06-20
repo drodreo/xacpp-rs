@@ -1,7 +1,8 @@
 //! XACPP Protocol Event Types.
 //!
-//! `XacppEvent` fully maps to x-agent's `AgentEvent`,
-//! serving as the standardized event stream between xagent and peers (e.g., xabot).
+//! `XacppEvent` is a generic `{ name, data }` structure.
+//! Type definitions for common event payloads are kept in submodules
+//! and serve as serialization targets for the `data` field.
 
 pub mod activity_event;
 pub mod content;
@@ -12,8 +13,8 @@ pub mod xacpp_event;
 
 pub use content::{AudioPart, ContentPart, FilePart, FileRef, ImagePart, TextPart, VideoPart};
 pub use interaction::{
-    ActionRequestEvent, ActionResponse, NotifyEvent, QuestionEvent, QuestionResponse,
-    SensitiveInfoItem, SensitiveInfoOperation, SensitiveInfoOperationEvent,
+    ActionRequestPayload, ActionResponse, NotifyPayload, QuestionPayload, QuestionResponse,
+    SensitiveInfoItem, SensitiveInfoOperation, SensitiveInfoOperationPayload,
     SensitiveInfoOperationResponse, SensitiveInfoResult, SensitiveInfoType,
 };
 pub use payload::{

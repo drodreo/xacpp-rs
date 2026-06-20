@@ -1,14 +1,17 @@
-//! Interaction event payloads (request-response pattern).
+//! Interaction command/response payloads.
 //!
-//! Events carry `responder` (oneshot Sender), consistent with x-agent's AgentEvent structure.
-//! During cross-process transmission, responder is `#[serde(skip)]` skipped; peer returns `XacppResponse`
-//! via Transport's on_event handler, and Transport auto-packs envelope to send back.
+//! These types serve as serialization targets for:
+//! - Command `arguments` when `name` is "action_request", "question", or "sensitive_info_operation".
+//! - Response `data` when `name` is "action", "question", or "sensitive_info_operation".
+//!
+//! The `responder` channel that existed in previous versions has been removed.
+//! Interaction requests are now Commands: the transport layer's request-response
+//! correlation handles matching responses back to the original sender.
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
+use serde_json::Value;
 
 use super::payload::AlertLevel;
-use crate::message::XacppResponse;
 
 // ---- Tool Call Authorization ----
 
@@ -24,13 +27,10 @@ pub enum ActionResponse {
     Reject { reason: String },
 }
 
-/// Tool call authorization request event payload.
-///
-/// For in-process usage, consumer replies `XacppResponse` via `responder`.
-/// During cross-process transmission, `responder` is None (auto-filled on deserialization), peer responds via transport.
-#[derive(Debug, Serialize, Deserialize)]
+/// Tool call authorization request payload (command arguments).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ActionRequestEvent {
+pub struct ActionRequestPayload {
     pub request_id: String,
     pub tool_name: String,
     pub arguments: String,
@@ -38,17 +38,14 @@ pub struct ActionRequestEvent {
     pub description: String,
     pub alert: AlertLevel,
     pub intent: String,
-    /// Callback channel. Consumer sends authorization decision via this channel.
-    #[serde(skip)]
-    pub responder: Option<oneshot::Sender<XacppResponse>>,
 }
 
 // ---- Notification ----
 
-/// User notification event payload (one-way push, non-blocking wait for reply).
+/// User notification event payload (one-way push via Event).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct NotifyEvent {
+pub struct NotifyPayload {
     pub request_id: String,
     pub message: String,
 }
@@ -65,16 +62,13 @@ pub enum QuestionResponse {
     Skip { reason: Option<String> },
 }
 
-/// User question event payload.
-#[derive(Debug, Serialize, Deserialize)]
+/// User question request payload (command arguments).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct QuestionEvent {
+pub struct QuestionPayload {
     pub request_id: String,
     pub question: String,
     pub options: Vec<String>,
-    /// Callback channel. Consumer replies with answer via this channel.
-    #[serde(skip)]
-    pub responder: Option<oneshot::Sender<XacppResponse>>,
 }
 
 // ---- Sensitive Info ----
@@ -126,13 +120,51 @@ pub struct SensitiveInfoOperationResponse {
     pub results: Vec<SensitiveInfoResult>,
 }
 
-/// Sensitive info operation request event payload.
-#[derive(Debug, Serialize, Deserialize)]
+/// Sensitive info operation request payload (command arguments).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SensitiveInfoOperationEvent {
+pub struct SensitiveInfoOperationPayload {
     pub request_id: String,
     pub operation: SensitiveInfoOperation,
-    /// Callback channel. Consumer sends operation result via this channel.
-    #[serde(skip)]
-    pub responder: Option<oneshot::Sender<XacppResponse>>,
+}
+
+// ---- Convenience: build interaction commands ----
+
+/// Builds an `action_request` command from a payload.
+pub fn action_request_command(activity: &str, payload: &ActionRequestPayload) -> Value {
+    serde_json::to_value(payload).map(|p| {
+        let mut map = if let Value::Object(m) = p {
+            m
+        } else {
+            serde_json::Map::new()
+        };
+        map.insert("activity".to_string(), Value::String(activity.to_string()));
+        Value::Object(map)
+    }).unwrap_or(Value::Null)
+}
+
+/// Builds a `question` command from a payload.
+pub fn question_command(activity: &str, payload: &QuestionPayload) -> Value {
+    serde_json::to_value(payload).map(|p| {
+        let mut map = if let Value::Object(m) = p {
+            m
+        } else {
+            serde_json::Map::new()
+        };
+        map.insert("activity".to_string(), Value::String(activity.to_string()));
+        Value::Object(map)
+    }).unwrap_or(Value::Null)
+}
+
+/// Builds a `sensitive_info_operation` command from a payload.
+pub fn sensitive_info_command(activity: &str, payload: &SensitiveInfoOperationPayload) -> Value {
+    serde_json::to_value(payload).map(|p| {
+        let mut map = if let Value::Object(m) = p {
+            m
+        } else {
+            serde_json::Map::new()
+        };
+        map.insert("activity".to_string(), Value::String(activity.to_string()));
+        Value::Object(map)
+    }).unwrap_or(Value::Null)
 }

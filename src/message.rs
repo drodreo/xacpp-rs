@@ -5,47 +5,41 @@
 //! - **Envelope layer**: `type` (routing) + `id` (correlation) + `payload` (business content)
 //! - **Payload layer**: `XacppRequest` / `XacppResponse`
 //!
-//! Transport layer is responsible for envelope assembly/disassembly and id correlation; upper layers only operate on payloads.
+//! ## Design
 //!
-//! ## JSON Format Examples
+//! Protocol responses (Negotiated, Established, EstablishPrepare, EstablishReject) are typed
+//! variants handled by the Peer layer during connection setup.
 //!
-//! ```json
-//! Request (Command): {"id":"r1","type":"request","payload":{"kind":"command","payload":{"establish":{}}}}
-//! Response (Established): {"id":"r1","type":"response","payload":{"kind":"established","sessionId":"s1","credentials":"issued-creds"}}
-//! ```
+//! Business responses use the `Generic { name, data }` variant — a uniform structure
+//! where `name` identifies the response type and `data` carries the response-specific payload.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::capability::Capabilities;
 use crate::commands::XacppCommand;
-use crate::events::ActivityInfo;
-use crate::events::XacppActivityEvent;
-use crate::events::{ActionResponse, QuestionResponse, SensitiveInfoOperationResponse};
+use crate::events::activity_event::XacppActivityEvent;
 
 // ---- Payload Types ----
 
 /// Request payload.
-///
-/// Received by Transport's `send` method.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)] // Protocol serde type, Box has no deserialization benefit
+#[allow(clippy::large_enum_variant)]
 pub enum XacppRequest {
-    /// Protocol command.
+    /// Protocol or business command.
     Command(XacppCommand),
-    /// Protocol event.
+    /// Activity event (one-way notification).
     Event(XacppActivityEvent),
 }
 
 /// Response payload.
-///
-/// Returned by Transport's `send` method.
-/// After handler returns this type, Transport automatically packs it into an envelope with the same id and sends back.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum XacppResponse {
+    // ---- Protocol responses (Peer layer) ----
+
     /// Capability negotiation response.
-    /// Responder returns its own capability list after processing the initiator's.
     Negotiated {
         capabilities: Capabilities,
     },
@@ -55,46 +49,29 @@ pub enum XacppResponse {
         session_id: String,
         credentials: String,
     },
+
     /// Challenge issued during first-time establishment.
     EstablishPrepare {
         challenge: String,
     },
+
     /// Handshake rejected.
     EstablishReject {
         reason: String,
     },
-    /// Tool invocation authorization response.
-    Action {
-        request_id: String,
-        #[serde(flatten)]
-        response: ActionResponse,
+
+    // ---- Business response (SessionHandler layer) ----
+
+    /// Generic business response.
+    ///
+    /// `name` identifies the response type (e.g. "activity_ready", "acknowledge", "action").
+    /// `data` carries the response-specific JSON payload.
+    Generic {
+        name: String,
+        #[serde(default)]
+        data: Value,
     },
-    /// User question response.
-    Question {
-        request_id: String,
-        #[serde(flatten)]
-        response: QuestionResponse,
-    },
-    /// Sensitive information operation response.
-    SensitiveInfoOperation {
-        request_id: String,
-        #[serde(flatten)]
-        response: SensitiveInfoOperationResponse,
-    },
-    /// Activity ready for interaction.
-    ActivityReady {
-        #[serde(flatten)]
-        info: ActivityInfo,
-    },
-    /// Activity not found.
-    ActivityNotFound,
-    /// Available activities list.
-    AvailableActivities {
-        total: u32,
-        activities: Vec<ActivityInfo>,
-    },
-    /// Generic acknowledge: request processed successfully, no data returned.
-    Acknowledge,
+
     /// Processing failed.
     Error {
         code: String,
@@ -102,12 +79,35 @@ pub enum XacppResponse {
     },
 }
 
+impl XacppResponse {
+    /// Convenience: creates a generic acknowledge response.
+    pub fn acknowledge() -> Self {
+        XacppResponse::Generic {
+            name: "acknowledge".to_string(),
+            data: Value::Null,
+        }
+    }
+
+    /// Convenience: creates a generic response with name and data.
+    pub fn generic(name: impl Into<String>, data: Value) -> Self {
+        XacppResponse::Generic {
+            name: name.into(),
+            data,
+        }
+    }
+
+    /// Convenience: creates an error response.
+    pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
+        XacppResponse::Error {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
 // ---- Envelope Types ----
 
 /// Wire message.
-///
-/// Envelope layer handles routing: `type` field distinguishes requests and responses,
-/// `id` is used for correlation, `payload` carries business content.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum XacppEnvelope {

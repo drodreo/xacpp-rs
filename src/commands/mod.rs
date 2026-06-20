@@ -1,84 +1,66 @@
 //! XACPP protocol command types.
 //!
-//! Commands are passed through transport, driving the interaction flow between xagent and peers.
-//! Command payload definitions are in submodules under the same directory.
+//! Commands are request-response: the sender always expects a Response.
+//!
+//! Wire format uses externally-tagged enum serialization:
+//! - Protocol commands (Negotiate/Establish/EstablishConfirm) use their own variant tag.
+//! - Business commands use the `Generic` variant wrapper.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::capability::Capabilities;
-use crate::events::content::ContentPart;
 
 /// XACPP protocol command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum XacppCommand {
+    // ---- Protocol commands (handled by Peer layer) ----
+
     /// Negotiate capabilities (must precede Establish).
-    ///
-    /// Initiator sends its capability list; responder processes them and
-    /// returns its own capability list.
     Negotiate {
         capabilities: Capabilities,
     },
 
     /// Establish a logical session.
-    ///
-    /// First connection carries no credentials (`credentials` is None), responder asks user for trust;
-    /// after user agrees, credentials and session identifier are issued. Subsequent connections carry saved credentials,
-    /// responder verifies and issues session identifier.
     Establish {
-        /// Authentication credentials. None for first connection.
         #[serde(skip_serializing_if = "Option::is_none")]
         credentials: Option<String>,
     },
 
-    /// Confirm establishment after challenge verification (phase 3 of 3-way handshake).
+    /// Confirm establishment after challenge verification.
     EstablishConfirm,
 
-    /// Resume the last active Activity.
-    LastActivity,
+    // ---- Business command (handled by SessionHandler) ----
 
-    /// Create a new Activity session.
-    NewActivity {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        title: Option<String>,
+    /// Generic business command.
+    ///
+    /// `name` identifies the command type (e.g. "new_activity", "action_request").
+    /// `arguments` carries the command-specific JSON payload.
+    Generic {
+        name: String,
+        arguments: Value,
     },
+}
 
-    /// List available Activities with pagination.
-    ListActivity {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        query: Option<String>,
-        page_num: u32,
-        page_size: u32,
-    },
+impl XacppCommand {
+    /// Convenience constructor for generic business commands.
+    pub fn generic(name: impl Into<String>, arguments: Value) -> Self {
+        XacppCommand::Generic {
+            name: name.into(),
+            arguments,
+        }
+    }
 
-    /// Switch to an existing Activity.
-    SwitchActivity {
-        /// Target activity unique identifier.
-        activity: String,
-    },
-
-    /// Invoke an existing Activity to perform operations.
-    InvokeActivity {
-        /// Target activity identifier.
-        activity: String,
-        /// Input messages for the activity.
-        messages: Vec<ContentPart>,
-    },
-
-    /// Compact Activity (reclaim resources / generate snapshot summary).
-    CompactActivity {
-        /// Target activity identifier.
-        activity: String,
-    },
-
-    /// Cancel Activity.
-    CancelActivity {
-        /// Target activity identifier.
-        activity: String,
-    },
-
-    /// Send a message outside of any activity context.
-    Message {
-        content: Vec<ContentPart>,
-    },
+    /// Returns the command name for capability-matching purposes.
+    ///
+    /// Protocol commands return their variant name; generic commands return the `name` field.
+    pub fn name(&self) -> &str {
+        match self {
+            XacppCommand::Negotiate { .. } => "negotiate",
+            XacppCommand::Establish { .. } => "establish",
+            XacppCommand::EstablishConfirm => "establish_confirm",
+            XacppCommand::Generic { name, .. } => name,
+        }
+    }
 }
