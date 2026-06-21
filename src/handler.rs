@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::capability::Capabilities;
+use crate::capability::EffectiveCapabilities;
 use crate::commands::XacppCommand;
 use crate::error::XacppError;
 use crate::events::XacppActivityEvent;
@@ -52,19 +52,23 @@ pub trait XacppSessionHandler: Send + Sync {
 
 /// Negotiate phase handler.
 ///
-/// Called when the peer's capability list is received during the Negotiate phase.
-/// The upper layer processes the remote capabilities (e.g. registering them as tools)
-/// and returns Ok on success or Err to reject the negotiation.
+/// Called when the negotiate phase completes. The protocol layer has already
+/// computed the effective capabilities (intersection of local and remote),
+/// and passes the result to the application layer.
+///
+/// The application layer only needs to consume the result:
+/// - `remote_commands`: which commands the peer can handle (use these names to send commands)
+/// - `emit_events`: which events we are allowed to send (local.produce_events ∩ remote.accept_events)
 #[async_trait]
 pub trait NegotiateHandler: Send + Sync {
-    /// Processes the remote peer's capability list.
+    /// Processes the negotiated effective capabilities.
     ///
     /// Called on both sides: on the responder when it receives the initiator's
     /// capabilities, and on the initiator when it receives the responder's
     /// capabilities in the response.
     async fn on_negotiate(
         &self,
-        remote_capabilities: Capabilities,
+        effective: EffectiveCapabilities,
     ) -> Result<(), XacppError>;
 }
 

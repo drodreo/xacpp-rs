@@ -160,7 +160,8 @@ fn test_command_negotiate_roundtrip() {
     let cmd = XacppCommand::Negotiate {
         capabilities: xacpp::capability::Capabilities {
             commands: vec![json!({ "name": "new_activity" })],
-            events: vec![json!({ "name": "content_delta" })],
+            produce_events: vec![json!({ "name": "content_delta" })],
+            accept_events: Vec::new(),
         },
     };
 
@@ -171,7 +172,7 @@ fn test_command_negotiate_roundtrip() {
     match de {
         XacppCommand::Negotiate { capabilities } => {
             assert_eq!(capabilities.commands.len(), 1);
-            assert_eq!(capabilities.events.len(), 1);
+            assert_eq!(capabilities.produce_events.len(), 1);
         }
         other => panic!("unexpected: {other:?}"),
     }
@@ -272,7 +273,8 @@ fn test_response_negotiated_roundtrip() {
     let resp = XacppResponse::Negotiated {
         capabilities: xacpp::capability::Capabilities {
             commands: vec![json!({ "name": "new_activity" })],
-            events: vec![],
+            produce_events: vec![],
+            accept_events: Vec::new(),
         },
     };
 

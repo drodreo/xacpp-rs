@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
 
-use crate::capability::Capabilities;
+use crate::capability::{Capabilities, EffectiveCapabilities};
 use crate::commands::XacppCommand;
 use crate::error::XacppError;
 use crate::events::XacppActivityEvent;
@@ -42,6 +42,8 @@ pub enum PeerState {
 struct PeerInner {
     state: PeerState,
     remote_capabilities: Capabilities,
+    /// negotiate 后缓存的交集结果（local.produce_events ∩ remote.accept_events）
+    emit_events: Vec<String>,
 }
 
 /// XACPP protocol endpoint.
@@ -51,6 +53,9 @@ struct PeerInner {
 pub struct XacppPeer {
     transport: Arc<dyn XacppTransport>,
     inner: Arc<Mutex<PeerInner>>,
+    /// Shared emit_events cache for Responder-side negotiation in connect closure.
+    /// The closure cannot access `inner` directly, so we use this Arc to share state.
+    emit_events: Arc<Mutex<Vec<String>>>,
     sessions: Arc<RwLock<HashMap<String, Arc<dyn XacppSessionHandler>>>>,
     establish_handler: Arc<dyn EstablishHandler>,
     local_capabilities: Capabilities,
@@ -73,9 +78,12 @@ impl XacppPeer {
                 state: PeerState::Disconnected,
                 remote_capabilities: Capabilities {
                     commands: Vec::new(),
-                    events: Vec::new(),
+                    produce_events: Vec::new(),
+                    accept_events: Vec::new(),
                 },
+                emit_events: Vec::new(),
             })),
+            emit_events: Arc::new(Mutex::new(Vec::new())),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             establish_handler,
             local_capabilities: capabilities,
@@ -91,6 +99,11 @@ impl XacppPeer {
     /// Queries the remote peer's negotiated capabilities.
     pub async fn remote_capabilities(&self) -> Capabilities {
         self.inner.lock().await.remote_capabilities.clone()
+    }
+
+    /// Queries the negotiated emit_events (local.produce_events ∩ remote.accept_events).
+    pub async fn emit_events(&self) -> Vec<String> {
+        self.inner.lock().await.emit_events.clone()
     }
 
     // ---- Negotiation ----
@@ -121,9 +134,15 @@ impl XacppPeer {
 
         match response {
             XacppResponse::Negotiated { capabilities } => {
-                self.negotiate_handler.on_negotiate(capabilities.clone()).await?;
+                // 协议层计算交集
+                let effective = EffectiveCapabilities::from_capabilities(
+                    &self.local_capabilities,
+                    &capabilities,
+                );
+                self.negotiate_handler.on_negotiate(effective.clone()).await?;
                 let mut inner = self.inner.lock().await;
                 inner.remote_capabilities = capabilities;
+                inner.emit_events = effective.emit_events;
                 inner.state = PeerState::Negotiated;
                 Ok(())
             }
@@ -149,6 +168,7 @@ impl XacppPeer {
         let transport = Arc::clone(&self.transport);
         let negotiate_handler = Arc::clone(&self.negotiate_handler);
         let local_capabilities = self.local_capabilities.clone();
+        let emit_events = Arc::clone(&self.emit_events);
 
         self.transport.on_request(Arc::new(move |session_id, payload| {
             let sessions = Arc::clone(&sessions);
@@ -156,11 +176,19 @@ impl XacppPeer {
             let transport = Arc::clone(&transport);
             let negotiate_handler = Arc::clone(&negotiate_handler);
             let local_capabilities = local_capabilities.clone();
+            let emit_events = Arc::clone(&emit_events);
             Box::pin(async move {
                 match (session_id, payload) {
                     // Pre-session Negotiate request
                     (None, XacppRequest::Command(XacppCommand::Negotiate { capabilities })) => {
-                        negotiate_handler.on_negotiate(capabilities).await?;
+                        // 协议层计算交集
+                        let effective = EffectiveCapabilities::from_capabilities(
+                            &local_capabilities,
+                            &capabilities,
+                        );
+                        negotiate_handler.on_negotiate(effective.clone()).await?;
+                        // 缓存 emit_events 交集结果（Responder 端无法直接访问 inner）
+                        *emit_events.lock().await = effective.emit_events;
                         Ok(XacppResponse::Negotiated {
                             capabilities: local_capabilities,
                         })
@@ -349,8 +377,10 @@ impl XacppPeer {
         inner.state = PeerState::Disconnected;
         inner.remote_capabilities = Capabilities {
             commands: Vec::new(),
-            events: Vec::new(),
+            produce_events: Vec::new(),
+            accept_events: Vec::new(),
         };
+        inner.emit_events.clear();
         self.sessions.write().await.clear();
         Ok(())
     }
@@ -369,11 +399,21 @@ impl XacppPeer {
     }
 
     /// Sends an interactive event and waits for a response (no session context).
+    ///
+    /// Protocol layer validates that the event name is in the negotiated emit_events capability.
     pub async fn request_event(
         &self,
         session_id: Option<&str>,
         event: XacppActivityEvent,
     ) -> Result<XacppResponse, XacppError> {
+        // 校验事件名在 emit_events 交集里
+        let event_name = &event.event.name;
+        let emit_events = self.inner.lock().await.emit_events.clone();
+        if !emit_events.is_empty() && !emit_events.contains(event_name) {
+            return Err(XacppError::Internal(format!(
+                "event '{}' not in negotiated emit_events capability", event_name
+            )));
+        }
         self.transport
             .send(session_id, XacppRequest::Event(event))
             .await
