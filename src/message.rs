@@ -35,7 +35,7 @@ pub enum XacppRequest {
 
 /// Response payload.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum XacppResponse {
     // ---- Protocol responses (Peer layer) ----
 
@@ -123,4 +123,31 @@ pub enum XacppEnvelope {
         session_id: Option<String>,
         payload: XacppResponse,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_envelope_negotiated_response_deserialize_xabot_wire() {
+        let json = r#"{"type":"response","id":"r1","payload":{"kind":"negotiated","capabilities":{"commands":[],"produceEvents":[],"acceptEvents":[]}}}"#;
+        let env: XacppEnvelope = serde_json::from_str(json).unwrap();
+        match env {
+            XacppEnvelope::Response { id, payload, .. } => {
+                assert_eq!(id, "r1");
+                assert!(matches!(payload, XacppResponse::Negotiated { .. }));
+            }
+            _ => panic!("expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_response_generic_roundtrip_xabot_wire() {
+        let wire = r#"{"kind":"generic","name":"activity_ready","data":{"activity":"act-1"}}"#;
+        let resp: XacppResponse = serde_json::from_str(wire).unwrap();
+        let ser = serde_json::to_string(&resp).unwrap();
+        assert!(ser.contains(r#""kind":"generic""#), "ser={}", ser);
+        assert!(ser.contains(r#""name":"activity_ready""#), "ser={}", ser);
+    }
 }

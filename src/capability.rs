@@ -189,4 +189,37 @@ mod tests {
         assert!(effective.remote_commands.is_empty());
         assert!(effective.emit_events.is_empty());
     }
+
+    #[test]
+    fn test_remote_commands_full_schema() {
+        // remote.commands contains a command with full schema (name + description + parameters)
+        let local = Capabilities {
+            commands: vec![],
+            produce_events: vec![],
+            accept_events: vec![],
+        };
+        let remote = Capabilities {
+            commands: vec![serde_json::json!({
+                "name": "new_activity",
+                "description": "Create a new activity",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string" }
+                    }
+                }
+            })],
+            produce_events: vec![],
+            accept_events: vec![],
+        };
+
+        let effective = EffectiveCapabilities::from_capabilities(&local, &remote);
+
+        // Should preserve the full schema, not just the name field
+        assert_eq!(effective.remote_commands.len(), 1);
+        let cmd = &effective.remote_commands[0];
+        assert_eq!(cmd["name"], "new_activity");
+        assert_eq!(cmd["description"], "Create a new activity");
+        assert!(cmd["parameters"].is_object());
+    }
 }

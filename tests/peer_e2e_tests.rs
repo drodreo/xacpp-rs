@@ -714,6 +714,118 @@ async fn test_negotiate_capabilities_preserved() {
     assert_eq!(remote.produce_events[1]["name"], "question");
 }
 
+// ============================================================================
+// Emit Events Intersection Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_emit_events_intersection() {
+    // caps_a: produce [content_delta, think], accept []
+    // caps_b: produce [], accept [content_delta, info]
+    // After negotiation:
+    //   - peer_a.emit_events = [content_delta] (think filtered out, not in b.accept)
+    //   - peer_b.emit_events = [] (b produces nothing)
+    let (transport_a, transport_b) = duplex_pair();
+
+    let caps_a = Capabilities {
+        commands: vec![],
+        produce_events: vec![
+            serde_json::json!({ "name": "content_delta" }),
+            serde_json::json!({ "name": "think" }),
+        ],
+        accept_events: Vec::new(),
+    };
+    let caps_b = Capabilities {
+        commands: vec![],
+        produce_events: Vec::new(),
+        accept_events: vec![
+            serde_json::json!({ "name": "content_delta" }),
+            serde_json::json!({ "name": "info" }),
+        ],
+    };
+
+    let negotiate_a = Arc::new(AcceptNegotiateHandler::new());
+    let negotiate_b = Arc::new(AcceptNegotiateHandler::new());
+    let negotiate_a_clone = negotiate_a.clone();
+    let negotiate_b_clone = negotiate_b.clone();
+
+    let peer_a = XacppPeer::new(
+        caps_a,
+        transport_a,
+        negotiate_a,
+        Arc::new(AutoApproveEstablishHandler),
+    );
+    let peer_b = XacppPeer::new(
+        caps_b,
+        transport_b,
+        negotiate_b,
+        Arc::new(AutoApproveEstablishHandler),
+    );
+    peer_a.connect().await.unwrap();
+    peer_b.connect().await.unwrap();
+
+    timeout(peer_a.negotiate()).await.unwrap();
+
+    // peer_a receives b's effective capabilities (intersection)
+    let received_by_a = negotiate_a_clone.get_received().unwrap();
+    assert_eq!(received_by_a.emit_events, vec!["content_delta"]);
+    // think was filtered out: not in caps_b.accept_events
+
+    // peer_b receives a's effective capabilities (intersection)
+    let received_by_b = negotiate_b_clone.get_received().unwrap();
+    assert_eq!(received_by_b.emit_events, Vec::<String>::new());
+    // caps_b produces nothing, so emit_events is empty
+}
+
+#[tokio::test]
+async fn test_request_event_rejected_by_emit_events() {
+    // caps_a: produce [content_delta], caps_b: accept [content_delta]
+    // After negotiation, emit_events = [content_delta]
+    // Sending "think" event should be rejected (not in emit_events)
+    let (transport_a, transport_b) = duplex_pair();
+
+    let caps_a = Capabilities {
+        commands: vec![],
+        produce_events: vec![serde_json::json!({ "name": "content_delta" })],
+        accept_events: Vec::new(),
+    };
+    let caps_b = Capabilities {
+        commands: vec![],
+        produce_events: Vec::new(),
+        accept_events: vec![serde_json::json!({ "name": "content_delta" })],
+    };
+
+    let peer_a = XacppPeer::new(
+        caps_a,
+        transport_a,
+        Arc::new(AcceptNegotiateHandler::new()),
+        Arc::new(AutoApproveEstablishHandler),
+    );
+    let peer_b = XacppPeer::new(
+        caps_b,
+        transport_b,
+        Arc::new(AcceptNegotiateHandler::new()),
+        Arc::new(AutoApproveEstablishHandler),
+    );
+    peer_a.connect().await.unwrap();
+    peer_b.connect().await.unwrap();
+
+    timeout(peer_a.negotiate()).await.unwrap();
+
+    // Try to send "think" event via peer.request_event (not session.request_event)
+    let result = peer_a
+        .request_event(
+            None,
+            XacppActivityEvent {
+                activity: "test-act".into(),
+                event: XacppEvent::new("think", json!({ "content": "hello" })),
+            },
+        )
+        .await;
+
+    assert!(result.is_err(), "sending non-emit event should be rejected");
+}
+
 #[tokio::test]
 async fn test_session_request_event() {
     let (peer_a, _peer_b) = negotiated_peers().await;
