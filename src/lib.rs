@@ -36,7 +36,7 @@
 //!
 //! ```json
 //! Request: {"type":"request","id":"r1","payload":{"kind":"command","payload":{"establish":{}}}}
-//! Request: {"type":"request","id":"r2","session_id":"s1","payload":{"kind":"event","payload":{"activity":"act-1","event":{"type":"think","content":"hi"}}}}
+//! Request: {"type":"request","id":"r2","session_id":"s1","payload":{"kind":"event","payload":{"activity":{"id":"act-1"},"event":{"name":"think","data":null}}}}
 //! Response: {"type":"response","id":"r1","payload":{"kind":"established","sessionId":"s1","credentials":"issued-creds"}}
 //! Response: {"type":"response","id":"r2","session_id":"s1","payload":{"kind":"action","requestId":"req-1","type":"approve"}}
 //! ```
@@ -50,6 +50,7 @@
 //! - **Peer to upper**: exposes typed `establish` / `request_command` / `request_event`
 //! - **Session to upper**: holds `XacppSessionHandler`, sends/receives directly through Transport
 
+pub mod activity_ref;
 pub mod capability;
 pub mod commands;
 pub mod error;

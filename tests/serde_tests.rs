@@ -6,13 +6,14 @@
 
 use serde_json::json;
 
+use xacpp::activity_ref::ActivityRef;
 use xacpp::commands::XacppCommand;
 use xacpp::events::content::FileRef;
 use xacpp::events::interaction::{
-    action_request_command, question_command, sensitive_info_command,
-    ActionRequestPayload, ActionResponse, QuestionPayload, QuestionResponse,
-    SensitiveInfoItem, SensitiveInfoOperation, SensitiveInfoOperationPayload,
-    SensitiveInfoOperationResponse, SensitiveInfoResult, SensitiveInfoType,
+    ActionRequestPayload, ActionResponse, QuestionPayload, QuestionResponse, SensitiveInfoItem,
+    SensitiveInfoOperation, SensitiveInfoOperationPayload, SensitiveInfoOperationResponse,
+    SensitiveInfoResult, SensitiveInfoType, action_request_command, question_command,
+    sensitive_info_command,
 };
 use xacpp::events::payload::{AlertLevel, TraceableEvent};
 use xacpp::events::{XacppActivityEvent, XacppEvent};
@@ -100,7 +101,9 @@ fn test_command_generic_roundtrip() {
 
     let de: XacppCommand = serde_json::from_str(&s).unwrap();
     match de {
-        XacppCommand::Generic { name, arguments } => {
+        XacppCommand::Generic {
+            name, arguments, ..
+        } => {
             assert_eq!(name, "new_activity");
             assert_eq!(arguments["title"], "test");
         }
@@ -117,7 +120,9 @@ fn test_command_generic_empty_arguments() {
 
     let de: XacppCommand = serde_json::from_str(&s).unwrap();
     match de {
-        XacppCommand::Generic { name, arguments } => {
+        XacppCommand::Generic {
+            name, arguments, ..
+        } => {
             assert_eq!(name, "last_activity");
             assert!(arguments.is_object());
         }
@@ -240,7 +245,10 @@ fn test_response_error_roundtrip() {
     let s = serde_json::to_string(&resp).unwrap();
     assert!(s.contains(r#""error""#), "json: {s}");
     assert!(s.contains(r#""code":"internal_error""#), "json: {s}");
-    assert!(s.contains(r#""message":"something went wrong""#), "json: {s}");
+    assert!(
+        s.contains(r#""message":"something went wrong""#),
+        "json: {s}"
+    );
 
     let de: XacppResponse = serde_json::from_str(&s).unwrap();
     match de {
@@ -336,7 +344,11 @@ fn test_wire_request_command_roundtrip() {
 
     let de: XacppEnvelope = serde_json::from_str(&json).unwrap();
     match de {
-        XacppEnvelope::Request { id, session_id: _, payload } => {
+        XacppEnvelope::Request {
+            id,
+            session_id: _,
+            payload,
+        } => {
             assert_eq!(id, "r1");
             assert!(matches!(
                 payload,
@@ -370,7 +382,9 @@ fn test_wire_request_generic_command_roundtrip() {
         XacppEnvelope::Request { id, payload, .. } => {
             assert_eq!(id, "r1");
             match payload {
-                XacppRequest::Command(XacppCommand::Generic { name, arguments }) => {
+                XacppRequest::Command(XacppCommand::Generic {
+                    name, arguments, ..
+                }) => {
                     assert_eq!(name, "new_activity");
                     assert_eq!(arguments["title"], "test");
                 }
@@ -387,7 +401,7 @@ fn test_wire_request_event_roundtrip() {
         id: "r2".into(),
         session_id: None,
         payload: XacppRequest::Event(XacppActivityEvent {
-            activity: "test-act".into(),
+            activity: ActivityRef::new("test-act"),
             event: XacppEvent::new("think", json!({ "content": "hi" })),
         }),
     };
@@ -395,16 +409,23 @@ fn test_wire_request_event_roundtrip() {
     assert!(json.contains(r#""type":"request""#), "json: {json}");
     assert!(json.contains(r#""id":"r2""#), "json: {json}");
     assert!(json.contains(r#""kind":"event""#), "json: {json}");
-    assert!(json.contains(r#""activity":"test-act""#), "json: {json}");
+    assert!(
+        json.contains(r#""activity":{"id":"test-act"}"#),
+        "json: {json}"
+    );
     assert!(json.contains(r#""name":"think""#), "json: {json}");
 
     let de: XacppEnvelope = serde_json::from_str(&json).unwrap();
     match de {
-        XacppEnvelope::Request { id, session_id: _, payload } => {
+        XacppEnvelope::Request {
+            id,
+            session_id: _,
+            payload,
+        } => {
             assert_eq!(id, "r2");
             match payload {
                 XacppRequest::Event(XacppActivityEvent { activity, event }) => {
-                    assert_eq!(activity, "test-act");
+                    assert_eq!(activity, ActivityRef::new("test-act"));
                     assert_eq!(event.name, "think");
                     assert_eq!(event.data["content"], "hi");
                 }
@@ -433,7 +454,11 @@ fn test_wire_response_established_roundtrip() {
 
     let de: XacppEnvelope = serde_json::from_str(&json).unwrap();
     match de {
-        XacppEnvelope::Response { id, session_id: _, payload } => {
+        XacppEnvelope::Response {
+            id,
+            session_id: _,
+            payload,
+        } => {
             assert_eq!(id, "r1");
             assert!(matches!(payload, XacppResponse::Established { .. }));
         }
@@ -457,7 +482,11 @@ fn test_wire_response_generic_roundtrip() {
 
     let de: XacppEnvelope = serde_json::from_str(&json).unwrap();
     match de {
-        XacppEnvelope::Response { id, session_id: _, payload } => {
+        XacppEnvelope::Response {
+            id,
+            session_id: _,
+            payload,
+        } => {
             assert_eq!(id, "r2");
             match payload {
                 XacppResponse::Generic { name, data } => {
@@ -484,7 +513,11 @@ fn test_wire_response_acknowledge_roundtrip() {
 
     let de: XacppEnvelope = serde_json::from_str(&json).unwrap();
     match de {
-        XacppEnvelope::Response { id, session_id: _, payload } => {
+        XacppEnvelope::Response {
+            id,
+            session_id: _,
+            payload,
+        } => {
             assert_eq!(id, "r3");
             match payload {
                 XacppResponse::Generic { name, .. } => assert_eq!(name, "acknowledge"),
@@ -513,7 +546,11 @@ fn test_wire_response_error_roundtrip() {
 
     let de: XacppEnvelope = serde_json::from_str(&json).unwrap();
     match de {
-        XacppEnvelope::Response { id, session_id: _, payload } => {
+        XacppEnvelope::Response {
+            id,
+            session_id: _,
+            payload,
+        } => {
             assert_eq!(id, "r4");
             match payload {
                 XacppResponse::Error { code, message } => {
@@ -536,7 +573,9 @@ fn test_deserialize_request_from_json() {
     let json = br#"{"type":"request","id":"r1","payload":{"kind":"command","payload":{"establish":{"credentials":null}}}}"#;
     let de: XacppEnvelope = serde_json::from_slice(json).unwrap();
     match de {
-        XacppEnvelope::Request { id, session_id: _, .. } => assert_eq!(id, "r1"),
+        XacppEnvelope::Request {
+            id, session_id: _, ..
+        } => assert_eq!(id, "r1"),
         XacppEnvelope::Response { .. } => panic!("expected Request"),
     }
 }
@@ -546,11 +585,17 @@ fn test_deserialize_generic_command_from_json() {
     let json = br#"{"type":"request","id":"r1","session_id":"s1","payload":{"kind":"command","payload":{"generic":{"name":"new_activity","arguments":{"title":"test"}}}}}"#;
     let de: XacppEnvelope = serde_json::from_slice(json).unwrap();
     match de {
-        XacppEnvelope::Request { id, session_id, payload } => {
+        XacppEnvelope::Request {
+            id,
+            session_id,
+            payload,
+        } => {
             assert_eq!(id, "r1");
             assert_eq!(session_id.as_deref(), Some("s1"));
             match payload {
-                XacppRequest::Command(XacppCommand::Generic { name, arguments }) => {
+                XacppRequest::Command(XacppCommand::Generic {
+                    name, arguments, ..
+                }) => {
                     assert_eq!(name, "new_activity");
                     assert_eq!(arguments["title"], "test");
                 }
@@ -563,17 +608,19 @@ fn test_deserialize_generic_command_from_json() {
 
 #[test]
 fn test_deserialize_response_from_json() {
-    let json = br#"{"type":"response","id":"r1","payload":{"established":{"sessionId":"s1","credentials":"test-creds"}}}"#;
+    let json = br#"{"type":"response","id":"r1","payload":{"kind":"established","sessionId":"s1","credentials":"test-creds"}}"#;
     let de: XacppEnvelope = serde_json::from_slice(json).unwrap();
     match de {
-        XacppEnvelope::Response { id, session_id: _, .. } => assert_eq!(id, "r1"),
+        XacppEnvelope::Response {
+            id, session_id: _, ..
+        } => assert_eq!(id, "r1"),
         XacppEnvelope::Request { .. } => panic!("expected Response"),
     }
 }
 
 #[test]
 fn test_deserialize_generic_response_from_json() {
-    let json = br#"{"type":"response","id":"r1","payload":{"generic":{"name":"acknowledge","data":null}}}"#;
+    let json = br#"{"type":"response","id":"r1","payload":{"kind":"generic","name":"acknowledge","data":null}}"#;
     let de: XacppEnvelope = serde_json::from_slice(json).unwrap();
     match de {
         XacppEnvelope::Response { id, payload, .. } => {
@@ -824,7 +871,10 @@ fn test_fileref_full_roundtrip() {
         json.contains(r#""remoteUrl":"https://example.com/file.png""#),
         "json: {json}"
     );
-    assert!(json.contains(r#""localUri":"/tmp/file.png""#), "json: {json}");
+    assert!(
+        json.contains(r#""localUri":"/tmp/file.png""#),
+        "json: {json}"
+    );
     assert!(
         json.contains(r#""remoteExpiresAt":"2026-05-18T12:00:00Z""#),
         "json: {json}"

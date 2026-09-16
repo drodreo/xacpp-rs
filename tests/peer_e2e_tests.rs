@@ -14,23 +14,24 @@ use serde_json::json;
 use tokio::io::BufReader;
 use tokio::sync::mpsc;
 
-use xacpp::commands::XacppCommand;
+use xacpp::activity_ref::ActivityRef;
 use xacpp::capability::{Capabilities, EffectiveCapabilities};
+use xacpp::commands::XacppCommand;
 use xacpp::error::XacppError;
 use xacpp::events::content::{ContentPart, TextPart};
 use xacpp::events::interaction::{
-    action_request_command, question_command, sensitive_info_command,
-    ActionRequestPayload, ActionResponse, QuestionPayload, QuestionResponse,
-    SensitiveInfoItem, SensitiveInfoOperation, SensitiveInfoOperationPayload,
-    SensitiveInfoOperationResponse, SensitiveInfoResult, SensitiveInfoType,
+    ActionRequestPayload, ActionResponse, QuestionPayload, QuestionResponse, SensitiveInfoItem,
+    SensitiveInfoOperation, SensitiveInfoOperationPayload, SensitiveInfoOperationResponse,
+    SensitiveInfoResult, SensitiveInfoType, action_request_command, question_command,
+    sensitive_info_command,
 };
 use xacpp::events::payload::AlertLevel;
 use xacpp::events::{XacppActivityEvent, XacppEvent};
 use xacpp::handler::{EstablishDecision, EstablishHandler, NegotiateHandler, XacppSessionHandler};
 use xacpp::message::{XacppRequest, XacppResponse};
 use xacpp::peer::{PeerState, XacppPeer};
-use xacpp::transport::stdio::StdioTransport;
 use xacpp::transport::XacppTransport;
+use xacpp::transport::stdio::StdioTransport;
 
 // ---- Test Handler Implementations ----
 
@@ -104,7 +105,11 @@ impl EstablishHandler for AutoApproveEstablishHandler {
         &self,
         _transport: Arc<dyn XacppTransport>,
     ) -> Result<(String, Arc<dyn XacppSessionHandler>, String), XacppError> {
-        Ok(("auto-sid".into(), Arc::new(TestSessionHandler), "issued-creds".into()))
+        Ok((
+            "auto-sid".into(),
+            Arc::new(TestSessionHandler),
+            "issued-creds".into(),
+        ))
     }
 }
 
@@ -127,7 +132,11 @@ impl EstablishHandler for ChallengeEstablishHandler {
         &self,
         _transport: Arc<dyn XacppTransport>,
     ) -> Result<(String, Arc<dyn XacppSessionHandler>, String), XacppError> {
-        Ok(("challenge-sid".into(), Arc::new(TestSessionHandler), "issued-creds".into()))
+        Ok((
+            "challenge-sid".into(),
+            Arc::new(TestSessionHandler),
+            "issued-creds".into(),
+        ))
     }
 }
 
@@ -173,7 +182,9 @@ impl EstablishHandler for SequencedEstablishHandler {
         _transport: Arc<dyn XacppTransport>,
         _credentials: Option<String>,
     ) -> Result<EstablishDecision, XacppError> {
-        let n = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let n = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sid = format!("handler-{n}");
         Ok(EstablishDecision::Established {
             session_id: sid.clone(),
@@ -186,9 +197,15 @@ impl EstablishHandler for SequencedEstablishHandler {
         &self,
         _transport: Arc<dyn XacppTransport>,
     ) -> Result<(String, Arc<dyn XacppSessionHandler>, String), XacppError> {
-        let n = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let n = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sid = format!("handler-{n}");
-        Ok((sid.clone(), Arc::new(IdentifiedHandler { id: sid }), "issued-creds".into()))
+        Ok((
+            sid.clone(),
+            Arc::new(IdentifiedHandler { id: sid }),
+            "issued-creds".into(),
+        ))
     }
 }
 
@@ -297,20 +314,21 @@ where
 async fn test_transport_send_establish() {
     let (transport_a, transport_b) = duplex_pair();
 
-    transport_b.on_request(Arc::new(|session_id, payload| {
-        Box::pin(async move {
-            match (session_id, payload) {
-                (None, XacppRequest::Command(XacppCommand::Establish { .. })) => {
-                    Ok(XacppResponse::Established {
-                        session_id: "sid-1".into(),
-                        credentials: "auto-creds".into(),
-                    })
+    transport_b
+        .on_request(Arc::new(|session_id, payload| {
+            Box::pin(async move {
+                match (session_id, payload) {
+                    (None, XacppRequest::Command(XacppCommand::Establish { .. })) => {
+                        Ok(XacppResponse::Established {
+                            session_id: "sid-1".into(),
+                            credentials: "auto-creds".into(),
+                        })
+                    }
+                    _ => Ok(XacppResponse::acknowledge()),
                 }
-                _ => Ok(XacppResponse::acknowledge()),
-            }
-        })
-    }))
-    .unwrap();
+            })
+        }))
+        .unwrap();
 
     transport_a.connect().await.unwrap();
     transport_b.connect().await.unwrap();
@@ -333,16 +351,17 @@ async fn test_transport_send_event_acknowledge() {
     let (transport_a, transport_b) = duplex_pair();
 
     let (notify_tx, mut notify_rx) = mpsc::channel::<XacppActivityEvent>(10);
-    transport_b.on_request(Arc::new(move |_session_id, payload| {
-        let tx = notify_tx.clone();
-        Box::pin(async move {
-            if let XacppRequest::Event(evt) = payload {
-                let _ = tx.send(evt).await;
-            }
-            Ok(XacppResponse::acknowledge())
-        })
-    }))
-    .unwrap();
+    transport_b
+        .on_request(Arc::new(move |_session_id, payload| {
+            let tx = notify_tx.clone();
+            Box::pin(async move {
+                if let XacppRequest::Event(evt) = payload {
+                    let _ = tx.send(evt).await;
+                }
+                Ok(XacppResponse::acknowledge())
+            })
+        }))
+        .unwrap();
 
     transport_a.connect().await.unwrap();
     transport_b.connect().await.unwrap();
@@ -350,7 +369,7 @@ async fn test_transport_send_event_acknowledge() {
     let response = timeout(transport_a.send(
         Some("s1"),
         XacppRequest::Event(XacppActivityEvent {
-            activity: "test-act".into(),
+            activity: ActivityRef::new("test-act"),
             event: XacppEvent::new("think", json!({ "content": "hello" })),
         }),
     ))
@@ -368,12 +387,11 @@ async fn test_transport_send_event_acknowledge() {
 async fn test_transport_handler_error() {
     let (transport_a, transport_b) = duplex_pair();
 
-    transport_b.on_request(Arc::new(|_session_id, _payload| {
-        Box::pin(async {
-            Err(XacppError::Internal("something went wrong".into()))
-        })
-    }))
-    .unwrap();
+    transport_b
+        .on_request(Arc::new(|_session_id, _payload| {
+            Box::pin(async { Err(XacppError::Internal("something went wrong".into())) })
+        }))
+        .unwrap();
 
     transport_a.connect().await.unwrap();
     transport_b.connect().await.unwrap();
@@ -420,19 +438,17 @@ async fn test_transport_no_handler_returns_error() {
 async fn test_transport_bidirectional() {
     let (transport_a, transport_b) = duplex_pair();
 
-    transport_a.on_request(Arc::new(|_session_id, _payload| {
-        Box::pin(async move {
-            Ok(XacppResponse::generic("from", json!({ "side": "a" })))
-        })
-    }))
-    .unwrap();
+    transport_a
+        .on_request(Arc::new(|_session_id, _payload| {
+            Box::pin(async move { Ok(XacppResponse::generic("from", json!({ "side": "a" }))) })
+        }))
+        .unwrap();
 
-    transport_b.on_request(Arc::new(|_session_id, _payload| {
-        Box::pin(async move {
-            Ok(XacppResponse::generic("from", json!({ "side": "b" })))
-        })
-    }))
-    .unwrap();
+    transport_b
+        .on_request(Arc::new(|_session_id, _payload| {
+            Box::pin(async move { Ok(XacppResponse::generic("from", json!({ "side": "b" }))) })
+        }))
+        .unwrap();
 
     transport_a.connect().await.unwrap();
     transport_b.connect().await.unwrap();
@@ -486,7 +502,9 @@ async fn test_peer_establish() {
     let (peer_a, _peer_b) = negotiated_peers().await;
 
     let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
-    let session = timeout(peer_a.establish(None, handler, |_| Ok(()))).await.unwrap();
+    let session = timeout(peer_a.establish(None, handler, |_| Ok(())))
+        .await
+        .unwrap();
 
     assert!(!session.session_id().is_empty());
     assert_eq!(session.credentials(), "auto-creds");
@@ -497,14 +515,14 @@ async fn test_session_request_command() {
     let (peer_a, _peer_b) = negotiated_peers().await;
 
     let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
-    let session = timeout(peer_a.establish(None, handler, |_| Ok(()))).await.unwrap();
+    let session = timeout(peer_a.establish(None, handler, |_| Ok(())))
+        .await
+        .unwrap();
 
-    let response = timeout(session.request_command(XacppCommand::generic(
-        "new_activity",
-        json!({}),
-    )))
-    .await
-    .unwrap();
+    let response =
+        timeout(session.request_command(XacppCommand::generic("new_activity", json!({}))))
+            .await
+            .unwrap();
 
     match response {
         XacppResponse::Generic { name, .. } => assert_eq!(name, "acknowledge"),
@@ -604,7 +622,11 @@ async fn test_negotiate_responder_rejects() {
         Arc::new(AutoApproveEstablishHandler),
     );
     let peer_b = XacppPeer::new(
-        Capabilities { commands: Vec::new(), produce_events: Vec::new(), accept_events: Vec::new() },
+        Capabilities {
+            commands: Vec::new(),
+            produce_events: Vec::new(),
+            accept_events: Vec::new(),
+        },
         transport_b,
         Arc::new(RejectNegotiateHandler),
         Arc::new(AutoApproveEstablishHandler),
@@ -614,14 +636,21 @@ async fn test_negotiate_responder_rejects() {
 
     // Negotiate should fail because responder rejects
     let result = timeout(peer_a.negotiate()).await;
-    assert!(result.is_err(), "negotiate should fail when responder rejects");
+    assert!(
+        result.is_err(),
+        "negotiate should fail when responder rejects"
+    );
 
     // State should remain Connected, not Negotiated
     assert_eq!(peer_a.state().await, PeerState::Connected);
 
     // Establish should fail because state is not Negotiated
-    let establish_result = timeout(peer_a.establish(None, Arc::new(TestSessionHandler), |_| Ok(()))).await;
-    assert!(establish_result.is_err(), "establish should fail without negotiation");
+    let establish_result =
+        timeout(peer_a.establish(None, Arc::new(TestSessionHandler), |_| Ok(()))).await;
+    assert!(
+        establish_result.is_err(),
+        "establish should fail without negotiation"
+    );
 }
 
 #[tokio::test]
@@ -629,7 +658,11 @@ async fn test_negotiate_initiator_rejects() {
     let (transport_a, transport_b) = duplex_pair();
 
     let peer_a = XacppPeer::new(
-        Capabilities { commands: Vec::new(), produce_events: Vec::new(), accept_events: Vec::new() },
+        Capabilities {
+            commands: Vec::new(),
+            produce_events: Vec::new(),
+            accept_events: Vec::new(),
+        },
         transport_a,
         Arc::new(RejectNegotiateHandler),
         Arc::new(AutoApproveEstablishHandler),
@@ -650,7 +683,10 @@ async fn test_negotiate_initiator_rejects() {
 
     // Negotiate should fail because initiator's handler rejects responder's capabilities
     let result = timeout(peer_a.negotiate()).await;
-    assert!(result.is_err(), "negotiate should fail when initiator rejects");
+    assert!(
+        result.is_err(),
+        "negotiate should fail when initiator rejects"
+    );
 
     // State should remain Connected
     assert_eq!(peer_a.state().await, PeerState::Connected);
@@ -674,9 +710,7 @@ async fn test_negotiate_capabilities_preserved() {
             serde_json::json!({"name": "new_activity", "version": "1.0"}),
             serde_json::json!({"name": "cancel_activity"}),
         ],
-        produce_events: vec![
-            serde_json::json!({"name": "content_delta"}),
-        ],
+        produce_events: vec![serde_json::json!({"name": "content_delta"})],
         accept_events: Vec::new(),
     };
     let caps_b = Capabilities {
@@ -817,7 +851,7 @@ async fn test_request_event_rejected_by_emit_events() {
         .request_event(
             None,
             XacppActivityEvent {
-                activity: "test-act".into(),
+                activity: ActivityRef::new("test-act"),
                 event: XacppEvent::new("think", json!({ "content": "hello" })),
             },
         )
@@ -831,10 +865,12 @@ async fn test_session_request_event() {
     let (peer_a, _peer_b) = negotiated_peers().await;
 
     let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
-    let session = timeout(peer_a.establish(None, handler, |_| Ok(()))).await.unwrap();
+    let session = timeout(peer_a.establish(None, handler, |_| Ok(())))
+        .await
+        .unwrap();
 
     let response = timeout(session.request_event(XacppActivityEvent {
-        activity: "test-act".into(),
+        activity: ActivityRef::new("test-act"),
         event: XacppEvent::new("think", json!({ "content": "hi" })),
     }))
     .await
@@ -852,10 +888,11 @@ async fn test_session_request_event() {
 async fn test_disconnect_then_send_returns_error() {
     let (transport_a, transport_b) = duplex_pair();
 
-    transport_b.on_request(Arc::new(|_session_id, _payload| {
-        Box::pin(async { Ok(XacppResponse::acknowledge()) })
-    }))
-    .unwrap();
+    transport_b
+        .on_request(Arc::new(|_session_id, _payload| {
+            Box::pin(async { Ok(XacppResponse::acknowledge()) })
+        }))
+        .unwrap();
 
     transport_a.connect().await.unwrap();
     transport_b.connect().await.unwrap();
@@ -891,10 +928,7 @@ async fn test_on_handler_after_connect_returns_error() {
         Box::pin(async { Ok(XacppResponse::acknowledge()) })
     }));
     assert!(result.is_err(), "on_request after connect should fail");
-    assert!(matches!(
-        result.unwrap_err(),
-        XacppError::AlreadyConnected
-    ));
+    assert!(matches!(result.unwrap_err(), XacppError::AlreadyConnected));
 }
 
 #[tokio::test]
@@ -931,20 +965,23 @@ async fn test_connect_disconnect_cycle() {
 async fn test_concurrent_requests_id_matching() {
     let (transport_a, transport_b) = duplex_pair();
 
-    transport_b.on_request(Arc::new(|_session_id, payload| {
-        Box::pin(async move {
-            // Echo back the command name to verify matching correctness
-            let name: String = match payload {
-                XacppRequest::Command(XacppCommand::Establish { .. }) => "establish".into(),
-                XacppRequest::Command(XacppCommand::EstablishConfirm) => "establish_confirm".into(),
-                XacppRequest::Command(XacppCommand::Negotiate { .. }) => "negotiate".into(),
-                XacppRequest::Command(XacppCommand::Generic { name, .. }) => name,
-                XacppRequest::Event(_) => "event".into(),
-            };
-            Ok(XacppResponse::generic("echo", json!({ "command": name })))
-        })
-    }))
-    .unwrap();
+    transport_b
+        .on_request(Arc::new(|_session_id, payload| {
+            Box::pin(async move {
+                // Echo back the command name to verify matching correctness
+                let name: String = match payload {
+                    XacppRequest::Command(XacppCommand::Establish { .. }) => "establish".into(),
+                    XacppRequest::Command(XacppCommand::EstablishConfirm) => {
+                        "establish_confirm".into()
+                    }
+                    XacppRequest::Command(XacppCommand::Negotiate { .. }) => "negotiate".into(),
+                    XacppRequest::Command(XacppCommand::Generic { name, .. }) => name,
+                    XacppRequest::Event(_) => "event".into(),
+                };
+                Ok(XacppResponse::generic("echo", json!({ "command": name })))
+            })
+        }))
+        .unwrap();
 
     transport_a.connect().await.unwrap();
     transport_b.connect().await.unwrap();
@@ -952,7 +989,10 @@ async fn test_concurrent_requests_id_matching() {
     let commands = [
         XacppCommand::Establish { credentials: None },
         XacppCommand::generic("new_activity", json!({})),
-        XacppCommand::generic("invoke_activity", json!({ "activity": "act-1", "messages": [] })),
+        XacppCommand::generic(
+            "invoke_activity",
+            json!({ "activity": "act-1", "messages": [] }),
+        ),
         XacppCommand::generic("compact_activity", json!({ "activity": "act-1" })),
         XacppCommand::generic("cancel_activity", json!({ "activity": "act-1" })),
         XacppCommand::generic("last_activity", json!({})),
@@ -1012,10 +1052,11 @@ async fn test_inflight_request_cancelled_on_disconnect() {
     // A's pending send should receive Closed error.
     let (transport_a, transport_b) = duplex_pair();
 
-    transport_b.on_request(Arc::new(move |_session_id, _payload| {
-        Box::pin(std::future::pending::<Result<XacppResponse, XacppError>>())
-    }))
-    .unwrap();
+    transport_b
+        .on_request(Arc::new(move |_session_id, _payload| {
+            Box::pin(std::future::pending::<Result<XacppResponse, XacppError>>())
+        }))
+        .unwrap();
 
     transport_a.connect().await.unwrap();
     transport_b.connect().await.unwrap();
@@ -1023,8 +1064,11 @@ async fn test_inflight_request_cancelled_on_disconnect() {
     // A sends request (handler will block without responding)
     let t = Arc::clone(&transport_a);
     let send_handle = tokio::spawn(async move {
-        timeout(t.send(None, XacppRequest::Command(XacppCommand::Establish { credentials: None })))
-            .await
+        timeout(t.send(
+            None,
+            XacppRequest::Command(XacppCommand::Establish { credentials: None }),
+        ))
+        .await
     });
 
     // Wait briefly to ensure request is sent and received by handler
@@ -1047,8 +1091,26 @@ async fn test_inflight_request_cancelled_on_disconnect() {
 async fn test_multi_session_routing_isolation() {
     // peer_b uses SequencedEstablishHandler, each session gets an ID'd handler
     let (transport_a, transport_b) = duplex_pair();
-    let peer_a = XacppPeer::new(Capabilities { commands: Vec::new(), produce_events: Vec::new(), accept_events: Vec::new() }, transport_a, Arc::new(AcceptNegotiateHandler::new()), Arc::new(SequencedEstablishHandler::new()));
-    let peer_b = XacppPeer::new(Capabilities { commands: Vec::new(), produce_events: Vec::new(), accept_events: Vec::new() }, transport_b, Arc::new(AcceptNegotiateHandler::new()), Arc::new(SequencedEstablishHandler::new()));
+    let peer_a = XacppPeer::new(
+        Capabilities {
+            commands: Vec::new(),
+            produce_events: Vec::new(),
+            accept_events: Vec::new(),
+        },
+        transport_a,
+        Arc::new(AcceptNegotiateHandler::new()),
+        Arc::new(SequencedEstablishHandler::new()),
+    );
+    let peer_b = XacppPeer::new(
+        Capabilities {
+            commands: Vec::new(),
+            produce_events: Vec::new(),
+            accept_events: Vec::new(),
+        },
+        transport_b,
+        Arc::new(AcceptNegotiateHandler::new()),
+        Arc::new(SequencedEstablishHandler::new()),
+    );
     peer_a.connect().await.unwrap();
     peer_b.connect().await.unwrap();
     peer_a.negotiate().await.unwrap();
@@ -1067,12 +1129,10 @@ async fn test_multi_session_routing_isolation() {
     assert_ne!(sid_1, sid_2, "two sessions must have different IDs");
 
     // Send command via session_1 → B side routes to handler-1 → response identifies as "handler-1"
-    let resp_1 = timeout(session_1.request_command(XacppCommand::generic(
-        "new_activity",
-        json!({}),
-    )))
-    .await
-    .unwrap();
+    let resp_1 =
+        timeout(session_1.request_command(XacppCommand::generic("new_activity", json!({}))))
+            .await
+            .unwrap();
     match resp_1 {
         XacppResponse::Generic { name, data } => {
             assert_eq!(name, "handler_id");
@@ -1082,12 +1142,10 @@ async fn test_multi_session_routing_isolation() {
     }
 
     // Send command via session_2 → B side routes to handler-2
-    let resp_2 = timeout(session_2.request_command(XacppCommand::generic(
-        "new_activity",
-        json!({}),
-    )))
-    .await
-    .unwrap();
+    let resp_2 =
+        timeout(session_2.request_command(XacppCommand::generic("new_activity", json!({}))))
+            .await
+            .unwrap();
     match resp_2 {
         XacppResponse::Generic { name, data } => {
             assert_eq!(name, "handler_id");
@@ -1106,7 +1164,10 @@ async fn test_multi_session_routing_isolation() {
     match resp_1_again {
         XacppResponse::Generic { name, data } => {
             assert_eq!(name, "handler_id");
-            assert_eq!(data["id"], "handler-1", "session_1 must still route to handler-1");
+            assert_eq!(
+                data["id"], "handler-1",
+                "session_1 must still route to handler-1"
+            );
         }
         other => panic!("expected handler_id, got: {other:?}"),
     }
@@ -1117,8 +1178,26 @@ async fn test_multi_session_routing_isolation() {
 #[tokio::test]
 async fn test_peer_establish_challenge_flow() {
     let (transport_a, transport_b) = duplex_pair();
-    let peer_a = XacppPeer::new(Capabilities { commands: Vec::new(), produce_events: Vec::new(), accept_events: Vec::new() }, transport_a, Arc::new(AcceptNegotiateHandler::new()), Arc::new(ChallengeEstablishHandler));
-    let peer_b = XacppPeer::new(Capabilities { commands: Vec::new(), produce_events: Vec::new(), accept_events: Vec::new() }, transport_b, Arc::new(AcceptNegotiateHandler::new()), Arc::new(ChallengeEstablishHandler));
+    let peer_a = XacppPeer::new(
+        Capabilities {
+            commands: Vec::new(),
+            produce_events: Vec::new(),
+            accept_events: Vec::new(),
+        },
+        transport_a,
+        Arc::new(AcceptNegotiateHandler::new()),
+        Arc::new(ChallengeEstablishHandler),
+    );
+    let peer_b = XacppPeer::new(
+        Capabilities {
+            commands: Vec::new(),
+            produce_events: Vec::new(),
+            accept_events: Vec::new(),
+        },
+        transport_b,
+        Arc::new(AcceptNegotiateHandler::new()),
+        Arc::new(ChallengeEstablishHandler),
+    );
     peer_a.connect().await.unwrap();
     peer_b.connect().await.unwrap();
     peer_a.negotiate().await.unwrap();
@@ -1140,8 +1219,26 @@ async fn test_peer_establish_challenge_flow() {
 #[tokio::test]
 async fn test_peer_establish_challenge_issues_credentials() {
     let (transport_a, transport_b) = duplex_pair();
-    let peer_a = XacppPeer::new(Capabilities { commands: Vec::new(), produce_events: Vec::new(), accept_events: Vec::new() }, transport_a, Arc::new(AcceptNegotiateHandler::new()), Arc::new(ChallengeEstablishHandler));
-    let peer_b = XacppPeer::new(Capabilities { commands: Vec::new(), produce_events: Vec::new(), accept_events: Vec::new() }, transport_b, Arc::new(AcceptNegotiateHandler::new()), Arc::new(ChallengeEstablishHandler));
+    let peer_a = XacppPeer::new(
+        Capabilities {
+            commands: Vec::new(),
+            produce_events: Vec::new(),
+            accept_events: Vec::new(),
+        },
+        transport_a,
+        Arc::new(AcceptNegotiateHandler::new()),
+        Arc::new(ChallengeEstablishHandler),
+    );
+    let peer_b = XacppPeer::new(
+        Capabilities {
+            commands: Vec::new(),
+            produce_events: Vec::new(),
+            accept_events: Vec::new(),
+        },
+        transport_b,
+        Arc::new(AcceptNegotiateHandler::new()),
+        Arc::new(ChallengeEstablishHandler),
+    );
     peer_a.connect().await.unwrap();
     peer_b.connect().await.unwrap();
     peer_a.negotiate().await.unwrap();
@@ -1189,22 +1286,22 @@ struct InteractionSessionHandler;
 impl XacppSessionHandler for InteractionSessionHandler {
     async fn on_command(&self, command: XacppCommand) -> Result<XacppResponse, XacppError> {
         match &command {
-            XacppCommand::Generic { name, arguments } => {
+            XacppCommand::Generic {
+                name, arguments, ..
+            } => {
                 match name.as_str() {
                     "action_request" => {
                         // Verify the payload is a valid ActionRequestPayload
-                        let _: ActionRequestPayload =
-                            serde_json::from_value(arguments.clone())
-                                .map_err(|e| XacppError::Internal(e.to_string()))?;
+                        let _: ActionRequestPayload = serde_json::from_value(arguments.clone())
+                            .map_err(|e| XacppError::Internal(e.to_string()))?;
                         Ok(XacppResponse::generic(
                             "action",
                             serde_json::to_value(&ActionResponse::Approve).unwrap(),
                         ))
                     }
                     "question" => {
-                        let payload: QuestionPayload =
-                            serde_json::from_value(arguments.clone())
-                                .map_err(|e| XacppError::Internal(e.to_string()))?;
+                        let payload: QuestionPayload = serde_json::from_value(arguments.clone())
+                            .map_err(|e| XacppError::Internal(e.to_string()))?;
                         Ok(XacppResponse::generic(
                             "question",
                             serde_json::to_value(&QuestionResponse::Answer {
@@ -1230,9 +1327,8 @@ impl XacppSessionHandler for InteractionSessionHandler {
                             SensitiveInfoOperation::Delete { items } => {
                                 for item in items {
                                     if let Some(id) = &item.id {
-                                        results.push(SensitiveInfoResult::Deleted {
-                                            id: id.clone(),
-                                        });
+                                        results
+                                            .push(SensitiveInfoResult::Deleted { id: id.clone() });
                                     }
                                 }
                             }
@@ -1288,14 +1384,22 @@ impl EstablishHandler for InteractionEstablishHandler {
 async fn test_action_request_command_lifecycle() {
     let (transport_a, transport_b) = duplex_pair();
     let peer_a = XacppPeer::new(
-        Capabilities { commands: Vec::new(), produce_events: Vec::new(), accept_events: Vec::new() },
+        Capabilities {
+            commands: Vec::new(),
+            produce_events: Vec::new(),
+            accept_events: Vec::new(),
+        },
         transport_a,
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(AutoApproveEstablishHandler),
     );
     // B side uses InteractionEstablishHandler → registers InteractionSessionHandler
     let peer_b = XacppPeer::new(
-        Capabilities { commands: Vec::new(), produce_events: Vec::new(), accept_events: Vec::new() },
+        Capabilities {
+            commands: Vec::new(),
+            produce_events: Vec::new(),
+            accept_events: Vec::new(),
+        },
         transport_b,
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(InteractionEstablishHandler),
@@ -1305,13 +1409,9 @@ async fn test_action_request_command_lifecycle() {
     peer_a.negotiate().await.unwrap();
 
     // B-side establishes with InteractionSessionHandler
-    let session = timeout(peer_a.establish(
-        None,
-        Arc::new(InteractionSessionHandler),
-        |_| Ok(()),
-    ))
-    .await
-    .unwrap();
+    let session = timeout(peer_a.establish(None, Arc::new(InteractionSessionHandler), |_| Ok(())))
+        .await
+        .unwrap();
 
     // Build action_request command using convenience function
     let payload = ActionRequestPayload {
@@ -1326,9 +1426,7 @@ async fn test_action_request_command_lifecycle() {
     let args = action_request_command("activity-1", &payload);
     let cmd = XacppCommand::generic("action_request", args);
 
-    let response = timeout(session.request_command(cmd))
-        .await
-        .unwrap();
+    let response = timeout(session.request_command(cmd)).await.unwrap();
 
     match response {
         XacppResponse::Generic { name, data } => {
@@ -1345,14 +1443,22 @@ async fn test_action_request_command_lifecycle() {
 async fn test_question_command_lifecycle() {
     let (transport_a, transport_b) = duplex_pair();
     let peer_a = XacppPeer::new(
-        Capabilities { commands: Vec::new(), produce_events: Vec::new(), accept_events: Vec::new() },
+        Capabilities {
+            commands: Vec::new(),
+            produce_events: Vec::new(),
+            accept_events: Vec::new(),
+        },
         transport_a,
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(AutoApproveEstablishHandler),
     );
     // B side uses InteractionEstablishHandler
     let peer_b = XacppPeer::new(
-        Capabilities { commands: Vec::new(), produce_events: Vec::new(), accept_events: Vec::new() },
+        Capabilities {
+            commands: Vec::new(),
+            produce_events: Vec::new(),
+            accept_events: Vec::new(),
+        },
         transport_b,
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(InteractionEstablishHandler),
@@ -1361,13 +1467,9 @@ async fn test_question_command_lifecycle() {
     peer_b.connect().await.unwrap();
     peer_a.negotiate().await.unwrap();
 
-    let session = timeout(peer_a.establish(
-        None,
-        Arc::new(InteractionSessionHandler),
-        |_| Ok(()),
-    ))
-    .await
-    .unwrap();
+    let session = timeout(peer_a.establish(None, Arc::new(InteractionSessionHandler), |_| Ok(())))
+        .await
+        .unwrap();
 
     let payload = QuestionPayload {
         request_id: "req-2".into(),
@@ -1377,9 +1479,7 @@ async fn test_question_command_lifecycle() {
     let args = question_command("activity-1", &payload);
     let cmd = XacppCommand::generic("question", args);
 
-    let response = timeout(session.request_command(cmd))
-        .await
-        .unwrap();
+    let response = timeout(session.request_command(cmd)).await.unwrap();
 
     match response {
         XacppResponse::Generic { name, data } => {
@@ -1400,14 +1500,22 @@ async fn test_question_command_lifecycle() {
 async fn test_sensitive_info_command_lifecycle() {
     let (transport_a, transport_b) = duplex_pair();
     let peer_a = XacppPeer::new(
-        Capabilities { commands: Vec::new(), produce_events: Vec::new(), accept_events: Vec::new() },
+        Capabilities {
+            commands: Vec::new(),
+            produce_events: Vec::new(),
+            accept_events: Vec::new(),
+        },
         transport_a,
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(AutoApproveEstablishHandler),
     );
     // B side uses InteractionEstablishHandler
     let peer_b = XacppPeer::new(
-        Capabilities { commands: Vec::new(), produce_events: Vec::new(), accept_events: Vec::new() },
+        Capabilities {
+            commands: Vec::new(),
+            produce_events: Vec::new(),
+            accept_events: Vec::new(),
+        },
         transport_b,
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(InteractionEstablishHandler),
@@ -1416,13 +1524,9 @@ async fn test_sensitive_info_command_lifecycle() {
     peer_b.connect().await.unwrap();
     peer_a.negotiate().await.unwrap();
 
-    let session = timeout(peer_a.establish(
-        None,
-        Arc::new(InteractionSessionHandler),
-        |_| Ok(()),
-    ))
-    .await
-    .unwrap();
+    let session = timeout(peer_a.establish(None, Arc::new(InteractionSessionHandler), |_| Ok(())))
+        .await
+        .unwrap();
 
     let payload = SensitiveInfoOperationPayload {
         request_id: "req-3".into(),
@@ -1448,15 +1552,12 @@ async fn test_sensitive_info_command_lifecycle() {
     let args = sensitive_info_command("activity-1", &payload);
     let cmd = XacppCommand::generic("sensitive_info_operation", args);
 
-    let response = timeout(session.request_command(cmd))
-        .await
-        .unwrap();
+    let response = timeout(session.request_command(cmd)).await.unwrap();
 
     match response {
         XacppResponse::Generic { name, data } => {
             assert_eq!(name, "sensitive_info_operation");
-            let resp: SensitiveInfoOperationResponse =
-                serde_json::from_value(data).unwrap();
+            let resp: SensitiveInfoOperationResponse = serde_json::from_value(data).unwrap();
             assert_eq!(resp.results.len(), 2);
             // Both items should be Provided
             for result in &resp.results {

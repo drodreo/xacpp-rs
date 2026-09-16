@@ -112,6 +112,7 @@ let server = SocketTransport::new(accepted_stream);
 | `EstablishHandler` | 处理 Establish 握手请求 |
 | `XacppCommand` | 协议命令（`Establish`、`NewActivity` 等） |
 | `XacppEvent` | 协议事件（Think、ActionRequest、Question 等） |
+| `ActivityRef` | 命令/事件信封共用的活动标识引用 |
 | `XacppRequest` | 请求载荷（Command 或 Event） |
 | `XacppResponse` | 响应载荷（Established、Acknowledge、Action 等） |
 | `XacppError` | 错误枚举，含机器可读错误码 |
@@ -130,8 +131,20 @@ JSONL（每行一个 JSON 对象），信封结构：
 
 ```json
 {"type":"request","id":"r1","payload":{"kind":"command","payload":{"establish":{"credentials":null}}}}
+{"type":"request","id":"r2","payload":{"kind":"command","payload":{"generic":{"name":"report_to_user","arguments":{},"activity":{"id":"act-1"}}}}}
+{"type":"request","id":"r3","payload":{"kind":"event","payload":{"activity":{"id":"act-1"},"event":{"name":"think","data":{"content":"hi"}}}}}
 {"type":"response","id":"r1","payload":{"kind":"established","sessionId":"s1"}}
 ```
+
+Generic 命令携带可选的 `activity` 字段，形态为结构化 `{id}` 引用；省略时该字段
+不会出现在线路格式中。协议层不强制该字段——校验权归命令实现方。事件信封使用
+相同的结构化 `{id}` 引用标识其所属活动。
+
+### 命令声明约定
+
+命令声明 schema 可携带 `dispatcher` 字段，取值 `"system"` 或 `"model"`，缺省视为
+`"system"`。`system` 表示系统路径接入（不进模型工具面）；`model` 表示模型直调
+（进工具列表）。声明 schema 为透传 JSON，协议库不强制类型。
 
 ## 许可证
 

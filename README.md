@@ -112,6 +112,7 @@ let server = SocketTransport::new(accepted_stream);
 | `EstablishHandler` | Handles Establish handshake requests |
 | `XacppCommand` | Protocol commands (`Establish`, `NewActivity`, etc.) |
 | `XacppEvent` | Protocol events (Think, ActionRequest, Question, etc.) |
+| `ActivityRef` | Activity identifier reference shared by command and event envelopes |
 | `XacppRequest` | Request payload (Command or Event) |
 | `XacppResponse` | Response payload (Established, Acknowledge, Action, etc.) |
 | `XacppError` | Error enum with machine-readable codes |
@@ -130,8 +131,23 @@ JSONL (one JSON object per line) with envelope structure:
 
 ```json
 {"type":"request","id":"r1","payload":{"kind":"command","payload":{"establish":{"credentials":null}}}}
+{"type":"request","id":"r2","payload":{"kind":"command","payload":{"generic":{"name":"report_to_user","arguments":{},"activity":{"id":"act-1"}}}}}
+{"type":"request","id":"r3","payload":{"kind":"event","payload":{"activity":{"id":"act-1"},"event":{"name":"think","data":{"content":"hi"}}}}}
 {"type":"response","id":"r1","payload":{"kind":"established","sessionId":"s1"}}
 ```
+
+Generic commands carry an optional `activity` field as a structured `{id}` reference;
+when absent, the field is omitted from the wire format. It is optional at the protocol
+level — validation is the command implementor's decision. Event envelopes identify
+their activity with the same structured `{id}` reference.
+
+### Command Declarations
+
+A command schema may carry a `dispatcher` field with values `"system"` or `"model"`,
+defaulting to `"system"`. `system` means the command is integrated via the system path
+(not exposed to the model tool surface); `model` means the model invokes it directly
+(included in the tool list). Declaration schemas are pass-through JSON; the protocol
+library does not enforce types.
 
 ## License
 
