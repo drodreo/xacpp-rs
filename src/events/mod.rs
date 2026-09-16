@@ -11,6 +11,7 @@ pub mod payload;
 pub mod upload;
 pub mod xacpp_event;
 
+pub use activity_event::XacppActivityEvent;
 pub use content::{AudioPart, ContentPart, FilePart, FileRef, ImagePart, TextPart, VideoPart};
 pub use interaction::{
     ActionRequestPayload, ActionResponse, NotifyPayload, QuestionPayload, QuestionResponse,
@@ -23,4 +24,3 @@ pub use payload::{
 };
 pub use upload::{TokenUsage, UploadEvent};
 pub use xacpp_event::XacppEvent;
-pub use activity_event::XacppActivityEvent;

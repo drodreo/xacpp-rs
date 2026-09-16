@@ -35,14 +35,15 @@ pub enum XacppRequest {
 
 /// Response payload.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum XacppResponse {
     // ---- Protocol responses (Peer layer) ----
-
     /// Capability negotiation response.
-    Negotiated {
-        capabilities: Capabilities,
-    },
+    Negotiated { capabilities: Capabilities },
 
     /// Handshake successful: session identifier and credentials issued.
     Established {
@@ -51,17 +52,12 @@ pub enum XacppResponse {
     },
 
     /// Challenge issued during first-time establishment.
-    EstablishPrepare {
-        challenge: String,
-    },
+    EstablishPrepare { challenge: String },
 
     /// Handshake rejected.
-    EstablishReject {
-        reason: String,
-    },
+    EstablishReject { reason: String },
 
     // ---- Business response (SessionHandler layer) ----
-
     /// Generic business response.
     ///
     /// `name` identifies the response type (e.g. "activity_ready", "acknowledge", "action").
@@ -73,10 +69,7 @@ pub enum XacppResponse {
     },
 
     /// Processing failed.
-    Error {
-        code: String,
-        message: String,
-    },
+    Error { code: String, message: String },
 }
 
 impl XacppResponse {

@@ -57,7 +57,10 @@ impl EffectiveCapabilities {
             .into_iter()
             .filter(|name| remote_accept.contains(&name))
             .collect();
-        Self { remote_commands, emit_events }
+        Self {
+            remote_commands,
+            emit_events,
+        }
     }
 }
 
@@ -76,42 +79,36 @@ mod tests {
     #[test]
     fn test_capabilities_serde_roundtrip() {
         let caps = Capabilities {
-            commands: vec![
-                serde_json::json!({
-                    "name": "new_activity",
-                    "description": "Create a new activity",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "title": { "type": "string" }
-                        }
+            commands: vec![serde_json::json!({
+                "name": "new_activity",
+                "description": "Create a new activity",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string" }
                     }
-                }),
-            ],
-            produce_events: vec![
-                serde_json::json!({
-                    "name": "content_delta",
-                    "description": "Content delta output",
-                    "data": {
-                        "type": "object",
-                        "properties": {
-                            "content": { "type": "string" }
-                        }
+                }
+            })],
+            produce_events: vec![serde_json::json!({
+                "name": "content_delta",
+                "description": "Content delta output",
+                "data": {
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string" }
                     }
-                }),
-            ],
-            accept_events: vec![
-                serde_json::json!({
-                    "name": "upload",
-                    "description": "Upload request",
-                    "data": {
-                        "type": "object",
-                        "properties": {
-                            "url": { "type": "string" }
-                        }
+                }
+            })],
+            accept_events: vec![serde_json::json!({
+                "name": "upload",
+                "description": "Upload request",
+                "data": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string" }
                     }
-                }),
-            ],
+                }
+            })],
         };
         let json = serde_json::to_string(&caps).unwrap();
         let deserialized: Capabilities = serde_json::from_str(&json).unwrap();

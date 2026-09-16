@@ -28,8 +28,10 @@ use crate::transport::XacppTransport;
 ///
 /// Wrapped with `Arc` to support concurrent calls from multiple tasks (SocketTransport's spawn-per-request model).
 pub type RequestHandler = Arc<
-    dyn Fn(Option<String>, XacppRequest)
-        -> Pin<Box<dyn Future<Output = Result<XacppResponse, XacppError>> + Send>>
+    dyn Fn(
+            Option<String>,
+            XacppRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<XacppResponse, XacppError>> + Send>>
         + Send
         + Sync,
 >;
@@ -66,18 +68,13 @@ pub trait NegotiateHandler: Send + Sync {
     /// Called on both sides: on the responder when it receives the initiator's
     /// capabilities, and on the initiator when it receives the responder's
     /// capabilities in the response.
-    async fn on_negotiate(
-        &self,
-        effective: EffectiveCapabilities,
-    ) -> Result<(), XacppError>;
+    async fn on_negotiate(&self, effective: EffectiveCapabilities) -> Result<(), XacppError>;
 }
 
 /// Decision made by the responder upon receiving an Establish request.
 pub enum EstablishDecision {
     /// First connection: challenge required → responder returns EstablishPrepare.
-    ChallengeRequired {
-        challenge: String,
-    },
+    ChallengeRequired { challenge: String },
     /// Credentials valid: direct establishment → responder returns Established.
     Established {
         session_id: String,

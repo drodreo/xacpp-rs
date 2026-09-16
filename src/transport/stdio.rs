@@ -4,8 +4,8 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
@@ -69,14 +69,23 @@ impl StdioTransport {
     }
 
     /// Serialize wire message and send (JSONL format).
-    async fn send_envelope(inner: &Arc<Mutex<StdioInner>>, msg: &XacppEnvelope) -> Result<(), XacppError> {
+    async fn send_envelope(
+        inner: &Arc<Mutex<StdioInner>>,
+        msg: &XacppEnvelope,
+    ) -> Result<(), XacppError> {
         let json = serde_json::to_vec(msg).map_err(|e| XacppError::Internal(e.to_string()))?;
 
         let mut guard = inner.lock().await;
         let writer = guard.writer.as_mut().ok_or(XacppError::NotConnected)?;
 
-        writer.write_all(&json).await.map_err(|_| XacppError::Closed)?;
-        writer.write_all(b"\n").await.map_err(|_| XacppError::Closed)?;
+        writer
+            .write_all(&json)
+            .await
+            .map_err(|_| XacppError::Closed)?;
+        writer
+            .write_all(b"\n")
+            .await
+            .map_err(|_| XacppError::Closed)?;
         writer.flush().await.map_err(|_| XacppError::Closed)?;
         Ok(())
     }
@@ -105,11 +114,16 @@ impl StdioTransport {
             };
 
             match envelope {
-                XacppEnvelope::Request { id, session_id, payload } => {
+                XacppEnvelope::Request {
+                    id,
+                    session_id,
+                    payload,
+                } => {
                     let sid_for_response = session_id.clone();
                     // Release read lock immediately after cloning Arc, avoid holding lock across await
                     let handler = shared.request_handler.read().await.clone();
-                    let handler_result: Result<XacppResponse, XacppError> = if let Some(h) = handler {
+                    let handler_result: Result<XacppResponse, XacppError> = if let Some(h) = handler
+                    {
                         h(session_id, payload).await
                     } else {
                         Err(XacppError::NoHandler)
@@ -126,7 +140,11 @@ impl StdioTransport {
                         }
                     };
 
-                    let response = XacppEnvelope::Response { id: id.clone(), session_id: sid_for_response, payload: response_payload };
+                    let response = XacppEnvelope::Response {
+                        id: id.clone(),
+                        session_id: sid_for_response,
+                        payload: response_payload,
+                    };
                     if let Err(e) = Self::send_envelope(&inner, &response).await {
                         log::warn!("accept: failed to send response for request {id}: {e}");
                     }
@@ -164,7 +182,12 @@ impl XacppTransport for StdioTransport {
             return Err(XacppError::AlreadyConnected);
         }
 
-        let reader = self.reader.lock().await.take().ok_or(XacppError::AlreadyConnected)?;
+        let reader = self
+            .reader
+            .lock()
+            .await
+            .take()
+            .ok_or(XacppError::AlreadyConnected)?;
 
         let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(256);
         let reader_handle = tokio::spawn(async move {
@@ -261,7 +284,10 @@ impl XacppTransport for StdioTransport {
         if self.shared.connected.load(Ordering::Acquire) {
             return Err(XacppError::AlreadyConnected);
         }
-        let mut guard = self.shared.request_handler.try_write()
+        let mut guard = self
+            .shared
+            .request_handler
+            .try_write()
             .expect("on_request: lock contention before connect");
         *guard = Some(handler);
         Ok(())

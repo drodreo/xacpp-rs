@@ -139,7 +139,9 @@ impl XacppPeer {
                     &self.local_capabilities,
                     &capabilities,
                 );
-                self.negotiate_handler.on_negotiate(effective.clone()).await?;
+                self.negotiate_handler
+                    .on_negotiate(effective.clone())
+                    .await?;
                 let mut inner = self.inner.lock().await;
                 inner.remote_capabilities = capabilities;
                 inner.emit_events = effective.emit_events;
@@ -170,90 +172,89 @@ impl XacppPeer {
         let local_capabilities = self.local_capabilities.clone();
         let emit_events = Arc::clone(&self.emit_events);
 
-        self.transport.on_request(Arc::new(move |session_id, payload| {
-            let sessions = Arc::clone(&sessions);
-            let establish_handler = Arc::clone(&establish_handler);
-            let transport = Arc::clone(&transport);
-            let negotiate_handler = Arc::clone(&negotiate_handler);
-            let local_capabilities = local_capabilities.clone();
-            let emit_events = Arc::clone(&emit_events);
-            Box::pin(async move {
-                match (session_id, payload) {
-                    // Pre-session Negotiate request
-                    (None, XacppRequest::Command(XacppCommand::Negotiate { capabilities })) => {
-                        // 协议层计算交集
-                        let effective = EffectiveCapabilities::from_capabilities(
-                            &local_capabilities,
-                            &capabilities,
-                        );
-                        negotiate_handler.on_negotiate(effective.clone()).await?;
-                        // 缓存 emit_events 交集结果（Responder 端无法直接访问 inner）
-                        *emit_events.lock().await = effective.emit_events;
-                        Ok(XacppResponse::Negotiated {
-                            capabilities: local_capabilities,
-                        })
-                    }
-                    // Pre-session Establish request
-                    (None, XacppRequest::Command(XacppCommand::Establish { credentials })) => {
-                        match establish_handler.on_establish(transport, credentials).await {
-                            Ok(decision) => match decision {
-                                crate::handler::EstablishDecision::ChallengeRequired { challenge } => {
-                                    Ok(XacppResponse::EstablishPrepare { challenge })
-                                }
-                                crate::handler::EstablishDecision::Established { session_id, handler, credentials } => {
-                                    sessions.write().await.insert(session_id.clone(), handler);
-                                    Ok(XacppResponse::Established {
+        self.transport
+            .on_request(Arc::new(move |session_id, payload| {
+                let sessions = Arc::clone(&sessions);
+                let establish_handler = Arc::clone(&establish_handler);
+                let transport = Arc::clone(&transport);
+                let negotiate_handler = Arc::clone(&negotiate_handler);
+                let local_capabilities = local_capabilities.clone();
+                let emit_events = Arc::clone(&emit_events);
+                Box::pin(async move {
+                    match (session_id, payload) {
+                        // Pre-session Negotiate request
+                        (None, XacppRequest::Command(XacppCommand::Negotiate { capabilities })) => {
+                            // 协议层计算交集
+                            let effective = EffectiveCapabilities::from_capabilities(
+                                &local_capabilities,
+                                &capabilities,
+                            );
+                            negotiate_handler.on_negotiate(effective.clone()).await?;
+                            // 缓存 emit_events 交集结果（Responder 端无法直接访问 inner）
+                            *emit_events.lock().await = effective.emit_events;
+                            Ok(XacppResponse::Negotiated {
+                                capabilities: local_capabilities,
+                            })
+                        }
+                        // Pre-session Establish request
+                        (None, XacppRequest::Command(XacppCommand::Establish { credentials })) => {
+                            match establish_handler.on_establish(transport, credentials).await {
+                                Ok(decision) => match decision {
+                                    crate::handler::EstablishDecision::ChallengeRequired {
+                                        challenge,
+                                    } => Ok(XacppResponse::EstablishPrepare { challenge }),
+                                    crate::handler::EstablishDecision::Established {
                                         session_id,
+                                        handler,
                                         credentials,
+                                    } => {
+                                        sessions.write().await.insert(session_id.clone(), handler);
+                                        Ok(XacppResponse::Established {
+                                            session_id,
+                                            credentials,
+                                        })
+                                    }
+                                },
+                                Err(e) => Err(e),
+                            }
+                        }
+                        // Pre-session EstablishConfirm request
+                        (None, XacppRequest::Command(XacppCommand::EstablishConfirm)) => {
+                            match establish_handler.on_establish_confirm(transport).await {
+                                Ok((sid, handler, creds)) => {
+                                    sessions.write().await.insert(sid.clone(), handler);
+                                    Ok(XacppResponse::Established {
+                                        session_id: sid,
+                                        credentials: creds,
                                     })
                                 }
-                            },
-                            Err(e) => Err(e),
-                        }
-                    }
-                    // Pre-session EstablishConfirm request
-                    (None, XacppRequest::Command(XacppCommand::EstablishConfirm)) => {
-                        match establish_handler.on_establish_confirm(transport).await {
-                            Ok((sid, handler, creds)) => {
-                                sessions.write().await.insert(sid.clone(), handler);
-                                Ok(XacppResponse::Established {
-                                    session_id: sid,
-                                    credentials: creds,
-                                })
+                                Err(e) => Err(e),
                             }
-                            Err(e) => Err(e),
+                        }
+                        // Other requests without session_id are invalid
+                        (None, _) => Err(XacppError::InvalidRequest("missing session_id".into())),
+                        // Route to Session handler
+                        (Some(sid), XacppRequest::Command(cmd)) => {
+                            let handler = { sessions.read().await.get(&sid).cloned() };
+                            match handler {
+                                Some(h) => h.on_command(cmd).await,
+                                None => {
+                                    Err(XacppError::Internal(format!("unknown session: {sid}")))
+                                }
+                            }
+                        }
+                        (Some(sid), XacppRequest::Event(evt)) => {
+                            let handler = { sessions.read().await.get(&sid).cloned() };
+                            match handler {
+                                Some(h) => h.on_event(evt).await,
+                                None => {
+                                    Err(XacppError::Internal(format!("unknown session: {sid}")))
+                                }
+                            }
                         }
                     }
-                    // Other requests without session_id are invalid
-                    (None, _) => Err(XacppError::InvalidRequest(
-                        "missing session_id".into(),
-                    )),
-                    // Route to Session handler
-                    (Some(sid), XacppRequest::Command(cmd)) => {
-                        let handler = {
-                            sessions.read().await.get(&sid).cloned()
-                        };
-                        match handler {
-                            Some(h) => h.on_command(cmd).await,
-                            None => Err(XacppError::Internal(format!(
-                                "unknown session: {sid}"
-                            ))),
-                        }
-                    }
-                    (Some(sid), XacppRequest::Event(evt)) => {
-                        let handler = {
-                            sessions.read().await.get(&sid).cloned()
-                        };
-                        match handler {
-                            Some(h) => h.on_event(evt).await,
-                            None => Err(XacppError::Internal(format!(
-                                "unknown session: {sid}"
-                            ))),
-                        }
-                    }
-                }
-            })
-        }))?;
+                })
+            }))?;
 
         self.transport.connect().await?;
         let mut inner = self.inner.lock().await;
@@ -284,7 +285,14 @@ impl XacppPeer {
             )));
         }
 
-        log::debug!("establish: sending Establish (credentials: {})", if credentials.is_some() { "present" } else { "none" });
+        log::debug!(
+            "establish: sending Establish (credentials: {})",
+            if credentials.is_some() {
+                "present"
+            } else {
+                "none"
+            }
+        );
 
         let response = self
             .transport
@@ -299,7 +307,15 @@ impl XacppPeer {
                 session_id,
                 credentials,
             } => {
-                log::debug!("establish: received Established (session_id: {}, credentials: {})", session_id, if credentials.is_empty() { "empty" } else { "present" });
+                log::debug!(
+                    "establish: received Established (session_id: {}, credentials: {})",
+                    session_id,
+                    if credentials.is_empty() {
+                        "empty"
+                    } else {
+                        "present"
+                    }
+                );
                 self.sessions
                     .write()
                     .await
@@ -311,22 +327,30 @@ impl XacppPeer {
                 ))
             }
             XacppResponse::EstablishPrepare { challenge } => {
-                log::debug!("establish: received EstablishPrepare (challenge: {})", challenge);
+                log::debug!(
+                    "establish: received EstablishPrepare (challenge: {})",
+                    challenge
+                );
                 verify_challenge(challenge)?;
                 log::debug!("establish: sending EstablishConfirm");
                 let confirm_response = self
                     .transport
-                    .send(
-                        None,
-                        XacppRequest::Command(XacppCommand::EstablishConfirm),
-                    )
+                    .send(None, XacppRequest::Command(XacppCommand::EstablishConfirm))
                     .await?;
                 match confirm_response {
                     XacppResponse::Established {
                         session_id,
                         credentials,
                     } => {
-                        log::debug!("establish: received Established after confirm (session_id: {}, credentials: {})", session_id, if credentials.is_empty() { "empty" } else { "present" });
+                        log::debug!(
+                            "establish: received Established after confirm (session_id: {}, credentials: {})",
+                            session_id,
+                            if credentials.is_empty() {
+                                "empty"
+                            } else {
+                                "present"
+                            }
+                        );
                         self.sessions
                             .write()
                             .await
@@ -338,15 +362,21 @@ impl XacppPeer {
                         ))
                     }
                     XacppResponse::EstablishReject { reason } => {
-                        log::debug!("establish: received EstablishReject after confirm (reason: {reason})");
+                        log::debug!(
+                            "establish: received EstablishReject after confirm (reason: {reason})"
+                        );
                         Err(XacppError::EstablishReject { reason })
                     }
                     XacppResponse::Error { code, message } => {
-                        log::debug!("establish: received Error after confirm (code: {code}, message: {message})");
+                        log::debug!(
+                            "establish: received Error after confirm (code: {code}, message: {message})"
+                        );
                         Err(XacppError::Application { code, message })
                     }
                     other => {
-                        log::debug!("establish: received unexpected response after confirm: {other:?}");
+                        log::debug!(
+                            "establish: received unexpected response after confirm: {other:?}"
+                        );
                         Err(XacppError::Internal(format!(
                             "unexpected response to establish_confirm: {other:?}"
                         )))
@@ -411,7 +441,8 @@ impl XacppPeer {
         let emit_events = self.inner.lock().await.emit_events.clone();
         if !emit_events.is_empty() && !emit_events.contains(event_name) {
             return Err(XacppError::Internal(format!(
-                "event '{}' not in negotiated emit_events capability", event_name
+                "event '{}' not in negotiated emit_events capability",
+                event_name
             )));
         }
         self.transport

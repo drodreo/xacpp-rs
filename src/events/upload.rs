@@ -15,15 +15,9 @@ pub enum UploadEvent {
         total: u64,
     },
     /// Single file upload completed.
-    Completed {
-        name: String,
-        media_source: FileRef,
-    },
+    Completed { name: String, media_source: FileRef },
     /// Single file upload failed.
-    Error {
-        name: String,
-        error: String,
-    },
+    Error { name: String, error: String },
 }
 
 /// Token usage information.

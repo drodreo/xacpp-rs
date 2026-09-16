@@ -15,20 +15,19 @@ use tokio::time::timeout;
 use xacpp::commands::XacppCommand;
 use xacpp::error::XacppError;
 use xacpp::message::{XacppRequest, XacppResponse};
-use xacpp::transport::socket::SocketTransport;
 use xacpp::transport::XacppTransport;
+use xacpp::transport::socket::SocketTransport;
 
 /// Creates a pair of SocketTransport connected via TCP (client + server).
 ///
 /// Server-side handler is specified by parameter, client handler returns acknowledge.
 async fn socket_pair(
     server_handler: Arc<
-        dyn Fn(Option<String>, XacppRequest)
-            -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Result<XacppResponse, XacppError>>
-                        + Send,
-                >,
+        dyn Fn(
+                Option<String>,
+                XacppRequest,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<XacppResponse, XacppError>> + Send>,
             > + Send
             + Sync,
     >,
@@ -91,7 +90,10 @@ async fn test_concurrent_requests_independent_processing() {
 
     let commands = [
         XacppCommand::generic("new_activity", json!({})),
-        XacppCommand::generic("invoke_activity", json!({ "activity": "act-1", "messages": [] })),
+        XacppCommand::generic(
+            "invoke_activity",
+            json!({ "activity": "act-1", "messages": [] }),
+        ),
         XacppCommand::generic("compact_activity", json!({ "activity": "act-1" })),
         XacppCommand::generic("cancel_activity", json!({ "activity": "act-1" })),
         XacppCommand::Establish { credentials: None },
@@ -162,9 +164,8 @@ async fn test_concurrent_write_no_data_corruption() {
     let large_content = "A".repeat(1024);
     let server_handler = Arc::new(move |_session_id, _payload| {
         let text = large_content.clone();
-        Box::pin(async move {
-            Ok(XacppResponse::generic("large", json!({ "content": text })))
-        }) as _
+        Box::pin(async move { Ok(XacppResponse::generic("large", json!({ "content": text }))) })
+            as _
     });
 
     let (client, _server) = socket_pair(server_handler).await;
@@ -174,12 +175,10 @@ async fn test_concurrent_write_no_data_corruption() {
     for _ in 0..10 {
         let c = Arc::clone(&client);
         handles.push(tokio::spawn(async move {
-            timeout_5s(
-                c.send(
-                    None,
-                    XacppRequest::Command(XacppCommand::generic("ping", json!({}))),
-                ),
-            )
+            timeout_5s(c.send(
+                None,
+                XacppRequest::Command(XacppCommand::generic("ping", json!({}))),
+            ))
             .await
             .unwrap()
         }));
@@ -201,10 +200,7 @@ async fn test_concurrent_write_no_data_corruption() {
                     "response {i} truncated: {} bytes",
                     content.len()
                 );
-                assert!(
-                    content.chars().all(|c| c == 'A'),
-                    "response {i} corrupted"
-                );
+                assert!(content.chars().all(|c| c == 'A'), "response {i} corrupted");
             }
             other => panic!("response {i}: expected Generic, got: {other:?}"),
         }
@@ -217,9 +213,7 @@ async fn test_concurrent_write_no_data_corruption() {
 async fn test_disconnect_aborts_inflight_no_deadlock() {
     // Server handler: never returns
     let server_handler = Arc::new(|_session_id, _payload| {
-        Box::pin(async {
-            std::future::pending::<Result<XacppResponse, XacppError>>().await
-        }) as _
+        Box::pin(async { std::future::pending::<Result<XacppResponse, XacppError>>().await }) as _
     });
 
     let (client, _server) = socket_pair(server_handler).await;
@@ -242,14 +236,8 @@ async fn test_disconnect_aborts_inflight_no_deadlock() {
 
     // disconnect should return within 2s
     let result = timeout(Duration::from_secs(2), client.disconnect()).await;
-    assert!(
-        result.is_ok(),
-        "disconnect should not deadlock"
-    );
-    assert!(
-        result.unwrap().is_ok(),
-        "disconnect should succeed"
-    );
+    assert!(result.is_ok(), "disconnect should not deadlock");
+    assert!(result.unwrap().is_ok(), "disconnect should succeed");
 
     // All inflight sends should complete within timeout (no hang)
     for h in send_handles {

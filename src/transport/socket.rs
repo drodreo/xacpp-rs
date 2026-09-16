@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
@@ -70,9 +70,7 @@ impl SocketTransport {
         let (read_half, write_half) = tokio::io::split(stream);
         Self {
             writer: Arc::new(Mutex::new(Some(Box::pin(write_half)))),
-            reader: Mutex::new(Some(Box::pin(
-                tokio::io::BufReader::new(read_half),
-            ))),
+            reader: Mutex::new(Some(Box::pin(tokio::io::BufReader::new(read_half)))),
             shared: Arc::new(SharedState {
                 request_handler: RwLock::new(None),
                 pending: Mutex::new(HashMap::new()),
@@ -122,13 +120,20 @@ impl SocketTransport {
                 Ok(msg) => msg,
                 Err(e) => {
                     let text = String::from_utf8_lossy(&data);
-                    log::warn!("reader: failed to parse envelope ({} bytes): {e}\n  raw: {text}", data.len());
+                    log::warn!(
+                        "reader: failed to parse envelope ({} bytes): {e}\n  raw: {text}",
+                        data.len()
+                    );
                     continue;
                 }
             };
 
             match envelope {
-                XacppEnvelope::Request { id, session_id, payload } => {
+                XacppEnvelope::Request {
+                    id,
+                    session_id,
+                    payload,
+                } => {
                     let sid_for_response = session_id.clone();
                     // Release read lock immediately after cloning Arc
                     let handler = shared.request_handler.read().await.clone();
@@ -206,13 +211,12 @@ impl XacppTransport for SocketTransport {
 
         // Get reader: client mode needs to establish TCP connection first
         let reader = if let Some(ref addr) = self.addr {
-            let stream = TcpStream::connect(addr).await.map_err(|e| {
-                XacppError::Internal(format!("connect to {addr}: {e}"))
-            })?;
+            let stream = TcpStream::connect(addr)
+                .await
+                .map_err(|e| XacppError::Internal(format!("connect to {addr}: {e}")))?;
             let (read_half, write_half) = tokio::io::split(stream);
             *self.writer.lock().await = Some(Box::pin(write_half));
-            Box::pin(tokio::io::BufReader::new(read_half))
-                as BoxedReader
+            Box::pin(tokio::io::BufReader::new(read_half)) as BoxedReader
         } else {
             self.reader
                 .lock()
@@ -320,7 +324,10 @@ impl XacppTransport for SocketTransport {
         if self.shared.connected.load(Ordering::Acquire) {
             return Err(XacppError::AlreadyConnected);
         }
-        let mut guard = self.shared.request_handler.try_write()
+        let mut guard = self
+            .shared
+            .request_handler
+            .try_write()
             .expect("on_request: lock contention before connect");
         *guard = Some(handler);
         Ok(())

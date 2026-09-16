@@ -17,7 +17,11 @@ use super::payload::AlertLevel;
 
 /// Tool call authorization response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum ActionResponse {
     /// Approve execution.
     Approve,
@@ -54,7 +58,11 @@ pub struct NotifyPayload {
 
 /// User question response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum QuestionResponse {
     /// User selected an option.
     Answer { content: String },
@@ -105,7 +113,11 @@ pub enum SensitiveInfoOperation {
 
 /// Operation result for a single piece of sensitive info.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum SensitiveInfoResult {
     Provided { key: String, value: String },
     CollectSkipped { key: String, reason: Option<String> },
@@ -132,39 +144,45 @@ pub struct SensitiveInfoOperationPayload {
 
 /// Builds an `action_request` command from a payload.
 pub fn action_request_command(activity: &str, payload: &ActionRequestPayload) -> Value {
-    serde_json::to_value(payload).map(|p| {
-        let mut map = if let Value::Object(m) = p {
-            m
-        } else {
-            serde_json::Map::new()
-        };
-        map.insert("activity".to_string(), Value::String(activity.to_string()));
-        Value::Object(map)
-    }).unwrap_or(Value::Null)
+    serde_json::to_value(payload)
+        .map(|p| {
+            let mut map = if let Value::Object(m) = p {
+                m
+            } else {
+                serde_json::Map::new()
+            };
+            map.insert("activity".to_string(), Value::String(activity.to_string()));
+            Value::Object(map)
+        })
+        .unwrap_or(Value::Null)
 }
 
 /// Builds a `question` command from a payload.
 pub fn question_command(activity: &str, payload: &QuestionPayload) -> Value {
-    serde_json::to_value(payload).map(|p| {
-        let mut map = if let Value::Object(m) = p {
-            m
-        } else {
-            serde_json::Map::new()
-        };
-        map.insert("activity".to_string(), Value::String(activity.to_string()));
-        Value::Object(map)
-    }).unwrap_or(Value::Null)
+    serde_json::to_value(payload)
+        .map(|p| {
+            let mut map = if let Value::Object(m) = p {
+                m
+            } else {
+                serde_json::Map::new()
+            };
+            map.insert("activity".to_string(), Value::String(activity.to_string()));
+            Value::Object(map)
+        })
+        .unwrap_or(Value::Null)
 }
 
 /// Builds a `sensitive_info_operation` command from a payload.
 pub fn sensitive_info_command(activity: &str, payload: &SensitiveInfoOperationPayload) -> Value {
-    serde_json::to_value(payload).map(|p| {
-        let mut map = if let Value::Object(m) = p {
-            m
-        } else {
-            serde_json::Map::new()
-        };
-        map.insert("activity".to_string(), Value::String(activity.to_string()));
-        Value::Object(map)
-    }).unwrap_or(Value::Null)
+    serde_json::to_value(payload)
+        .map(|p| {
+            let mut map = if let Value::Object(m) = p {
+                m
+            } else {
+                serde_json::Map::new()
+            };
+            map.insert("activity".to_string(), Value::String(activity.to_string()));
+            Value::Object(map)
+        })
+        .unwrap_or(Value::Null)
 }
