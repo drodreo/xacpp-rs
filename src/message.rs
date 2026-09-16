@@ -81,6 +81,14 @@ impl XacppResponse {
         }
     }
 
+    /// Convenience: creates a generic `activity_not_found` response.
+    pub fn activity_not_found() -> Self {
+        XacppResponse::Generic {
+            name: "activity_not_found".to_string(),
+            data: Value::Null,
+        }
+    }
+
     /// Convenience: creates a generic response with name and data.
     pub fn generic(name: impl Into<String>, data: Value) -> Self {
         XacppResponse::Generic {

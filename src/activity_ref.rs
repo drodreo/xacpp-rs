@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Identifies the activity a command/event belongs to.
+/// Identifies the activity a command/event originates from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ActivityRef {

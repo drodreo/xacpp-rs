@@ -143,11 +143,11 @@ their activity with the same structured `{id}` reference.
 
 ### Command Declarations
 
-A command schema may carry a `dispatcher` field with values `"system"` or `"model"`,
-defaulting to `"system"`. `system` means the command is integrated via the system path
-(not exposed to the model tool surface); `model` means the model invokes it directly
-(included in the tool list). Declaration schemas are pass-through JSON; the protocol
-library does not enforce types.
+A command schema may carry a `dispatcher` field with values `"bridge"` or `"tool"`,
+defaulting to `"bridge"`. `bridge` means the command is integrated via the event
+bridge system path (not exposed to the model tool surface); `tool` means the command
+is injected into the receiver's model tool surface (the model invokes it directly).
+Declaration schemas are pass-through JSON; the protocol library does not enforce types.
 
 ## License
 

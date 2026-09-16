@@ -12,6 +12,13 @@ use serde_json::Value;
 use crate::activity_ref::ActivityRef;
 use crate::capability::Capabilities;
 
+pub mod lifecycle;
+
+pub use lifecycle::{
+    AvailableActivities, CancelActivityPayload, CompactActivityPayload, InvokeActivityPayload,
+    LastActivityPayload, ListActivityPayload, NewActivityPayload, SwitchActivityPayload,
+};
+
 /// XACPP protocol command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", rename_all_fields = "camelCase")]
@@ -37,7 +44,7 @@ pub enum XacppCommand {
     Generic {
         name: String,
         arguments: Value,
-        /// Activity the command belongs to. Optional at protocol level;
+        /// Activity the command originates from. Optional at protocol level;
         /// validation is the command implementor's decision.
         #[serde(skip_serializing_if = "Option::is_none")]
         activity: Option<ActivityRef>,

@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::payload::AlertLevel;
+use crate::activity_ref::ActivityRef;
+use crate::commands::XacppCommand;
 
 // ---- Tool Call Authorization ----
 
@@ -35,7 +37,6 @@ pub enum ActionResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionRequestPayload {
-    pub request_id: String,
     pub tool_name: String,
     pub arguments: String,
     pub action_id: String,
@@ -50,7 +51,6 @@ pub struct ActionRequestPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotifyPayload {
-    pub request_id: String,
     pub message: String,
 }
 
@@ -74,7 +74,6 @@ pub enum QuestionResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuestionPayload {
-    pub request_id: String,
     pub question: String,
     pub options: Vec<String>,
 }
@@ -136,53 +135,37 @@ pub struct SensitiveInfoOperationResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SensitiveInfoOperationPayload {
-    pub request_id: String,
     pub operation: SensitiveInfoOperation,
 }
 
 // ---- Convenience: build interaction commands ----
 
-/// Builds an `action_request` command from a payload.
-pub fn action_request_command(activity: &str, payload: &ActionRequestPayload) -> Value {
-    serde_json::to_value(payload)
-        .map(|p| {
-            let mut map = if let Value::Object(m) = p {
-                m
-            } else {
-                serde_json::Map::new()
-            };
-            map.insert("activity".to_string(), Value::String(activity.to_string()));
-            Value::Object(map)
-        })
-        .unwrap_or(Value::Null)
+/// Builds an `action_request` command with the activity in the command envelope.
+pub fn action_request_command(activity: &str, payload: &ActionRequestPayload) -> XacppCommand {
+    XacppCommand::generic_with_activity(
+        "action_request",
+        serde_json::to_value(payload).unwrap_or(Value::Null),
+        ActivityRef::new(activity),
+    )
 }
 
-/// Builds a `question` command from a payload.
-pub fn question_command(activity: &str, payload: &QuestionPayload) -> Value {
-    serde_json::to_value(payload)
-        .map(|p| {
-            let mut map = if let Value::Object(m) = p {
-                m
-            } else {
-                serde_json::Map::new()
-            };
-            map.insert("activity".to_string(), Value::String(activity.to_string()));
-            Value::Object(map)
-        })
-        .unwrap_or(Value::Null)
+/// Builds a `question` command with the activity in the command envelope.
+pub fn question_command(activity: &str, payload: &QuestionPayload) -> XacppCommand {
+    XacppCommand::generic_with_activity(
+        "question",
+        serde_json::to_value(payload).unwrap_or(Value::Null),
+        ActivityRef::new(activity),
+    )
 }
 
-/// Builds a `sensitive_info_operation` command from a payload.
-pub fn sensitive_info_command(activity: &str, payload: &SensitiveInfoOperationPayload) -> Value {
-    serde_json::to_value(payload)
-        .map(|p| {
-            let mut map = if let Value::Object(m) = p {
-                m
-            } else {
-                serde_json::Map::new()
-            };
-            map.insert("activity".to_string(), Value::String(activity.to_string()));
-            Value::Object(map)
-        })
-        .unwrap_or(Value::Null)
+/// Builds a `sensitive_info_operation` command with the activity in the command envelope.
+pub fn sensitive_info_command(
+    activity: &str,
+    payload: &SensitiveInfoOperationPayload,
+) -> XacppCommand {
+    XacppCommand::generic_with_activity(
+        "sensitive_info_operation",
+        serde_json::to_value(payload).unwrap_or(Value::Null),
+        ActivityRef::new(activity),
+    )
 }

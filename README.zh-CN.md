@@ -142,9 +142,9 @@ Generic 命令携带可选的 `activity` 字段，形态为结构化 `{id}` 引�
 
 ### 命令声明约定
 
-命令声明 schema 可携带 `dispatcher` 字段，取值 `"system"` 或 `"model"`，缺省视为
-`"system"`。`system` 表示系统路径接入（不进模型工具面）；`model` 表示模型直调
-（进工具列表）。声明 schema 为透传 JSON，协议库不强制类型。
+命令声明 schema 可携带 `dispatcher` 字段，取值 `"bridge"` 或 `"tool"`，缺省视为
+`"bridge"`。`bridge` 表示事件桥系统路径接入（不进模型工具面）；`tool` 表示注入
+接收方模型工具面（模型直调）。声明 schema 为透传 JSON，协议库不强制类型。
 
 ## 许可证
 

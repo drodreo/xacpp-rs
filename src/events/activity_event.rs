@@ -58,9 +58,8 @@ mod tests {
     #[test]
     fn test_activity_event_rejects_legacy_string_activity() {
         // 0.8.0 breaking change: legacy string-form activity must fail deterministically.
-        let result: Result<XacppActivityEvent, _> = serde_json::from_str(
-            r#"{"activity":"act-1","event":{"name":"think","data":null}}"#,
-        );
+        let result: Result<XacppActivityEvent, _> =
+            serde_json::from_str(r#"{"activity":"act-1","event":{"name":"think","data":null}}"#);
         assert!(result.is_err());
     }
 }

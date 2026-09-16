@@ -471,14 +471,17 @@ fn test_wire_response_generic_roundtrip() {
     let wire = XacppEnvelope::Response {
         id: "r2".into(),
         session_id: None,
-        payload: XacppResponse::generic("action", json!({ "requestId": "req-1" })),
+        payload: XacppResponse::generic(
+            "action",
+            serde_json::to_value(ActionResponse::Approve).unwrap(),
+        ),
     };
     let json = serde_json::to_string(&wire).unwrap();
     assert!(json.contains(r#""type":"response""#), "json: {json}");
     assert!(json.contains(r#""id":"r2""#), "json: {json}");
     assert!(json.contains(r#""generic""#), "json: {json}");
     assert!(json.contains(r#""name":"action""#), "json: {json}");
-    assert!(json.contains(r#""requestId":"req-1""#), "json: {json}");
+    assert!(json.contains(r#""data":{"type":"approve"}"#), "json: {json}");
 
     let de: XacppEnvelope = serde_json::from_str(&json).unwrap();
     match de {
@@ -491,7 +494,7 @@ fn test_wire_response_generic_roundtrip() {
             match payload {
                 XacppResponse::Generic { name, data } => {
                     assert_eq!(name, "action");
-                    assert_eq!(data["requestId"], "req-1");
+                    assert_eq!(data["type"], "approve");
                 }
                 other => panic!("unexpected: {other:?}"),
             }
@@ -644,7 +647,6 @@ fn test_deserialize_generic_response_from_json() {
 #[test]
 fn test_action_request_payload_roundtrip() {
     let payload = ActionRequestPayload {
-        request_id: "req-1".into(),
         tool_name: "bash".into(),
         arguments: r#"{"command":"ls"}"#.into(),
         action_id: "act-1".into(),
@@ -653,12 +655,11 @@ fn test_action_request_payload_roundtrip() {
         intent: "list files".into(),
     };
     let json = serde_json::to_string(&payload).unwrap();
-    assert!(json.contains(r#""requestId":"req-1""#), "json: {json}");
     assert!(json.contains(r#""toolName":"bash""#), "json: {json}");
     assert!(json.contains(r#""alert":"warn""#), "json: {json}");
+    assert!(!json.contains(r#""requestId""#), "json: {json}");
 
     let de: ActionRequestPayload = serde_json::from_str(&json).unwrap();
-    assert_eq!(de.request_id, "req-1");
     assert_eq!(de.tool_name, "bash");
     assert_eq!(de.alert, AlertLevel::Warn);
 }
@@ -689,17 +690,14 @@ fn test_action_response_roundtrip() {
 #[test]
 fn test_question_payload_roundtrip() {
     let payload = QuestionPayload {
-        request_id: "req-2".into(),
         question: "continue?".into(),
         options: vec!["yes".into(), "no".into()],
     };
     let json = serde_json::to_string(&payload).unwrap();
-    assert!(json.contains(r#""requestId":"req-2""#), "json: {json}");
-    assert!(json.contains(r#""question":"continue?""#), "json: {json}");
-    assert!(json.contains(r#""options""#), "json: {json}");
+    assert_eq!(json, r#"{"question":"continue?","options":["yes","no"]}"#);
 
     let de: QuestionPayload = serde_json::from_str(&json).unwrap();
-    assert_eq!(de.request_id, "req-2");
+    assert_eq!(de.question, "continue?");
     assert_eq!(de.options.len(), 2);
 }
 
@@ -729,7 +727,6 @@ fn test_question_response_roundtrip() {
 #[test]
 fn test_sensitive_info_operation_payload_roundtrip() {
     let payload = SensitiveInfoOperationPayload {
-        request_id: "req-3".into(),
         operation: SensitiveInfoOperation::Collect {
             items: vec![SensitiveInfoItem {
                 id: None,
@@ -741,12 +738,11 @@ fn test_sensitive_info_operation_payload_roundtrip() {
         },
     };
     let json = serde_json::to_string(&payload).unwrap();
-    assert!(json.contains(r#""requestId":"req-3""#), "json: {json}");
     assert!(json.contains(r#""collect""#), "json: {json}");
     assert!(json.contains(r#""siType":"secret""#), "json: {json}");
+    assert!(!json.contains(r#""requestId""#), "json: {json}");
 
     let de: SensitiveInfoOperationPayload = serde_json::from_str(&json).unwrap();
-    assert_eq!(de.request_id, "req-3");
     match de.operation {
         SensitiveInfoOperation::Collect { items } => {
             assert_eq!(items.len(), 1);
@@ -783,7 +779,6 @@ fn test_sensitive_info_result_roundtrip() {
 #[test]
 fn test_action_request_command_builder() {
     let payload = ActionRequestPayload {
-        request_id: "req-1".into(),
         tool_name: "bash".into(),
         arguments: "{}".into(),
         action_id: "act-1".into(),
@@ -791,42 +786,43 @@ fn test_action_request_command_builder() {
         alert: AlertLevel::Info,
         intent: "test".into(),
     };
-    let args = action_request_command("act-1", &payload);
+    let cmd = action_request_command("act-1", &payload);
 
-    // Should contain all payload fields plus "activity"
-    assert_eq!(args["activity"], "act-1");
-    assert_eq!(args["requestId"], "req-1");
-    assert_eq!(args["toolName"], "bash");
-
-    // Build full command and verify
-    let cmd = XacppCommand::generic("action_request", args);
+    // Activity belongs to the command envelope; arguments carry payload fields only
     let json = serde_json::to_string(&cmd).unwrap();
     assert!(json.contains(r#""name":"action_request""#), "json: {json}");
-    assert!(json.contains(r#""activity":"act-1""#), "json: {json}");
+    assert!(
+        json.contains(r#""activity":{"id":"act-1"}"#),
+        "json: {json}"
+    );
+    assert!(json.contains(r#""toolName":"bash""#), "json: {json}");
+    assert!(!json.contains(r#""requestId""#), "json: {json}");
+    assert!(!json.contains(r#""activity":"act-1""#), "json: {json}");
 }
 
 #[test]
 fn test_question_command_builder() {
     let payload = QuestionPayload {
-        request_id: "req-2".into(),
         question: "continue?".into(),
         options: vec!["yes".into(), "no".into()],
     };
-    let args = question_command("act-1", &payload);
+    let cmd = question_command("act-1", &payload);
 
-    assert_eq!(args["activity"], "act-1");
-    assert_eq!(args["requestId"], "req-2");
-    assert_eq!(args["question"], "continue?");
-
-    let cmd = XacppCommand::generic("question", args);
+    // Activity belongs to the command envelope; arguments carry payload fields only
     let json = serde_json::to_string(&cmd).unwrap();
     assert!(json.contains(r#""name":"question""#), "json: {json}");
+    assert!(
+        json.contains(r#""activity":{"id":"act-1"}"#),
+        "json: {json}"
+    );
+    assert!(json.contains(r#""question":"continue?""#), "json: {json}");
+    assert!(!json.contains(r#""requestId""#), "json: {json}");
+    assert!(!json.contains(r#""activity":"act-1""#), "json: {json}");
 }
 
 #[test]
 fn test_sensitive_info_command_builder() {
     let payload = SensitiveInfoOperationPayload {
-        request_id: "req-3".into(),
         operation: SensitiveInfoOperation::Collect {
             items: vec![SensitiveInfoItem {
                 id: None,
@@ -837,17 +833,20 @@ fn test_sensitive_info_command_builder() {
             }],
         },
     };
-    let args = sensitive_info_command("act-1", &payload);
+    let cmd = sensitive_info_command("act-1", &payload);
 
-    assert_eq!(args["activity"], "act-1");
-    assert_eq!(args["requestId"], "req-3");
-
-    let cmd = XacppCommand::generic("sensitive_info_operation", args);
+    // Activity belongs to the command envelope; arguments carry payload fields only
     let json = serde_json::to_string(&cmd).unwrap();
     assert!(
         json.contains(r#""name":"sensitive_info_operation""#),
         "json: {json}"
     );
+    assert!(
+        json.contains(r#""activity":{"id":"act-1"}"#),
+        "json: {json}"
+    );
+    assert!(!json.contains(r#""requestId""#), "json: {json}");
+    assert!(!json.contains(r#""activity":"act-1""#), "json: {json}");
 }
 
 // =========================================================================

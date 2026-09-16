@@ -1415,7 +1415,6 @@ async fn test_action_request_command_lifecycle() {
 
     // Build action_request command using convenience function
     let payload = ActionRequestPayload {
-        request_id: "req-1".into(),
         tool_name: "bash".into(),
         arguments: r#"{"command":"ls"}"#.into(),
         action_id: "act-1".into(),
@@ -1423,8 +1422,7 @@ async fn test_action_request_command_lifecycle() {
         alert: AlertLevel::Warn,
         intent: "list files".into(),
     };
-    let args = action_request_command("activity-1", &payload);
-    let cmd = XacppCommand::generic("action_request", args);
+    let cmd = action_request_command("activity-1", &payload);
 
     let response = timeout(session.request_command(cmd)).await.unwrap();
 
@@ -1472,12 +1470,10 @@ async fn test_question_command_lifecycle() {
         .unwrap();
 
     let payload = QuestionPayload {
-        request_id: "req-2".into(),
         question: "continue?".into(),
         options: vec!["yes".into(), "no".into()],
     };
-    let args = question_command("activity-1", &payload);
-    let cmd = XacppCommand::generic("question", args);
+    let cmd = question_command("activity-1", &payload);
 
     let response = timeout(session.request_command(cmd)).await.unwrap();
 
@@ -1529,7 +1525,6 @@ async fn test_sensitive_info_command_lifecycle() {
         .unwrap();
 
     let payload = SensitiveInfoOperationPayload {
-        request_id: "req-3".into(),
         operation: SensitiveInfoOperation::Collect {
             items: vec![
                 SensitiveInfoItem {
@@ -1549,8 +1544,7 @@ async fn test_sensitive_info_command_lifecycle() {
             ],
         },
     };
-    let args = sensitive_info_command("activity-1", &payload);
-    let cmd = XacppCommand::generic("sensitive_info_operation", args);
+    let cmd = sensitive_info_command("activity-1", &payload);
 
     let response = timeout(session.request_command(cmd)).await.unwrap();
 
