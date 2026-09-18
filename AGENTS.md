@@ -91,7 +91,7 @@ Must stay in sync with xacpp-ts test suite.
 
 ## Conventions
 
-- All comments in English
+- All comments and commit messages in English
 - Keep in sync with xacpp-ts: when adding/removing a command, response variant, or envelope field, update both projects
 - `XacppCommand` is an externally tagged enum — Establish carries `credentials: Option<String>`
 - Transport implementations must handle envelope `session_id` field
