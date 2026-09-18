@@ -72,6 +72,175 @@ fn extract_names(schemas: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
+// ---- Command declaration schema (typed view of `Capabilities::commands`) ----
+
+/// Typed representation of one command declaration schema (an element of
+/// `Capabilities::commands` / `EffectiveCapabilities::remote_commands`).
+///
+/// Purely additive: the raw `serde_json::Value` carrier is unchanged. Use
+/// [`CommandDeclaration::from_value`] / [`CommandDeclaration::to_value`] to
+/// convert between the raw and typed forms.
+///
+/// Forward compatibility:
+/// - Unknown fields are ignored on deserialization.
+/// - Unknown `dispatcher` / `extraScopes` values fall back to
+///   [`Dispatcher::Unknown`] / [`ExtraScope::Unknown`] instead of failing.
+///
+/// Wire keys are camelCase (`evaluationPolicy`, `extraScopes`, ...); Rust
+/// fields are snake_case bridged via `rename_all`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandDeclaration {
+    /// Command name. Required.
+    pub name: String,
+
+    /// Human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// JSON Schema describing the parameters surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+
+    /// Dispatch surface. `Some(Tool)` routes the command into the model tool
+    /// surface; `None` (absent on the wire) means bridge semantics (not in
+    /// the tool surface).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatcher: Option<Dispatcher>,
+
+    /// Evaluation policy attached by the declaring side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_policy: Option<EvaluationPolicy>,
+
+    /// Additional exposure scopes. Absent/empty = default conversation
+    /// surface only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_scopes: Vec<ExtraScope>,
+}
+
+impl CommandDeclaration {
+    /// Parses a typed declaration from the raw JSON value carried in
+    /// `Capabilities::commands` / `EffectiveCapabilities::remote_commands`.
+    pub fn from_value(value: &serde_json::Value) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(value.clone())
+    }
+
+    /// Converts back to the raw JSON value form.
+    pub fn to_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(self)
+    }
+
+    /// True when the command should be routed into the model tool surface.
+    /// Only `Tool` is tool-facing: an absent dispatcher (bridge semantics),
+    /// an explicit `Bridge`, and unknown dispatcher values are all not
+    /// tool-facing.
+    pub fn is_tool_facing(&self) -> bool {
+        matches!(self.dispatcher, Some(Dispatcher::Tool))
+    }
+
+    /// The `requireToolCall` evaluation entry, if declared.
+    pub fn require_tool_call(&self) -> Option<&RequireToolCall> {
+        self.evaluation_policy
+            .as_ref()
+            .and_then(|p| p.require_tool_call.as_ref())
+    }
+
+    /// True when the command is additionally exposed in the compact scope.
+    pub fn has_compact_scope(&self) -> bool {
+        self.extra_scopes
+            .iter()
+            .any(|s| matches!(s, ExtraScope::Compact))
+    }
+}
+
+/// Command dispatch surface.
+///
+/// The wire-known values are `"tool"` and `"bridge"`. Anything else (from a
+/// newer peer) is preserved verbatim as `Unknown` — never a deserialization
+/// failure. An absent dispatcher also means bridge semantics (`None`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Dispatcher {
+    /// Routed into the model tool surface (`"tool"`).
+    Tool,
+    /// Bridge semantics, explicitly declared (`"bridge"`); same semantics as
+    /// an absent dispatcher.
+    Bridge,
+    /// Unrecognized dispatcher string, preserved verbatim.
+    Unknown(String),
+}
+
+impl Serialize for Dispatcher {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Dispatcher::Tool => serializer.serialize_str("tool"),
+            Dispatcher::Bridge => serializer.serialize_str("bridge"),
+            Dispatcher::Unknown(s) => serializer.serialize_str(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Dispatcher {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.as_str() {
+            "tool" => Dispatcher::Tool,
+            "bridge" => Dispatcher::Bridge,
+            _ => Dispatcher::Unknown(s),
+        })
+    }
+}
+
+/// Additional exposure scope of a command declaration.
+///
+/// The only wire-known value is `"compact"` (compaction thread surface).
+/// Anything else is preserved verbatim as `Unknown`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExtraScope {
+    /// Additionally exposed in the compact (compaction thread) surface.
+    Compact,
+    /// Unrecognized scope string, preserved verbatim.
+    Unknown(String),
+}
+
+impl Serialize for ExtraScope {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ExtraScope::Compact => serializer.serialize_str("compact"),
+            ExtraScope::Unknown(s) => serializer.serialize_str(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtraScope {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.as_str() {
+            "compact" => ExtraScope::Compact,
+            _ => ExtraScope::Unknown(s),
+        })
+    }
+}
+
+/// Evaluation policy declared alongside a command.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvaluationPolicy {
+    /// Require the model to call a specific tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_tool_call: Option<RequireToolCall>,
+}
+
+/// The single currently-defined evaluation entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequireToolCall {
+    /// Name of the tool the model must call.
+    pub require: String,
+
+    /// Message used to bounce the turn back when the tool was not called.
+    pub on_failure: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +387,139 @@ mod tests {
         assert_eq!(cmd["name"], "new_activity");
         assert_eq!(cmd["description"], "Create a new activity");
         assert!(cmd["parameters"].is_object());
+    }
+
+    // ---- CommandDeclaration ----
+
+    #[test]
+    fn test_command_declaration_full_roundtrip() {
+        let json = serde_json::json!({
+            "name": "new_activity",
+            "description": "Create a new activity",
+            "parameters": {
+                "type": "object",
+                "properties": { "title": { "type": "string" } }
+            },
+            "dispatcher": "tool",
+            "evaluationPolicy": {
+                "requireToolCall": {
+                    "require": "report_to_user",
+                    "onFailure": "You must reply via report_to_user."
+                }
+            },
+            "extraScopes": ["compact"]
+        });
+
+        let decl = CommandDeclaration::from_value(&json).unwrap();
+        assert_eq!(decl.name, "new_activity");
+        assert_eq!(decl.description.as_deref(), Some("Create a new activity"));
+        assert!(decl.parameters.as_ref().unwrap().is_object());
+        assert_eq!(decl.dispatcher, Some(Dispatcher::Tool));
+        let rtc = decl.require_tool_call().unwrap();
+        assert_eq!(rtc.require, "report_to_user");
+        assert_eq!(rtc.on_failure, "You must reply via report_to_user.");
+        assert_eq!(decl.extra_scopes, vec![ExtraScope::Compact]);
+
+        // Wire keys stay camelCase; a fully-populated declaration round-trips losslessly.
+        let back = decl.to_value().unwrap();
+        assert_eq!(back, json);
+
+        let reparsed = CommandDeclaration::from_value(&back).unwrap();
+        assert_eq!(decl, reparsed);
+    }
+
+    #[test]
+    fn test_command_declaration_optional_fields_omitted_on_serialize() {
+        let decl = CommandDeclaration {
+            name: "cmd".into(),
+            description: None,
+            parameters: None,
+            dispatcher: None,
+            evaluation_policy: None,
+            extra_scopes: vec![],
+        };
+        let back = decl.to_value().unwrap();
+        assert_eq!(back, serde_json::json!({ "name": "cmd" }));
+    }
+
+    #[test]
+    fn test_command_declaration_unknown_fields_tolerated() {
+        let json = serde_json::json!({
+            "name": "cmd",
+            "futureField": { "anything": true }
+        });
+        let decl = CommandDeclaration::from_value(&json).unwrap();
+        assert_eq!(decl.name, "cmd");
+        assert!(decl.description.is_none());
+    }
+
+    #[test]
+    fn test_command_declaration_absent_fields_default_semantics() {
+        let json = serde_json::json!({ "name": "cmd" });
+        let decl = CommandDeclaration::from_value(&json).unwrap();
+        // Absent dispatcher = bridge semantics (not tool-facing).
+        assert!(!decl.is_tool_facing());
+        assert!(decl.dispatcher.is_none());
+        // Absent scopes = default conversation surface only.
+        assert!(!decl.has_compact_scope());
+        assert!(decl.extra_scopes.is_empty());
+        assert!(decl.require_tool_call().is_none());
+    }
+
+    #[test]
+    fn test_command_declaration_unknown_values_fall_back() {
+        let json = serde_json::json!({
+            "name": "cmd",
+            "dispatcher": "turbo",
+            "extraScopes": ["compact", "sidebar"]
+        });
+        let decl = CommandDeclaration::from_value(&json).unwrap();
+        assert_eq!(
+            decl.dispatcher,
+            Some(Dispatcher::Unknown("turbo".into()))
+        );
+        // Unknown dispatcher is conservatively not tool-facing.
+        assert!(!decl.is_tool_facing());
+        assert_eq!(
+            decl.extra_scopes,
+            vec![
+                ExtraScope::Compact,
+                ExtraScope::Unknown("sidebar".into())
+            ]
+        );
+        // Unknown values serialize back verbatim (no data loss).
+        let back = decl.to_value().unwrap();
+        assert_eq!(back["dispatcher"], "turbo");
+        assert_eq!(back["extraScopes"], serde_json::json!(["compact", "sidebar"]));
+    }
+
+    #[test]
+    fn test_command_declaration_helpers() {
+        let json = serde_json::json!({
+            "name": "cmd",
+            "dispatcher": "tool",
+            "evaluationPolicy": {
+                "requireToolCall": { "require": "report_to_user", "onFailure": "bounce" }
+            },
+            "extraScopes": ["compact"]
+        });
+        let decl = CommandDeclaration::from_value(&json).unwrap();
+        assert!(decl.is_tool_facing());
+        assert!(decl.has_compact_scope());
+        assert_eq!(decl.require_tool_call().unwrap().require, "report_to_user");
+        assert_eq!(decl.require_tool_call().unwrap().on_failure, "bounce");
+    }
+
+    #[test]
+    fn test_command_declaration_explicit_bridge_dispatcher() {
+        let json = serde_json::json!({ "name": "cmd", "dispatcher": "bridge" });
+        let decl = CommandDeclaration::from_value(&json).unwrap();
+        // Explicit bridge is a known wire value, distinct from Unknown.
+        assert_eq!(decl.dispatcher, Some(Dispatcher::Bridge));
+        // Bridge is not the model tool surface.
+        assert!(!decl.is_tool_facing());
+        // Serializes back verbatim as the wire value.
+        let back = decl.to_value().unwrap();
+        assert_eq!(back, json);
     }
 }
