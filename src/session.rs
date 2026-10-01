@@ -1,6 +1,9 @@
 //! XACPP logical session.
 //!
-//! Created via `XacppPeer::establish`, holds an independent session_id and credentials.
+//! Created via `XacppPeer::establish` on the initiator side; on the responder
+//! side, construct it directly inside `on_establish` from the transport
+//! parameter and the self-generated session_id/credentials (see
+//! [`crate::handler::EstablishHandler`]).
 //! Multiple Sessions under the same Peer share the same connection.
 
 use std::sync::Arc;
@@ -22,7 +25,12 @@ pub struct XacppSession {
 }
 
 impl XacppSession {
-    pub(crate) fn new(
+    /// Creates a session handle over an established transport.
+    ///
+    /// Initiator side: returned by `XacppPeer::establish`. Responder side:
+    /// construct directly inside `on_establish` (transport parameter +
+    /// self-generated session_id + issued credentials).
+    pub fn new(
         transport: Arc<dyn XacppTransport>,
         session_id: String,
         credentials: String,
