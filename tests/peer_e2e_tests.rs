@@ -1421,6 +1421,7 @@ async fn test_action_request_command_lifecycle() {
         description: "list files".into(),
         alert: AlertLevel::Warn,
         intent: "list files".into(),
+        origin: vec![],
     };
     let cmd = action_request_command("activity-1", &payload);
 
@@ -1472,6 +1473,7 @@ async fn test_question_command_lifecycle() {
     let payload = QuestionPayload {
         question: "continue?".into(),
         options: vec!["yes".into(), "no".into()],
+        origin: vec![],
     };
     let cmd = question_command("activity-1", &payload);
 
@@ -1543,6 +1545,7 @@ async fn test_sensitive_info_command_lifecycle() {
                 },
             ],
         },
+        origin: vec![],
     };
     let cmd = sensitive_info_command("activity-1", &payload);
 

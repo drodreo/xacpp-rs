@@ -653,15 +653,21 @@ fn test_action_request_payload_roundtrip() {
         description: "list files".into(),
         alert: AlertLevel::Warn,
         intent: "list files".into(),
+        origin: vec!["sub-task-a".into()],
     };
     let json = serde_json::to_string(&payload).unwrap();
     assert!(json.contains(r#""toolName":"bash""#), "json: {json}");
     assert!(json.contains(r#""alert":"warn""#), "json: {json}");
+    assert!(
+        json.contains(r#""origin":["sub-task-a"]"#),
+        "json: {json}"
+    );
     assert!(!json.contains(r#""requestId""#), "json: {json}");
 
     let de: ActionRequestPayload = serde_json::from_str(&json).unwrap();
     assert_eq!(de.tool_name, "bash");
     assert_eq!(de.alert, AlertLevel::Warn);
+    assert_eq!(de.origin, vec!["sub-task-a".to_string()]);
 }
 
 #[test]
@@ -692,13 +698,18 @@ fn test_question_payload_roundtrip() {
     let payload = QuestionPayload {
         question: "continue?".into(),
         options: vec!["yes".into(), "no".into()],
+        origin: vec!["sub-task-a".into()],
     };
     let json = serde_json::to_string(&payload).unwrap();
-    assert_eq!(json, r#"{"question":"continue?","options":["yes","no"]}"#);
+    assert_eq!(
+        json,
+        r#"{"question":"continue?","options":["yes","no"],"origin":["sub-task-a"]}"#
+    );
 
     let de: QuestionPayload = serde_json::from_str(&json).unwrap();
     assert_eq!(de.question, "continue?");
     assert_eq!(de.options.len(), 2);
+    assert_eq!(de.origin, vec!["sub-task-a".to_string()]);
 }
 
 #[test]
@@ -736,10 +747,15 @@ fn test_sensitive_info_operation_payload_roundtrip() {
                 si_type: SensitiveInfoType::Secret,
             }],
         },
+        origin: vec!["sub-task-a".into()],
     };
     let json = serde_json::to_string(&payload).unwrap();
     assert!(json.contains(r#""collect""#), "json: {json}");
     assert!(json.contains(r#""siType":"secret""#), "json: {json}");
+    assert!(
+        json.contains(r#""origin":["sub-task-a"]"#),
+        "json: {json}"
+    );
     assert!(!json.contains(r#""requestId""#), "json: {json}");
 
     let de: SensitiveInfoOperationPayload = serde_json::from_str(&json).unwrap();
@@ -750,6 +766,7 @@ fn test_sensitive_info_operation_payload_roundtrip() {
         }
         other => panic!("unexpected: {other:?}"),
     }
+    assert_eq!(de.origin, vec!["sub-task-a".to_string()]);
 }
 
 #[test]
@@ -772,6 +789,60 @@ fn test_sensitive_info_result_roundtrip() {
     assert_eq!(de.results.len(), 2);
 }
 
+/// Legacy payloads (pre-0.8.5) carry no `origin` field; it must deserialize
+/// to an empty vec (= initiated by the consuming activity itself).
+#[test]
+fn test_interaction_payloads_legacy_origin_default() {
+    let action_json = r#"{
+        "toolName": "bash",
+        "arguments": "{}",
+        "actionId": "act-1",
+        "description": "test",
+        "alert": "warn",
+        "intent": "test"
+    }"#;
+    let de: ActionRequestPayload = serde_json::from_str(action_json).unwrap();
+    assert!(de.origin.is_empty(), "origin should default to empty vec");
+
+    let question_json = r#"{"question":"continue?","options":["yes"]}"#;
+    let de: QuestionPayload = serde_json::from_str(question_json).unwrap();
+    assert!(de.origin.is_empty(), "origin should default to empty vec");
+
+    let sensitive_json = r#"{
+        "operation": {
+            "type": "delete",
+            "items": [
+                {"id": "item-1", "key": "API_KEY", "displayText": "API Key", "hint": "", "siType": "secret"}
+            ]
+        }
+    }"#;
+    let de: SensitiveInfoOperationPayload = serde_json::from_str(sensitive_json).unwrap();
+    assert!(de.origin.is_empty(), "origin should default to empty vec");
+}
+
+/// Multi-hop origin chain serializes verbatim (source first, last = direct
+/// child of the consuming activity).
+#[test]
+fn test_interaction_payloads_origin_chain_roundtrip() {
+    let chain = vec![
+        "grandchild".to_string(),
+        "direct-child".to_string(),
+    ];
+    let payload = QuestionPayload {
+        question: "continue?".into(),
+        options: vec!["yes".into()],
+        origin: chain.clone(),
+    };
+    let json = serde_json::to_string(&payload).unwrap();
+    assert!(
+        json.contains(r#""origin":["grandchild","direct-child"]"#),
+        "json: {json}"
+    );
+
+    let de: QuestionPayload = serde_json::from_str(&json).unwrap();
+    assert_eq!(de.origin, chain);
+}
+
 // =========================================================================
 // Convenience function tests (interaction command builders)
 // =========================================================================
@@ -785,6 +856,7 @@ fn test_action_request_command_builder() {
         description: "test".into(),
         alert: AlertLevel::Info,
         intent: "test".into(),
+        origin: vec![],
     };
     let cmd = action_request_command("act-1", &payload);
 
@@ -805,6 +877,7 @@ fn test_question_command_builder() {
     let payload = QuestionPayload {
         question: "continue?".into(),
         options: vec!["yes".into(), "no".into()],
+        origin: vec![],
     };
     let cmd = question_command("act-1", &payload);
 
@@ -832,6 +905,7 @@ fn test_sensitive_info_command_builder() {
                 si_type: SensitiveInfoType::Secret,
             }],
         },
+        origin: vec![],
     };
     let cmd = sensitive_info_command("act-1", &payload);
 

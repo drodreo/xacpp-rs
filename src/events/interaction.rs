@@ -43,6 +43,15 @@ pub struct ActionRequestPayload {
     pub description: String,
     pub alert: AlertLevel,
     pub intent: String,
+    /// Activity origin chain titles (source first).
+    ///
+    /// - Empty: the request was initiated by the consuming activity itself;
+    /// - Non-empty: forwarded from a sub-activity — index 0 is the deepest
+    ///   originating activity title, ascending toward the consuming activity,
+    ///   with the last entry being the direct child of the consumer. Built by
+    ///   the host's ActivityManager interaction forwarder.
+    #[serde(default)]
+    pub origin: Vec<String>,
 }
 
 // ---- Notification ----
@@ -76,6 +85,15 @@ pub enum QuestionResponse {
 pub struct QuestionPayload {
     pub question: String,
     pub options: Vec<String>,
+    /// Activity origin chain titles (source first).
+    ///
+    /// - Empty: the request was initiated by the consuming activity itself;
+    /// - Non-empty: forwarded from a sub-activity — index 0 is the deepest
+    ///   originating activity title, ascending toward the consuming activity,
+    ///   with the last entry being the direct child of the consumer. Built by
+    ///   the host's ActivityManager interaction forwarder.
+    #[serde(default)]
+    pub origin: Vec<String>,
 }
 
 // ---- Sensitive Info ----
@@ -136,6 +154,15 @@ pub struct SensitiveInfoOperationResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SensitiveInfoOperationPayload {
     pub operation: SensitiveInfoOperation,
+    /// Activity origin chain titles (source first).
+    ///
+    /// - Empty: the request was initiated by the consuming activity itself;
+    /// - Non-empty: forwarded from a sub-activity — index 0 is the deepest
+    ///   originating activity title, ascending toward the consuming activity,
+    ///   with the last entry being the direct child of the consumer. Built by
+    ///   the host's ActivityManager interaction forwarder.
+    #[serde(default)]
+    pub origin: Vec<String>,
 }
 
 // ---- Convenience: build interaction commands ----
