@@ -83,9 +83,11 @@ cargo test
 
 ## Testing
 
-- `tests/peer_e2e_tests.rs` — Transport + Peer + Session e2e (17 tests)
-- `tests/serde_tests.rs` — Serialization round-trip (15 tests)
-- `tests/socket_concurrent_tests.rs` — SocketTransport concurrency (3 tests)
+- `tests/peer_e2e_tests.rs` — Transport + Peer + Session e2e
+- `tests/serde_tests.rs` — Serialization round-trip
+- `tests/socket_concurrent_tests.rs` — SocketTransport concurrency
+- `tests/egress_wire_tests.rs` — Raw-TCP wire order/throughput evidence
+- `examples/egress_bench.rs` — 40k-event throughput baseline (`cargo run --example egress_bench`, `XACPP_BENCH_N` overrides scale)
 
 Must stay in sync with xacpp-ts test suite.
 
