@@ -436,7 +436,7 @@ impl XacppPeer {
         session_id: Option<&str>,
         event: XacppActivityEvent,
     ) -> Result<XacppResponse, XacppError> {
-        // 校验事件名在 emit_events 交集里
+        // Validate event name against the negotiated emit_events capability
         let event_name = &event.event.name;
         let emit_events = self.inner.lock().await.emit_events.clone();
         if !emit_events.is_empty() && !emit_events.contains(event_name) {
@@ -447,6 +447,29 @@ impl XacppPeer {
         }
         self.transport
             .send(session_id, XacppRequest::Event(event))
+            .await
+    }
+
+    /// Sends an interactive event fire-and-forget (no session context):
+    /// returns as soon as the frame is queued, never waits for the ack.
+    ///
+    /// Protocol layer validates that the event name is in the negotiated emit_events capability.
+    pub async fn send_event(
+        &self,
+        session_id: Option<&str>,
+        event: XacppActivityEvent,
+    ) -> Result<(), XacppError> {
+        // Validate event name against the negotiated emit_events capability
+        let event_name = &event.event.name;
+        let emit_events = self.inner.lock().await.emit_events.clone();
+        if !emit_events.is_empty() && !emit_events.contains(event_name) {
+            return Err(XacppError::Internal(format!(
+                "event '{}' not in negotiated emit_events capability",
+                event_name
+            )));
+        }
+        self.transport
+            .send_faf(session_id, XacppRequest::Event(event))
             .await
     }
 }

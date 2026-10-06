@@ -1,6 +1,10 @@
 //! Stdio Transport Implementation.
 //!
 //! Communicates via stdin/stdout pipe handles using JSONL frame protocol (one message per line, delimited by `\n`).
+//!
+//! All outbound frames (requests, events, responses) go through the single
+//! ordered egress queue (see `super::egress`): one drain task owns the write
+//! half and writes frames FIFO in submission order.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -8,24 +12,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, RwLock, oneshot};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite};
+use tokio::sync::{Mutex, RwLock, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use super::egress::{self, Egress, PendingSlot};
 use super::{RequestHandler, XacppTransport};
 use crate::error::XacppError;
 use crate::message::{XacppEnvelope, XacppRequest, XacppResponse};
 
-/// Stdio internal send state.
-struct StdioInner {
-    writer: Option<Pin<Box<dyn AsyncWrite + Send>>>,
-}
-
 /// Shared state: accessed via Arc between accept loop and main task.
 struct SharedState {
     request_handler: RwLock<Option<RequestHandler>>,
-    pending: Mutex<HashMap<String, oneshot::Sender<XacppResponse>>>,
-    connected: AtomicBool,
+    pending: egress::PendingMap,
+    connected: Arc<AtomicBool>,
     /// reader task handle, aborted on disconnect.
     reader_handle: Mutex<Option<JoinHandle<()>>>,
     /// accept_loop task handle, aborted on disconnect.
@@ -34,8 +34,13 @@ struct SharedState {
 
 /// Stdio Transport Implementation.
 pub struct StdioTransport {
-    inner: Arc<Mutex<StdioInner>>,
+    /// Write half parked before connect.
+    parked_writer: Mutex<Option<Pin<Box<dyn AsyncWrite + Send>>>>,
     reader: Mutex<Option<Pin<Box<dyn AsyncBufRead + Send>>>>,
+    /// Ordered egress entry (present after connect).
+    egress: Mutex<Option<Egress>>,
+    /// Connection-close broadcast (see `XacppTransport::closed`).
+    closed_tx: watch::Sender<bool>,
     shared: Arc<SharedState>,
     next_id: Arc<AtomicU64>,
     /// Connection operation mutex, ensures connect / disconnect do not execute concurrently.
@@ -47,15 +52,16 @@ impl StdioTransport {
         writer: Pin<Box<dyn AsyncWrite + Send>>,
         reader: Pin<Box<dyn AsyncBufRead + Send>>,
     ) -> Self {
+        let (closed_tx, _) = watch::channel(false);
         Self {
-            inner: Arc::new(Mutex::new(StdioInner {
-                writer: Some(writer),
-            })),
+            parked_writer: Mutex::new(Some(writer)),
             reader: Mutex::new(Some(reader)),
+            egress: Mutex::new(None),
+            closed_tx,
             shared: Arc::new(SharedState {
                 request_handler: RwLock::new(None),
-                pending: Mutex::new(HashMap::new()),
-                connected: AtomicBool::new(false),
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                connected: Arc::new(AtomicBool::new(false)),
                 reader_handle: Mutex::new(None),
                 accept_handle: Mutex::new(None),
             }),
@@ -68,34 +74,27 @@ impl StdioTransport {
         format!("r{}", self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Serialize wire message and send (JSONL format).
-    async fn send_envelope(
-        inner: &Arc<Mutex<StdioInner>>,
-        msg: &XacppEnvelope,
-    ) -> Result<(), XacppError> {
-        let json = serde_json::to_vec(msg).map_err(|e| XacppError::Internal(e.to_string()))?;
+    /// Serialize wire message (JSONL payload without trailing newline).
+    fn serialize_envelope(msg: &XacppEnvelope) -> Result<Vec<u8>, XacppError> {
+        serde_json::to_vec(msg).map_err(|e| XacppError::Internal(e.to_string()))
+    }
 
-        let mut guard = inner.lock().await;
-        let writer = guard.writer.as_mut().ok_or(XacppError::NotConnected)?;
-
-        writer
-            .write_all(&json)
+    /// Clone the ordered egress entry (`Err(NotConnected)` before connect).
+    async fn egress(&self) -> Result<Egress, XacppError> {
+        self.egress
+            .lock()
             .await
-            .map_err(|_| XacppError::Closed)?;
-        writer
-            .write_all(b"\n")
-            .await
-            .map_err(|_| XacppError::Closed)?;
-        writer.flush().await.map_err(|_| XacppError::Closed)?;
-        Ok(())
+            .clone()
+            .ok_or(XacppError::NotConnected)
     }
 
     /// Accept loop: read from frame channel, parse, dispatch.
     ///
-    /// On exit: disconnect writer and set connected to false, preventing subsequent send hang.
+    /// On exit: mark disconnected (subsequent sends fail fast), clear pending,
+    /// shut the egress down.
     async fn accept_loop(
         mut frame_rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
-        inner: Arc<Mutex<StdioInner>>,
+        egress: Egress,
         shared: Arc<SharedState>,
     ) {
         while let Some(result) = frame_rx.recv().await {
@@ -145,31 +144,41 @@ impl StdioTransport {
                         session_id: sid_for_response,
                         payload: response_payload,
                     };
-                    if let Err(e) = Self::send_envelope(&inner, &response).await {
-                        log::warn!("accept: failed to send response for request {id}: {e}");
+                    match Self::serialize_envelope(&response) {
+                        Ok(frame) => {
+                            if let Err(e) = egress.send_acked(frame).await {
+                                log::warn!("accept: failed to send response for request {id}: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "accept: failed to serialize response for request {id}: {e}"
+                            );
+                        }
                     }
                 }
                 XacppEnvelope::Response { id, payload, .. } => {
                     let mut pending_guard = shared.pending.lock().await;
-                    if let Some(sender) = pending_guard.remove(&id) {
-                        let _ = sender.send(payload);
-                    } else {
-                        log::warn!("accept: received response for unknown request {id}");
+                    match pending_guard.remove(&id) {
+                        Some(PendingSlot::Respond(sender)) => {
+                            let _ = sender.send(payload);
+                        }
+                        // Fire-and-forget ack: silently consumed.
+                        Some(PendingSlot::Drop) => {}
+                        None => {
+                            log::warn!("accept: received response for unknown request {id}");
+                        }
                     }
                 }
             }
         }
 
-        // On exit: disconnect writer, clear pending, mark disconnected
+        // On exit: connection dead — fail fast subsequent sends, drop pending
+        // waiters, shut the egress down.
         log::info!("accept: loop exited, cleaning up");
-        {
-            let mut guard = inner.lock().await;
-            if let Some(mut writer) = guard.writer.take() {
-                let _ = writer.shutdown().await;
-            }
-        }
-        shared.pending.lock().await.clear();
         shared.connected.store(false, Ordering::Release);
+        shared.pending.lock().await.clear();
+        egress.close();
     }
 }
 
@@ -182,12 +191,27 @@ impl XacppTransport for StdioTransport {
             return Err(XacppError::AlreadyConnected);
         }
 
+        let writer = self
+            .parked_writer
+            .lock()
+            .await
+            .take()
+            .ok_or(XacppError::AlreadyConnected)?;
         let reader = self
             .reader
             .lock()
             .await
             .take()
             .ok_or(XacppError::AlreadyConnected)?;
+
+        // Ordered egress: drain task owns the write half.
+        let (egress, _egress_handle) = egress::spawn_egress(
+            writer,
+            Arc::clone(&self.shared.connected),
+            Arc::clone(&self.shared.pending),
+            self.closed_tx.clone(),
+        );
+        *self.egress.lock().await = Some(egress.clone());
 
         let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(256);
         let reader_handle = tokio::spawn(async move {
@@ -208,10 +232,9 @@ impl XacppTransport for StdioTransport {
             }
         });
 
-        let inner = Arc::clone(&self.inner);
         let shared = Arc::clone(&self.shared);
         let accept_handle = tokio::spawn(async move {
-            Self::accept_loop(frame_rx, inner, shared).await;
+            Self::accept_loop(frame_rx, egress, shared).await;
         });
 
         self.shared.connected.store(true, Ordering::Release);
@@ -225,12 +248,11 @@ impl XacppTransport for StdioTransport {
     async fn disconnect(&self) -> Result<(), XacppError> {
         let _guard = self.connect_lock.lock().await;
 
-        // Disconnect writer
-        {
-            let mut inner = self.inner.lock().await;
-            if let Some(mut writer) = inner.writer.take() {
-                let _ = writer.shutdown().await;
-            }
+        // Stop accepting new outbound traffic, then shut the egress down
+        // (queued frames flush FIFO before the writer closes).
+        self.shared.connected.store(false, Ordering::Release);
+        if let Some(egress) = self.egress.lock().await.take() {
+            egress.close();
         }
 
         // Abort both tasks
@@ -242,7 +264,6 @@ impl XacppTransport for StdioTransport {
         }
 
         self.shared.pending.lock().await.clear();
-        self.shared.connected.store(false, Ordering::Release);
 
         log::debug!("disconnect: transport disconnected");
         Ok(())
@@ -254,19 +275,21 @@ impl XacppTransport for StdioTransport {
         payload: XacppRequest,
     ) -> Result<XacppResponse, XacppError> {
         let id = self.next_id();
-        let (tx, rx) = oneshot::channel();
-
-        {
-            let mut pending = self.shared.pending.lock().await;
-            pending.insert(id.clone(), tx);
-        }
-
         let envelope = XacppEnvelope::Request {
             id: id.clone(),
             session_id: session_id.map(String::from),
             payload,
         };
-        if let Err(e) = Self::send_envelope(&self.inner, &envelope).await {
+        let frame = Self::serialize_envelope(&envelope)?;
+
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.shared.pending.lock().await;
+            pending.insert(id.clone(), PendingSlot::Respond(tx));
+        }
+
+        let egress = self.egress().await?;
+        if let Err(e) = egress.send_acked(frame).await {
             self.shared.pending.lock().await.remove(&id);
             return Err(e);
         }
@@ -280,6 +303,34 @@ impl XacppTransport for StdioTransport {
         }
     }
 
+    async fn send_faf(
+        &self,
+        session_id: Option<&str>,
+        payload: XacppRequest,
+    ) -> Result<(), XacppError> {
+        let id = self.next_id();
+        let envelope = XacppEnvelope::Request {
+            id: id.clone(),
+            session_id: session_id.map(String::from),
+            payload,
+        };
+        let frame = Self::serialize_envelope(&envelope)?;
+
+        // Drop slot: the peer's ack is silently consumed on arrival.
+        self.shared
+            .pending
+            .lock()
+            .await
+            .insert(id.clone(), PendingSlot::Drop);
+
+        let egress = self.egress().await?;
+        if let Err(e) = egress.send_faf(frame) {
+            self.shared.pending.lock().await.remove(&id);
+            return Err(e);
+        }
+        Ok(())
+    }
+
     fn on_request(&self, handler: RequestHandler) -> Result<(), XacppError> {
         if self.shared.connected.load(Ordering::Acquire) {
             return Err(XacppError::AlreadyConnected);
@@ -291,5 +342,9 @@ impl XacppTransport for StdioTransport {
             .expect("on_request: lock contention before connect");
         *guard = Some(handler);
         Ok(())
+    }
+
+    fn closed(&self) -> watch::Receiver<bool> {
+        self.closed_tx.subscribe()
     }
 }

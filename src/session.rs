@@ -73,4 +73,23 @@ impl XacppSession {
             .send(Some(&self.session_id), XacppRequest::Event(event))
             .await
     }
+
+    /// Sends an event fire-and-forget: returns as soon as the frame is
+    /// queued for writing, never waits for the ack.
+    ///
+    /// Ordering against other outbound frames is preserved by the
+    /// transport's single FIFO egress. `Err` = connection already known dead.
+    pub async fn send_event(&self, event: XacppActivityEvent) -> Result<(), XacppError> {
+        self.transport
+            .send_faf(Some(&self.session_id), XacppRequest::Event(event))
+            .await
+    }
+
+    /// Subscribe to the underlying connection's close notification.
+    ///
+    /// Check `*rx.borrow()` after subscribing: the connection may already be
+    /// closed before the subscription.
+    pub fn closed(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.transport.closed()
+    }
 }
