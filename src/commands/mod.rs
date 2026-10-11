@@ -15,8 +15,9 @@ use crate::capability::Capabilities;
 pub mod lifecycle;
 
 pub use lifecycle::{
-    AvailableActivities, CancelActivityPayload, CompactActivityPayload, InvokeActivityPayload,
-    LastActivityPayload, ListActivityPayload, NewActivityPayload, SwitchActivityPayload,
+    ArchiveActivityPayload, AvailableActivities, CancelActivityPayload, CompactActivityPayload,
+    DeleteActivityPayload, InvokeActivityPayload, LastActivityPayload, ListActivityPayload,
+    NewActivityPayload, SwitchActivityPayload,
 };
 
 /// XACPP protocol command.

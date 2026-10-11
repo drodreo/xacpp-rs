@@ -124,4 +124,13 @@ pub struct ActivityInfo {
     pub agent: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Human-readable activity description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Last update time (RFC 3339 string).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    /// Working directory; fillers normalize the agent home prefix to the `$AGENT_HOME` placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
 }

@@ -1,6 +1,6 @@
 //! Lifecycle command and response payload types (protocol body).
 //!
-//! Wire types for the seven lifecycle commands:
+//! Wire types for the nine lifecycle commands:
 //!
 //! | Command          | req arguments                       | resp                                                     |
 //! |------------------|-------------------------------------|----------------------------------------------------------|
@@ -11,6 +11,8 @@
 //! | invoke_activity  | `{activity, messages}`              | `acknowledge`                                             |
 //! | cancel_activity  | `{activity, reason?}`               | `acknowledge`                                             |
 //! | compact_activity | `{activity}`                        | `acknowledge`                                             |
+//! | archive_activity | `{activity}`                        | `acknowledge`                                             |
+//! | delete_activity  | `{activity}`                        | `acknowledge`                                             |
 //!
 //! `activity` in request payloads is the operation target (a command business
 //! argument), not the envelope source; envelope source semantics are carried by
@@ -90,6 +92,22 @@ pub struct CancelActivityPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactActivityPayload {
+    /// Operation target activity.
+    pub activity: String,
+}
+
+/// `archive_activity` request payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveActivityPayload {
+    /// Operation target activity.
+    pub activity: String,
+}
+
+/// `delete_activity` request payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteActivityPayload {
     /// Operation target activity.
     pub activity: String,
 }
@@ -201,6 +219,55 @@ mod tests {
     }
 
     #[test]
+    fn test_archive_activity_payload_serialization() {
+        let payload = ArchiveActivityPayload {
+            activity: "act-1".into(),
+        };
+        let s = serde_json::to_string(&payload).unwrap();
+        assert_eq!(s, r#"{"activity":"act-1"}"#);
+
+        let de: ArchiveActivityPayload = serde_json::from_str(r#"{"activity":"act-1"}"#).unwrap();
+        assert_eq!(de.activity, "act-1");
+    }
+
+    #[test]
+    fn test_delete_activity_payload_serialization() {
+        let payload = DeleteActivityPayload {
+            activity: "act-1".into(),
+        };
+        let s = serde_json::to_string(&payload).unwrap();
+        assert_eq!(s, r#"{"activity":"act-1"}"#);
+
+        let de: DeleteActivityPayload = serde_json::from_str(r#"{"activity":"act-1"}"#).unwrap();
+        assert_eq!(de.activity, "act-1");
+    }
+
+    #[test]
+    fn test_activity_info_extended_fields_wire() {
+        let info = ActivityInfo {
+            activity: "act-1".into(),
+            agent: "main".into(),
+            title: Some("research".into()),
+            description: Some("long running task".into()),
+            updated_at: Some("2026-10-11T03:00:00Z".into()),
+            working_dir: Some("$AGENT_HOME/work".into()),
+        };
+        let s = serde_json::to_string(&info).unwrap();
+        assert_eq!(
+            s,
+            r#"{"activity":"act-1","agent":"main","title":"research","description":"long running task","updatedAt":"2026-10-11T03:00:00Z","workingDir":"$AGENT_HOME/work"}"#
+        );
+
+        // Extended fields default to None when absent on the wire (backward compatible).
+        let de: ActivityInfo =
+            serde_json::from_str(r#"{"activity":"act-1","agent":"main"}"#).unwrap();
+        assert_eq!(de.title, None);
+        assert_eq!(de.description, None);
+        assert_eq!(de.updated_at, None);
+        assert_eq!(de.working_dir, None);
+    }
+
+    #[test]
     fn test_available_activities_serialization() {
         let payload = AvailableActivities {
             total: 1,
@@ -208,6 +275,9 @@ mod tests {
                 activity: "act-1".into(),
                 agent: "main".into(),
                 title: Some("research".into()),
+                description: None,
+                updated_at: None,
+                working_dir: None,
             }],
         };
         let s = serde_json::to_string(&payload).unwrap();
