@@ -49,6 +49,20 @@ pub enum AlertLevel {
     Critical,
 }
 
+/// Activity-level authorization mode.
+///
+/// `Default` keeps the existing per-request authorization flow; `Auto` has the
+/// serve side short-circuit action-class authorization requests for the whole
+/// activity (semantics owned by the serve side, see x-agent
+/// tool-runtime-permission.md). Questions are not affected.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityMode {
+    #[default]
+    Default,
+    Auto,
+}
+
 /// Tool call started event payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,6 +92,12 @@ pub struct ToolResultEvent {
     /// Tool execution result content.
     #[serde(default)]
     pub parts: Vec<ContentPart>,
+    /// True when this result was produced under the activity `auto`
+    /// authorization mode (self-approved, no user interaction).
+    // COMPAT: additive optional field; old serve peers omit it (reads as
+    // false). Remove once all consumers are mode-aware.
+    #[serde(default)]
+    pub auto: bool,
 }
 
 /// Security alert event payload.
@@ -133,4 +153,10 @@ pub struct ActivityInfo {
     /// Working directory; fillers normalize the agent home prefix to the `$AGENT_HOME` placeholder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
+    /// Current activity authorization mode (in-memory state on the serve
+    /// side; a restored activity is always `Default`).
+    // COMPAT: additive optional field; old serve peers omit it (reads as
+    // Default). Remove once all consumers are mode-aware.
+    #[serde(default)]
+    pub mode: ActivityMode,
 }

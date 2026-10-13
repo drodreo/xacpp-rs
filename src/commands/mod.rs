@@ -17,7 +17,7 @@ pub mod lifecycle;
 pub use lifecycle::{
     ArchiveActivityPayload, AvailableActivities, CancelActivityPayload, CompactActivityPayload,
     DeleteActivityPayload, InvokeActivityPayload, LastActivityPayload, ListActivityPayload,
-    NewActivityPayload, SwitchActivityPayload,
+    NewActivityPayload, SetActivityModePayload, SwitchActivityPayload,
 };
 
 /// XACPP protocol command.

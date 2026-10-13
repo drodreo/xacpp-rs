@@ -1,6 +1,6 @@
 //! Lifecycle command and response payload types (protocol body).
 //!
-//! Wire types for the nine lifecycle commands:
+//! Wire types for the ten lifecycle commands:
 //!
 //! | Command          | req arguments                       | resp                                                     |
 //! |------------------|-------------------------------------|----------------------------------------------------------|
@@ -13,6 +13,7 @@
 //! | compact_activity | `{activity}`                        | `acknowledge`                                             |
 //! | archive_activity | `{activity}`                        | `acknowledge`                                             |
 //! | delete_activity  | `{activity}`                        | `acknowledge`                                             |
+//! | set_activity_mode| `{activity, mode}`                  | `acknowledge`                                             |
 //!
 //! `activity` in request payloads is the operation target (a command business
 //! argument), not the envelope source; envelope source semantics are carried by
@@ -26,7 +27,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::events::content::ContentPart;
-use crate::events::payload::ActivityInfo;
+use crate::events::payload::{ActivityInfo, ActivityMode};
 
 // ---- Request payloads (command arguments) ----
 
@@ -112,6 +113,20 @@ pub struct DeleteActivityPayload {
     pub activity: String,
 }
 
+/// `set_activity_mode` request payload.
+///
+/// Switches the activity-level authorization mode. Idempotent: setting the
+/// current mode again succeeds. The mode is in-memory state on the serve side
+/// and resets to `Default` when the activity is restored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetActivityModePayload {
+    /// Operation target activity.
+    pub activity: String,
+    /// Authorization mode to switch to.
+    pub mode: ActivityMode,
+}
+
 // ---- Response payloads ----
 
 /// `available_activities` response payload (`list_activity`).
@@ -129,6 +144,7 @@ mod tests {
     use super::*;
     use crate::commands::XacppCommand;
     use crate::events::content::TextPart;
+    use crate::events::payload::ToolResultEvent;
 
     #[test]
     fn test_new_activity_payload_serialization() {
@@ -189,7 +205,10 @@ mod tests {
             })],
         };
         let s = serde_json::to_string(&payload).unwrap();
-        assert_eq!(s, r#"{"activity":"act-1","messages":[{"type":"text","text":"hi"}]}"#);
+        assert_eq!(
+            s,
+            r#"{"activity":"act-1","messages":[{"type":"text","text":"hi"}]}"#
+        );
     }
 
     #[test]
@@ -243,6 +262,60 @@ mod tests {
     }
 
     #[test]
+    fn test_activity_mode_serialization() {
+        let s = serde_json::to_string(&ActivityMode::Default).unwrap();
+        assert_eq!(s, r#""default""#);
+        let s = serde_json::to_string(&ActivityMode::Auto).unwrap();
+        assert_eq!(s, r#""auto""#);
+
+        let de: ActivityMode = serde_json::from_str(r#""default""#).unwrap();
+        assert_eq!(de, ActivityMode::Default);
+        let de: ActivityMode = serde_json::from_str(r#""auto""#).unwrap();
+        assert_eq!(de, ActivityMode::Auto);
+        assert_eq!(ActivityMode::default(), ActivityMode::Default);
+    }
+
+    #[test]
+    fn test_set_activity_mode_payload_serialization() {
+        let payload = SetActivityModePayload {
+            activity: "act-1".into(),
+            mode: ActivityMode::Auto,
+        };
+        let s = serde_json::to_string(&payload).unwrap();
+        assert_eq!(s, r#"{"activity":"act-1","mode":"auto"}"#);
+
+        let de: SetActivityModePayload =
+            serde_json::from_str(r#"{"activity":"act-1","mode":"auto"}"#).unwrap();
+        assert_eq!(de.activity, "act-1");
+        assert_eq!(de.mode, ActivityMode::Auto);
+
+        let de: SetActivityModePayload =
+            serde_json::from_str(r#"{"activity":"act-1","mode":"default"}"#).unwrap();
+        assert_eq!(de.mode, ActivityMode::Default);
+    }
+
+    #[test]
+    fn test_tool_result_auto_flag_wire() {
+        let event = ToolResultEvent {
+            request_id: "req-1".into(),
+            tool_name: "shell".into(),
+            index: 0,
+            parts: vec![],
+            auto: true,
+        };
+        let s = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            s,
+            r#"{"requestId":"req-1","toolName":"shell","index":0,"parts":[],"auto":true}"#
+        );
+
+        // Old serve peers omit the auto flag; it reads as false (backward compatible).
+        let de: ToolResultEvent =
+            serde_json::from_str(r#"{"requestId":"req-1","toolName":"shell","index":0}"#).unwrap();
+        assert!(!de.auto);
+    }
+
+    #[test]
     fn test_activity_info_extended_fields_wire() {
         let info = ActivityInfo {
             activity: "act-1".into(),
@@ -251,11 +324,12 @@ mod tests {
             description: Some("long running task".into()),
             updated_at: Some("2026-10-11T03:00:00Z".into()),
             working_dir: Some("$AGENT_HOME/work".into()),
+            mode: ActivityMode::Auto,
         };
         let s = serde_json::to_string(&info).unwrap();
         assert_eq!(
             s,
-            r#"{"activity":"act-1","agent":"main","title":"research","description":"long running task","updatedAt":"2026-10-11T03:00:00Z","workingDir":"$AGENT_HOME/work"}"#
+            r#"{"activity":"act-1","agent":"main","title":"research","description":"long running task","updatedAt":"2026-10-11T03:00:00Z","workingDir":"$AGENT_HOME/work","mode":"auto"}"#
         );
 
         // Extended fields default to None when absent on the wire (backward compatible).
@@ -265,6 +339,8 @@ mod tests {
         assert_eq!(de.description, None);
         assert_eq!(de.updated_at, None);
         assert_eq!(de.working_dir, None);
+        // Mode defaults to Default when absent on the wire (backward compatible).
+        assert_eq!(de.mode, ActivityMode::Default);
     }
 
     #[test]
@@ -278,12 +354,13 @@ mod tests {
                 description: None,
                 updated_at: None,
                 working_dir: None,
+                mode: ActivityMode::Default,
             }],
         };
         let s = serde_json::to_string(&payload).unwrap();
         assert_eq!(
             s,
-            r#"{"total":1,"activities":[{"activity":"act-1","agent":"main","title":"research"}]}"#
+            r#"{"total":1,"activities":[{"activity":"act-1","agent":"main","title":"research","mode":"default"}]}"#
         );
     }
 
@@ -307,7 +384,10 @@ mod tests {
     fn test_activity_not_found_response_anchor() {
         let resp = crate::message::XacppResponse::activity_not_found();
         let s = serde_json::to_string(&resp).unwrap();
-        assert_eq!(s, r#"{"kind":"generic","name":"activity_not_found","data":null}"#);
+        assert_eq!(
+            s,
+            r#"{"kind":"generic","name":"activity_not_found","data":null}"#
+        );
     }
 
     #[test]
