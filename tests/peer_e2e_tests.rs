@@ -1422,6 +1422,7 @@ async fn test_action_request_command_lifecycle() {
         alert: AlertLevel::Warn,
         intent: "list files".into(),
         origin: vec![],
+        request_id: String::new(),
     };
     let cmd = action_request_command("activity-1", &payload);
 
@@ -1474,6 +1475,7 @@ async fn test_question_command_lifecycle() {
         question: "continue?".into(),
         options: vec!["yes".into(), "no".into()],
         origin: vec![],
+        request_id: String::new(),
     };
     let cmd = question_command("activity-1", &payload);
 

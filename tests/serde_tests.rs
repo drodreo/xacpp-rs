@@ -654,6 +654,7 @@ fn test_action_request_payload_roundtrip() {
         alert: AlertLevel::Warn,
         intent: "list files".into(),
         origin: vec!["sub-task-a".into()],
+        request_id: "req-1".into(),
     };
     let json = serde_json::to_string(&payload).unwrap();
     assert!(json.contains(r#""toolName":"bash""#), "json: {json}");
@@ -662,12 +663,13 @@ fn test_action_request_payload_roundtrip() {
         json.contains(r#""origin":["sub-task-a"]"#),
         "json: {json}"
     );
-    assert!(!json.contains(r#""requestId""#), "json: {json}");
+    assert!(json.contains(r#""requestId":"req-1""#), "json: {json}");
 
     let de: ActionRequestPayload = serde_json::from_str(&json).unwrap();
     assert_eq!(de.tool_name, "bash");
     assert_eq!(de.alert, AlertLevel::Warn);
     assert_eq!(de.origin, vec!["sub-task-a".to_string()]);
+    assert_eq!(de.request_id, "req-1");
 }
 
 #[test]
@@ -699,17 +701,19 @@ fn test_question_payload_roundtrip() {
         question: "continue?".into(),
         options: vec!["yes".into(), "no".into()],
         origin: vec!["sub-task-a".into()],
+        request_id: "req-2".into(),
     };
     let json = serde_json::to_string(&payload).unwrap();
     assert_eq!(
         json,
-        r#"{"question":"continue?","options":["yes","no"],"origin":["sub-task-a"]}"#
+        r#"{"question":"continue?","options":["yes","no"],"origin":["sub-task-a"],"requestId":"req-2"}"#
     );
 
     let de: QuestionPayload = serde_json::from_str(&json).unwrap();
     assert_eq!(de.question, "continue?");
     assert_eq!(de.options.len(), 2);
     assert_eq!(de.origin, vec!["sub-task-a".to_string()]);
+    assert_eq!(de.request_id, "req-2");
 }
 
 #[test]
@@ -832,6 +836,7 @@ fn test_interaction_payloads_origin_chain_roundtrip() {
         question: "continue?".into(),
         options: vec!["yes".into()],
         origin: chain.clone(),
+        request_id: String::new(),
     };
     let json = serde_json::to_string(&payload).unwrap();
     assert!(
@@ -841,6 +846,65 @@ fn test_interaction_payloads_origin_chain_roundtrip() {
 
     let de: QuestionPayload = serde_json::from_str(&json).unwrap();
     assert_eq!(de.origin, chain);
+}
+
+/// request_id serializes under the camelCase wire key (`requestId`) and
+/// round-trips verbatim on both interaction payloads.
+#[test]
+fn test_interaction_payloads_request_id_roundtrip() {
+    let action = ActionRequestPayload {
+        tool_name: "bash".into(),
+        arguments: "{}".into(),
+        action_id: "act-1".into(),
+        description: "test".into(),
+        alert: AlertLevel::Info,
+        intent: "test".into(),
+        origin: vec![],
+        request_id: "req-abc-1".into(),
+    };
+    let json = serde_json::to_string(&action).unwrap();
+    assert!(json.contains(r#""requestId":"req-abc-1""#), "json: {json}");
+    let de: ActionRequestPayload = serde_json::from_str(&json).unwrap();
+    assert_eq!(de.request_id, "req-abc-1");
+
+    let question = QuestionPayload {
+        question: "continue?".into(),
+        options: vec!["yes".into()],
+        origin: vec![],
+        request_id: "req-abc-2".into(),
+    };
+    let json = serde_json::to_string(&question).unwrap();
+    assert!(json.contains(r#""requestId":"req-abc-2""#), "json: {json}");
+    let de: QuestionPayload = serde_json::from_str(&json).unwrap();
+    assert_eq!(de.request_id, "req-abc-2");
+}
+
+/// Legacy peers (pre-request-id) omit the field entirely; it must deserialize
+/// to an empty string.
+///
+/// COMPAT: 旧 serve 无 requestId 的兼容路径（缺省反序列化为空串），后续版本解除。
+#[test]
+fn test_interaction_payloads_legacy_request_id_default() {
+    let action_json = r#"{
+        "toolName": "bash",
+        "arguments": "{}",
+        "actionId": "act-1",
+        "description": "test",
+        "alert": "warn",
+        "intent": "test"
+    }"#;
+    let de: ActionRequestPayload = serde_json::from_str(action_json).unwrap();
+    assert!(
+        de.request_id.is_empty(),
+        "request_id should default to empty string"
+    );
+
+    let question_json = r#"{"question":"continue?","options":["yes"]}"#;
+    let de: QuestionPayload = serde_json::from_str(question_json).unwrap();
+    assert!(
+        de.request_id.is_empty(),
+        "request_id should default to empty string"
+    );
 }
 
 // =========================================================================
@@ -857,6 +921,7 @@ fn test_action_request_command_builder() {
         alert: AlertLevel::Info,
         intent: "test".into(),
         origin: vec![],
+        request_id: String::new(),
     };
     let cmd = action_request_command("act-1", &payload);
 
@@ -868,7 +933,6 @@ fn test_action_request_command_builder() {
         "json: {json}"
     );
     assert!(json.contains(r#""toolName":"bash""#), "json: {json}");
-    assert!(!json.contains(r#""requestId""#), "json: {json}");
     assert!(!json.contains(r#""activity":"act-1""#), "json: {json}");
 }
 
@@ -878,6 +942,7 @@ fn test_question_command_builder() {
         question: "continue?".into(),
         options: vec!["yes".into(), "no".into()],
         origin: vec![],
+        request_id: String::new(),
     };
     let cmd = question_command("act-1", &payload);
 
@@ -889,7 +954,6 @@ fn test_question_command_builder() {
         "json: {json}"
     );
     assert!(json.contains(r#""question":"continue?""#), "json: {json}");
-    assert!(!json.contains(r#""requestId""#), "json: {json}");
     assert!(!json.contains(r#""activity":"act-1""#), "json: {json}");
 }
 

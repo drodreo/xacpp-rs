@@ -52,6 +52,12 @@ pub struct ActionRequestPayload {
     ///   the host's ActivityManager interaction forwarder.
     #[serde(default)]
     pub origin: Vec<String>,
+    /// Unique identifier for matching this request with its response on the
+    /// wire (engine-level correlation identity, carried through unchanged).
+    ///
+    /// COMPAT: 旧 serve 无 requestId 的兼容路径（缺省反序列化为空串），后续版本解除。
+    #[serde(default)]
+    pub request_id: String,
 }
 
 // ---- Notification ----
@@ -94,6 +100,12 @@ pub struct QuestionPayload {
     ///   the host's ActivityManager interaction forwarder.
     #[serde(default)]
     pub origin: Vec<String>,
+    /// Unique identifier for matching this request with its response on the
+    /// wire (engine-level correlation identity, carried through unchanged).
+    ///
+    /// COMPAT: 旧 serve 无 requestId 的兼容路径（缺省反序列化为空串），后续版本解除。
+    #[serde(default)]
+    pub request_id: String,
 }
 
 // ---- Sensitive Info ----
