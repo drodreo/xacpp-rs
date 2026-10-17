@@ -474,23 +474,20 @@ mod tests {
             "extraScopes": ["compact", "sidebar"]
         });
         let decl = CommandDeclaration::from_value(&json).unwrap();
-        assert_eq!(
-            decl.dispatcher,
-            Some(Dispatcher::Unknown("turbo".into()))
-        );
+        assert_eq!(decl.dispatcher, Some(Dispatcher::Unknown("turbo".into())));
         // Unknown dispatcher is conservatively not tool-facing.
         assert!(!decl.is_tool_facing());
         assert_eq!(
             decl.extra_scopes,
-            vec![
-                ExtraScope::Compact,
-                ExtraScope::Unknown("sidebar".into())
-            ]
+            vec![ExtraScope::Compact, ExtraScope::Unknown("sidebar".into())]
         );
         // Unknown values serialize back verbatim (no data loss).
         let back = decl.to_value().unwrap();
         assert_eq!(back["dispatcher"], "turbo");
-        assert_eq!(back["extraScopes"], serde_json::json!(["compact", "sidebar"]));
+        assert_eq!(
+            back["extraScopes"],
+            serde_json::json!(["compact", "sidebar"])
+        );
     }
 
     #[test]

@@ -202,12 +202,13 @@ mod tests {
             messages: vec![ContentPart::Text(TextPart {
                 text: "hi".into(),
                 part_id: None,
+                part_type: "default".into(),
             })],
         };
         let s = serde_json::to_string(&payload).unwrap();
         assert_eq!(
             s,
-            r#"{"activity":"act-1","messages":[{"type":"text","text":"hi"}]}"#
+            r#"{"activity":"act-1","messages":[{"type":"text","text":"hi","partType":"default"}]}"#
         );
     }
 

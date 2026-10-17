@@ -10,18 +10,24 @@ xacpp defines the communication protocol between an agent and its peers. It prov
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  Peer (protocol layer)                                       │
-│  Typed operations + session routing                          │
+│  Peer (lifecycle orchestration, initiator side)              │
+│  negotiate → connect → establish → disconnect                │
 ├──────────────────────────────────────────────────────────────┤
-│  Session (session layer)                                     │
-│  Independent session context, sends directly via Transport   │
+│  Session (communication facade + transfer state)             │
+│  request_command / send_event / send_binary;                 │
+│  owns TransferSession (ACK/NACK/RESUME/heartbeat),           │
+│  wires itself onto the current transport                     │
 ├──────────────────────────────────────────────────────────────┤
-│  Transport (transport layer)                                 │
-│  Envelope assembly, id correlation, pending matching         │
+│  Transport (connection entity)                               │
+│  Physical IO, binary framing, single-FIFO egress             │
 ├──────────────────────────────────────────────────────────────┤
-│  Stdio / TCP / WebSocket                                     │
+│  Stdio / TCP                                                  │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+A session outlives individual connections: on disconnect the transfer state
+stays in the session; on reconnect the session wires itself onto the new
+transport and interrupted transfers resume from the breakpoint.
 
 ## Usage
 
@@ -29,62 +35,71 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-xacpp = "0.1"
+xacpp = "1.0"
 ```
 
 ### Establish a session (initiator side)
 
 ```rust
 use std::sync::Arc;
-use xacpp::commands::XacppCommand;
-use xacpp::events::XacppEvent;
-use xacpp::handler::{EstablishHandler, XacppSessionHandler};
-use xacpp::message::{XacppRequest, XacppResponse};
+use xacpp::capability::Capabilities;
+use xacpp::handler::{EstablishHandler, NegotiateHandler, XacppSessionHandler};
 use xacpp::peer::XacppPeer;
-use xacpp::transport::stdio::StdioTransport;
+use xacpp::session::XacppSession;
+use xacpp::transport::socket::SocketTransport;
 use xacpp::transport::XacppTransport;
 
-// Create transport + peer
-let transport: Arc<dyn XacppTransport> = Arc::new(StdioTransport::new(/* ... */));
+// A session owns its transfer state; it is created independently of any
+// connection and wires itself onto transports as they come and go.
+let session = Arc::new(XacppSession::new(None)); // None = TransferConfig::default()
 
-struct MyEstablishHandler;
-#[async_trait::async_trait]
-impl EstablishHandler for MyEstablishHandler {
-    async fn on_establish(
-        &self,
-        transport: Arc<dyn XacppTransport>,
-        credentials: Option<String>,
-    ) -> Result<(String, Arc<dyn XacppSessionHandler>), xacpp::error::XacppError> {
-        Ok(("session-1".into(), Arc::new(MySessionHandler)))
-    }
-}
+let transport: Arc<dyn XacppTransport> =
+    Arc::new(SocketTransport::connect_to("127.0.0.1:8080".into()));
 
-let peer = XacppPeer::new(transport, Arc::new(MyEstablishHandler));
+// Peer orchestrates the lifecycle and auto-wires the session on connect.
+let caps = Capabilities {
+    commands: vec![/* JSON Schemas this side handles */],
+    produce_events: vec![],
+    accept_events: vec![],
+};
+let peer = XacppPeer::new(
+    caps,
+    transport,
+    Some(Arc::clone(&session)),
+    Arc::new(MyNegotiateHandler),
+    Arc::new(MyEstablishHandler),
+);
 peer.connect().await?;
 
-// Establish a logical session
-let session = peer.establish(None, Arc::new(my_session_handler)).await?;
+// Establish a logical session (fills identity/emit-events into the session).
+peer.establish(None, Arc::new(my_session_handler), |_| Ok(())).await?;
 
-// Send commands/events through the session
-let response = session.request_command(XacppCommand::NewActivity).await?;
-session.request_event(XacppEvent::Think { content: "Hello!".into() }).await?;
+// Send commands/events/binary through the session facade.
+let response = session.request_command(cmd).await?;
+session.send_event(event).await?;
+let txid = session
+    .send_binary(payload, Some(Arc::new(|result| { /* BinarySendResult */ })))
+    .await?;
 ```
 
-### Handle incoming requests (responder side)
+### Handle incoming connections (responder side)
 
 ```rust
-struct MySessionHandler;
+// Responder side has no peer: accept a connection, create a session,
+// restore identity if reconnecting, and wire the session onto the transport.
+let transport: Arc<dyn XacppTransport> = Arc::new(SocketTransport::new(stream));
+let session = Arc::new(
+    XacppSession::new(None)
+        .with_identity("session-1".into(), credentials),
+);
+session.wire(Arc::clone(&transport)).await?;
+session.on_binary(Arc::new(|txid, payload| { /* consume */ }));
 
-#[async_trait::async_trait]
-impl XacppSessionHandler for MySessionHandler {
-    async fn on_command(&self, command: XacppCommand) -> Result<XacppResponse, XacppError> {
-        Ok(XacppResponse::Acknowledge)
-    }
-
-    async fn on_event(&self, event: XacppEvent) -> Result<XacppResponse, XacppError> {
-        Ok(XacppResponse::Acknowledge)
-    }
-}
+transport
+    .on_request(Arc::new(move |_sid, payload| {
+        // Return XacppResponse for inbound commands/events
+    }))
+    .expect("register request handler before connect");
 ```
 
 ### TCP Transport (for network communication)
@@ -105,15 +120,15 @@ let server = SocketTransport::new(accepted_stream);
 
 | Type | Description |
 |------|-------------|
-| `XacppTransport` | Transport trait (`connect`, `disconnect`, `send`, `on_request`) |
-| `XacppPeer` | Protocol endpoint with session routing |
-| `XacppSession` | Logical session, sends via Transport directly |
+| `XacppPeer` | Lifecycle orchestration (negotiate/connect/establish/disconnect); wires the session onto the transport automatically (initiator side) |
+| `XacppSession` | Communication facade (`request_command`/`send_event`/`send_binary`); owns transfer state, survives reconnections, `wire`/`unwire` onto transports |
+| `TransferSession` | Transfer-transaction state machine (ACK/NACK/RESUME/heartbeat/backpressure); owned by `XacppSession` |
+| `TransferConfig` | Transfer tuning (heartbeat interval, silent timeout, ACK batching, tick) |
+| `XacppTransport` | Connection entity: physical IO, binary framing, single-FIFO egress |
 | `XacppSessionHandler` | Handles inbound Command/Event for a session |
-| `EstablishHandler` | Handles Establish handshake requests |
-| `XacppCommand` | Protocol commands (`Establish`, `NewActivity`, etc.) |
-| `XacppEvent` | Protocol events (Think, ActionRequest, Question, etc.) |
+| `NegotiateHandler` / `EstablishHandler` | Handshake handlers |
+| `XacppCommand` / `XacppEvent` | Protocol commands and events |
 | `ActivityRef` | Activity identifier reference shared by command and event envelopes |
-| `XacppRequest` | Request payload (Command or Event) |
 | `XacppResponse` | Response payload (Established, Acknowledge, Action, etc.) |
 | `XacppError` | Error enum with machine-readable codes |
 | `PeerState` | Peer state enum (Disconnected, Connected) |
@@ -122,12 +137,12 @@ let server = SocketTransport::new(accepted_stream);
 
 | Type | Description |
 |------|-------------|
-| `StdioTransport` | Async stdin/stdout JSONL pipe |
+| `StdioTransport` | Child-process pipes with binary framing |
 | `SocketTransport` | TCP transport (`TcpStream`), spawn-per-request concurrency |
 
 ## Wire Protocol
 
-JSONL (one JSON object per line) with envelope structure:
+Framing is the XACPP binary frame protocol (docs/SPEC.md §3/§4): every envelope travels as the payload of a `DATA_JSON` frame. Envelope structure:
 
 ```json
 {"type":"request","id":"r1","payload":{"kind":"command","payload":{"establish":{"credentials":null}}}}
@@ -148,6 +163,15 @@ defaulting to `"bridge"`. `bridge` means the command is integrated via the event
 bridge system path (not exposed to the model tool surface); `tool` means the command
 is injected into the receiver's model tool surface (the model invokes it directly).
 Declaration schemas are pass-through JSON; the protocol library does not enforce types.
+
+## Performance
+
+Baseline measured by `cargo run --release --example bench_protocol` (TCP loopback, release build); scale via `XACPP_BENCH_N`, select a group via `XACPP_BENCH_ONLY`. These numbers are the reference for future optimization work.
+
+- Codec (pure encode/decode, no I/O): binary frames level with JSONL on small (~200 B) messages, +49% on medium (~2 KiB)
+- Request-response RTT: p50 0.070 ms at ~13.5k events/s
+- 64 MiB `sendBinary` (1 MiB working frames): 463–638 MB/s aggregate; 4 × 16 MiB concurrent: 638–732 MB/s
+- Control-frame insertion: heartbeat p50 under a bulk binary transfer is level with the idle connection (10 ms period)
 
 ## License
 

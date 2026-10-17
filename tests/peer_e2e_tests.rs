@@ -30,6 +30,7 @@ use xacpp::events::{XacppActivityEvent, XacppEvent};
 use xacpp::handler::{EstablishDecision, EstablishHandler, NegotiateHandler, XacppSessionHandler};
 use xacpp::message::{XacppRequest, XacppResponse};
 use xacpp::peer::{PeerState, XacppPeer};
+use xacpp::session::XacppSession;
 use xacpp::transport::XacppTransport;
 use xacpp::transport::stdio::StdioTransport;
 
@@ -277,12 +278,14 @@ async fn connected_peers() -> (XacppPeer, XacppPeer) {
     let peer_a = XacppPeer::new(
         caps_agent,
         transport_a,
+        Some(Arc::new(XacppSession::new(None))),
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(AutoApproveEstablishHandler),
     );
     let peer_b = XacppPeer::new(
         caps_bot,
         transport_b,
+        None,
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(AutoApproveEstablishHandler),
     );
@@ -563,12 +566,14 @@ async fn test_negotiate_full_flow() {
     let peer_a = XacppPeer::new(
         caps_a.clone(),
         transport_a,
+        Some(Arc::new(XacppSession::new(None))),
         negotiate_a,
         Arc::new(AutoApproveEstablishHandler),
     );
     let peer_b = XacppPeer::new(
         caps_b.clone(),
         transport_b,
+        None,
         negotiate_b,
         Arc::new(AutoApproveEstablishHandler),
     );
@@ -618,6 +623,7 @@ async fn test_negotiate_responder_rejects() {
     let peer_a = XacppPeer::new(
         caps_a,
         transport_a,
+        Some(Arc::new(XacppSession::new(None))),
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(AutoApproveEstablishHandler),
     );
@@ -628,6 +634,7 @@ async fn test_negotiate_responder_rejects() {
             accept_events: Vec::new(),
         },
         transport_b,
+        None,
         Arc::new(RejectNegotiateHandler),
         Arc::new(AutoApproveEstablishHandler),
     );
@@ -664,6 +671,7 @@ async fn test_negotiate_initiator_rejects() {
             accept_events: Vec::new(),
         },
         transport_a,
+        Some(Arc::new(XacppSession::new(None))),
         Arc::new(RejectNegotiateHandler),
         Arc::new(AutoApproveEstablishHandler),
     );
@@ -675,6 +683,7 @@ async fn test_negotiate_initiator_rejects() {
     let peer_b = XacppPeer::new(
         caps_b,
         transport_b,
+        None,
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(AutoApproveEstablishHandler),
     );
@@ -725,12 +734,14 @@ async fn test_negotiate_capabilities_preserved() {
     let peer_a = XacppPeer::new(
         caps_a,
         transport_a,
+        Some(Arc::new(XacppSession::new(None))),
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(AutoApproveEstablishHandler),
     );
     let peer_b = XacppPeer::new(
         caps_b,
         transport_b,
+        None,
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(AutoApproveEstablishHandler),
     );
@@ -786,12 +797,14 @@ async fn test_emit_events_intersection() {
     let peer_a = XacppPeer::new(
         caps_a,
         transport_a,
+        Some(Arc::new(XacppSession::new(None))),
         negotiate_a,
         Arc::new(AutoApproveEstablishHandler),
     );
     let peer_b = XacppPeer::new(
         caps_b,
         transport_b,
+        None,
         negotiate_b,
         Arc::new(AutoApproveEstablishHandler),
     );
@@ -832,12 +845,14 @@ async fn test_request_event_rejected_by_emit_events() {
     let peer_a = XacppPeer::new(
         caps_a,
         transport_a,
+        Some(Arc::new(XacppSession::new(None))),
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(AutoApproveEstablishHandler),
     );
     let peer_b = XacppPeer::new(
         caps_b,
         transport_b,
+        None,
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(AutoApproveEstablishHandler),
     );
@@ -846,15 +861,20 @@ async fn test_request_event_rejected_by_emit_events() {
 
     timeout(peer_a.negotiate()).await.unwrap();
 
-    // Try to send "think" event via peer.request_event (not session.request_event)
-    let result = peer_a
-        .request_event(
-            None,
-            XacppActivityEvent {
-                activity: ActivityRef::new("test-act"),
-                event: XacppEvent::new("think", json!({ "content": "hello" })),
-            },
-        )
+    // Establish: the initiator session gets the negotiated emit_events
+    // snapshot backfilled ([content_delta]).
+    let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
+    let session = timeout(peer_a.establish(None, handler, |_| Ok(())))
+        .await
+        .unwrap();
+
+    // Try to send "think" event via session.request_event (not in the
+    // negotiated emit_events snapshot) — must be rejected client-side.
+    let result = session
+        .request_event(XacppActivityEvent {
+            activity: ActivityRef::new("test-act"),
+            event: XacppEvent::new("think", json!({ "content": "hello" })),
+        })
         .await;
 
     assert!(result.is_err(), "sending non-emit event should be rejected");
@@ -1091,6 +1111,8 @@ async fn test_inflight_request_cancelled_on_disconnect() {
 async fn test_multi_session_routing_isolation() {
     // peer_b uses SequencedEstablishHandler, each session gets an ID'd handler
     let (transport_a, transport_b) = duplex_pair();
+    // Kept aside for a direct (session-less) send under the first session id.
+    let raw_transport_a = Arc::clone(&transport_a);
     let peer_a = XacppPeer::new(
         Capabilities {
             commands: Vec::new(),
@@ -1098,6 +1120,7 @@ async fn test_multi_session_routing_isolation() {
             accept_events: Vec::new(),
         },
         transport_a,
+        Some(Arc::new(XacppSession::new(None))),
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(SequencedEstablishHandler::new()),
     );
@@ -1108,6 +1131,7 @@ async fn test_multi_session_routing_isolation() {
             accept_events: Vec::new(),
         },
         transport_b,
+        None,
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(SequencedEstablishHandler::new()),
     );
@@ -1115,33 +1139,28 @@ async fn test_multi_session_routing_isolation() {
     peer_b.connect().await.unwrap();
     peer_a.negotiate().await.unwrap();
 
-    // A initiator: establish two sessions, handler returns acknowledge for commands
+    // A initiator: establish two sessions (responder registers an ID'd
+    // handler per session). The initiator peer owns a single logical
+    // session: the second establish backfills its identity to sid_2, while
+    // the responder's routing table keeps both handlers isolated.
     let handler_a: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
-    let session_1 = timeout(peer_a.establish(None, Arc::clone(&handler_a), |_| Ok(())))
+    let first = timeout(peer_a.establish(None, Arc::clone(&handler_a), |_| Ok(())))
         .await
         .unwrap();
+    let sid_1_prev = first.session_id().to_owned();
     let session_2 = timeout(peer_a.establish(None, Arc::clone(&handler_a), |_| Ok(())))
         .await
         .unwrap();
 
-    let sid_1 = session_1.session_id().to_owned();
+    // The initiator session now carries the second identity.
     let sid_2 = session_2.session_id().to_owned();
-    assert_ne!(sid_1, sid_2, "two sessions must have different IDs");
+    assert!(
+        !sid_2.is_empty(),
+        "second establish must backfill the initiator session identity"
+    );
+    assert_ne!(sid_1_prev, sid_2, "two sessions must have different IDs");
 
-    // Send command via session_1 → B side routes to handler-1 → response identifies as "handler-1"
-    let resp_1 =
-        timeout(session_1.request_command(XacppCommand::generic("new_activity", json!({}))))
-            .await
-            .unwrap();
-    match resp_1 {
-        XacppResponse::Generic { name, data } => {
-            assert_eq!(name, "handler_id");
-            assert_eq!(data["id"], "handler-1", "session_1 must route to handler-1");
-        }
-        other => panic!("expected handler_id, got: {other:?}"),
-    }
-
-    // Send command via session_2 → B side routes to handler-2
+    // Send command via session_2 → B side routes to handler-2 → response identifies as "handler-2"
     let resp_2 =
         timeout(session_2.request_command(XacppCommand::generic("new_activity", json!({}))))
             .await
@@ -1154,11 +1173,17 @@ async fn test_multi_session_routing_isolation() {
         other => panic!("expected handler_id, got: {other:?}"),
     }
 
-    // Cross-validation: session_1 sends again, still routes to handler-1
-    let resp_1_again = timeout(session_1.request_command(XacppCommand::generic(
-        "cancel_activity",
-        json!({ "activity": "act-1" }),
-    )))
+    // Cross-validation: the responder still routes the FIRST session id to
+    // handler-1 (routing-table isolation across sessions on one connection).
+    // Direct transport send under the first session id (the initiator's
+    // single session object now carries sid_2).
+    let resp_1_again = timeout(raw_transport_a.send(
+        Some(&sid_1_prev),
+        XacppRequest::Command(XacppCommand::generic(
+            "cancel_activity",
+            json!({ "activity": "act-1" }),
+        )),
+    ))
     .await
     .unwrap();
     match resp_1_again {
@@ -1166,7 +1191,7 @@ async fn test_multi_session_routing_isolation() {
             assert_eq!(name, "handler_id");
             assert_eq!(
                 data["id"], "handler-1",
-                "session_1 must still route to handler-1"
+                "first session id must still route to handler-1"
             );
         }
         other => panic!("expected handler_id, got: {other:?}"),
@@ -1185,6 +1210,7 @@ async fn test_peer_establish_challenge_flow() {
             accept_events: Vec::new(),
         },
         transport_a,
+        Some(Arc::new(XacppSession::new(None))),
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(ChallengeEstablishHandler),
     );
@@ -1195,6 +1221,7 @@ async fn test_peer_establish_challenge_flow() {
             accept_events: Vec::new(),
         },
         transport_b,
+        None,
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(ChallengeEstablishHandler),
     );
@@ -1226,6 +1253,7 @@ async fn test_peer_establish_challenge_issues_credentials() {
             accept_events: Vec::new(),
         },
         transport_a,
+        Some(Arc::new(XacppSession::new(None))),
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(ChallengeEstablishHandler),
     );
@@ -1236,6 +1264,7 @@ async fn test_peer_establish_challenge_issues_credentials() {
             accept_events: Vec::new(),
         },
         transport_b,
+        None,
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(ChallengeEstablishHandler),
     );
@@ -1264,7 +1293,7 @@ async fn test_session_send_message() {
     let response = timeout(session.request_command(XacppCommand::generic(
         "message",
         json!({
-            "content": [ContentPart::Text(TextPart { text: "hello".into(), part_id: None })]
+            "content": [ContentPart::Text(TextPart { text: "hello".into(), part_id: None, part_type: "default".into() })]
         }),
     )))
     .await
@@ -1390,6 +1419,7 @@ async fn test_action_request_command_lifecycle() {
             accept_events: Vec::new(),
         },
         transport_a,
+        Some(Arc::new(XacppSession::new(None))),
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(AutoApproveEstablishHandler),
     );
@@ -1401,6 +1431,7 @@ async fn test_action_request_command_lifecycle() {
             accept_events: Vec::new(),
         },
         transport_b,
+        None,
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(InteractionEstablishHandler),
     );
@@ -1449,6 +1480,7 @@ async fn test_question_command_lifecycle() {
             accept_events: Vec::new(),
         },
         transport_a,
+        Some(Arc::new(XacppSession::new(None))),
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(AutoApproveEstablishHandler),
     );
@@ -1460,6 +1492,7 @@ async fn test_question_command_lifecycle() {
             accept_events: Vec::new(),
         },
         transport_b,
+        None,
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(InteractionEstablishHandler),
     );
@@ -1506,6 +1539,7 @@ async fn test_sensitive_info_command_lifecycle() {
             accept_events: Vec::new(),
         },
         transport_a,
+        Some(Arc::new(XacppSession::new(None))),
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(AutoApproveEstablishHandler),
     );
@@ -1517,6 +1551,7 @@ async fn test_sensitive_info_command_lifecycle() {
             accept_events: Vec::new(),
         },
         transport_b,
+        None,
         Arc::new(AcceptNegotiateHandler::new()),
         Arc::new(InteractionEstablishHandler),
     );

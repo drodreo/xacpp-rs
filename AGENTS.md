@@ -4,7 +4,7 @@
 
 xacpp (Agent Control Plane Protocol) — Rust implementation.
 
-This is the Rust counterpart of [xacpp-ts](https://github.com/drodreo/xacpp-ts). The two projects share identical wire protocol (JSONL envelope) and must stay in sync.
+This is the Rust counterpart of [xacpp-ts](https://github.com/drodreo/xacpp-ts). The two projects share identical wire protocol (binary frames; envelope JSON is carried in `DATA_JSON` frames) and must stay in sync.
 
 ## Architecture
 
@@ -27,7 +27,7 @@ Three-layer design, mirroring xacpp-ts:
 │  Does not know about specific business event types           │
 ├──────────────────────────────────────────────────────────────┤
 │  Underlying pipe (Stdio / TCP / WebSocket)                   │
-│  Raw byte stream, frame splitting (JSONL)                    │
+│  Raw byte stream, binary frame layer (XACP frames, SPEC §3)  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -46,12 +46,15 @@ Three-layer design, mirroring xacpp-ts:
 | `src/session.rs` | `XacppSession` struct |
 | `src/peer.rs` | `XacppPeer` struct + `PeerState` enum |
 | `src/message.rs` | `XacppError`, `XacppRequest`, `XacppResponse`, `XacppEnvelope` |
+| `src/frame.rs` | Binary wire frame codec (`Frame`, `FrameType`, `FrameDecoder`; SPEC §3/§4) |
 | `src/commands/mod.rs` | `XacppCommand` enum |
 | `src/events/` | Event type definitions |
-| `src/transport/stdio.rs` | Stdio transport (async stdin/stdout JSONL) |
+| `src/transport/stdio.rs` | Stdio transport (async stdin/stdout, binary frames) |
 | `src/transport/socket.rs` | TCP transport (`TcpStream`, spawn-per-request concurrency) |
 
 ## Wire Protocol
+
+The wire carries self-describing binary frames (36-byte header + payload + CRC-32, SPEC §3). Each `XacppEnvelope` is serialized to JSON and sent as a single-frame `DATA_JSON` transaction (`seq = 0`, `total_len` = payload length, fresh UUID v4 `transaction_id` per frame). Control frames (ACK/NACK/RESUME/...) are reserved for the reliability layer and are ignored by the current reader. Wire size limits (SPEC §4): `DATA_JSON` payload ≤ 1 MiB.
 
 All wire messages are `XacppEnvelope` with `type` field routing:
 

@@ -89,6 +89,11 @@ pub enum EstablishDecision {
 /// Developer completes credential verification, creates and holds Session (for subsequent outgoing messages),
 /// creates SessionHandler and returns it. Returning Err rejects the handshake.
 ///
+/// The consumer constructs its [`crate::session::XacppSession`] inside the
+/// callback (`XacppSession::new(config)` + identity + `wire(transport)`) —
+/// the identity-matching strategy is the consumer's, the library does not
+/// force one.
+///
 /// ## Identity Contract
 ///
 /// `credentials` is an identity **anchor** — it never carries user/agent identity directly.
@@ -103,7 +108,8 @@ pub enum EstablishDecision {
 pub trait EstablishHandler: Send + Sync {
     /// Handles Establish request.
     ///
-    /// `transport` is passed by Peer, for `on_establish` to create `XacppSession` internally.
+    /// `transport` is passed by Peer, for `on_establish` to construct and
+    /// wire a `XacppSession` internally.
     /// Returns [`EstablishDecision`] indicating whether to challenge or directly establish.
     async fn on_establish(
         &self,

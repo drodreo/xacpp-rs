@@ -1,0 +1,1198 @@
+//! Transport-integration e2e tests for the transfer session (SPEC §5).
+//!
+//! All tests run over memory duplexes (`StdioTransport`), mirroring
+//! `peer_e2e_tests::duplex_pair`. Timing-sensitive scenarios use shrunk
+//! configs (RTO / heartbeat / timeouts) with real-clock waiting.
+
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+
+use xacpp::commands::XacppCommand;
+use xacpp::control::{
+    AckEntry, AckPayload, ErrorPayload, ResumeResponsePayload, ResumeStatus, ResumeStatusEntry,
+    error_codes,
+};
+use xacpp::error::XacppError;
+use xacpp::frame::{Frame, FrameType};
+use xacpp::message::{XacppEnvelope, XacppRequest, XacppResponse};
+use xacpp::reassemble::ReassemblerConfig;
+use xacpp::session::XacppSession;
+use xacpp::transaction::SenderConfig;
+use xacpp::transport::stdio::StdioTransport;
+use xacpp::transport::{TransferConfig, XacppTransport};
+
+// ---- Test config ----
+
+/// Shrunk timing: 1 KiB frames, 200 ms initial RTO, fast clock.
+fn test_config() -> TransferConfig {
+    TransferConfig {
+        sender: SenderConfig {
+            frame_size: 1024,
+            copy_retention_ms: 10_000,
+            rto_initial_ms: 200,
+            rto_max_ms: 800,
+            backpressure_cap_bytes: 64 * 1024 * 1024,
+        },
+        reassembler: ReassemblerConfig {
+            stale_retention_ms: 10_000,
+        },
+        heartbeat_interval_ms: 30_000,
+        silent_timeout_ms: 4_000,
+        ack_batch_frames: 64,
+        ack_batch_interval_ms: 100,
+        nack_feedback_interval_ms: 100,
+        tick_interval_ms: 20,
+    }
+}
+
+/// Deterministic payload pattern (not all-zero: exercises real bytes).
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| ((i * 31 + (i >> 7)) & 0xff) as u8)
+        .collect()
+}
+
+/// Poll `f` until true or `timeout`.
+async fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    loop {
+        if f() {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return f();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+// ---- Memory duplex pair ----
+
+const DUPLEX_BUF: usize = 64 * 1024;
+
+type BoxedWriter = Pin<Box<dyn AsyncWrite + Send>>;
+type BoxedReader = Pin<Box<dyn AsyncBufRead + Send>>;
+
+/// An unconnected `StdioTransport` pair over a memory duplex.
+fn duplex_pair() -> (StdioTransport, StdioTransport) {
+    let (a, b) = tokio::io::duplex(DUPLEX_BUF);
+    let (a_read, a_write) = tokio::io::split(a);
+    let (b_read, b_write) = tokio::io::split(b);
+    (
+        StdioTransport::new(
+            Box::pin(a_write) as BoxedWriter,
+            Box::pin(BufReader::new(a_read)) as BoxedReader,
+        ),
+        StdioTransport::new(
+            Box::pin(b_write) as BoxedWriter,
+            Box::pin(BufReader::new(b_read)) as BoxedReader,
+        ),
+    )
+}
+
+/// Create, wire and connect both sides: returns the transports plus the
+/// logical sessions owning the transfer state.
+async fn connected_reliable_pair(
+    a_cfg: TransferConfig,
+    b_cfg: TransferConfig,
+) -> (
+    Arc<StdioTransport>,
+    Arc<XacppSession>,
+    Arc<StdioTransport>,
+    Arc<XacppSession>,
+) {
+    let (ta, tb) = duplex_pair();
+    let session_a = Arc::new(XacppSession::new(Some(a_cfg)));
+    let session_b = Arc::new(XacppSession::new(Some(b_cfg)));
+    let ta: Arc<StdioTransport> = Arc::new(ta);
+    let tb: Arc<StdioTransport> = Arc::new(tb);
+    // Connect first, then wire: wiring attaches the session to a live
+    // connection (clock starts, RESUME handshake runs through the write
+    // surface).
+    ta.connect().await.unwrap();
+    tb.connect().await.unwrap();
+    session_a
+        .wire(Arc::clone(&ta) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+    session_b
+        .wire(Arc::clone(&tb) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+    (ta, session_a, tb, session_b)
+}
+
+// ---- Frame-dropping writer (lossy link emulator) ----
+
+const MAGIC: &[u8; 4] = b"XACP";
+const HEADER_LEN: usize = 36;
+const CRC_LEN: usize = 4;
+const FRAME_TYPE_DATA_BINARY: u16 = 0x1002;
+
+/// Writer wrapper that scans the outbound byte stream at frame boundaries
+/// and silently drops the **first** `DATA_BINARY` frame with `target_seq`
+/// (of any transaction) — a lossy-link emulator for the retransmission and
+/// RESUME tests (`target_seq = None` = full passthrough).
+struct FrameDropper<W> {
+    inner: W,
+    /// Bytes not yet classified into complete frames.
+    scan: Vec<u8>,
+    /// Classified bytes waiting to reach `inner`.
+    out: Vec<u8>,
+    target_seq: Option<u32>,
+    drop_armed: bool,
+}
+
+impl<W: AsyncWrite + Unpin> FrameDropper<W> {
+    fn new(inner: W, target_seq: Option<u32>) -> Self {
+        Self {
+            inner,
+            scan: Vec::new(),
+            out: Vec::new(),
+            target_seq,
+            drop_armed: true,
+        }
+    }
+
+    /// Move complete frames from `scan` to `out`, dropping the armed target.
+    fn classify(&mut self) {
+        let Some(_target_seq) = self.target_seq else {
+            self.out.append(&mut self.scan);
+            return;
+        };
+        loop {
+            let Some(magic_pos) = self.scan.windows(4).position(|w| w == MAGIC) else {
+                self.out.append(&mut self.scan);
+                return;
+            };
+            if magic_pos > 0 {
+                self.out.extend(self.scan.drain(..magic_pos));
+            }
+            if self.scan.len() < HEADER_LEN {
+                return;
+            }
+            let frame_len =
+                u32::from_be_bytes([self.scan[32], self.scan[33], self.scan[34], self.scan[35]])
+                    as usize;
+            let total = HEADER_LEN + frame_len + CRC_LEN;
+            if self.scan.len() < total {
+                return;
+            }
+            let frame: Vec<u8> = self.scan.drain(..total).collect();
+            let ftype = u16::from_be_bytes([frame[6], frame[7]]);
+            let seq = u32::from_be_bytes([frame[28], frame[29], frame[30], frame[31]]);
+            if self.drop_armed && ftype == FRAME_TYPE_DATA_BINARY && Some(seq) == self.target_seq {
+                self.drop_armed = false;
+                log::debug!("FrameDropper: dropped DATA_BINARY seq {seq}");
+            } else {
+                self.out.extend_from_slice(&frame);
+            }
+        }
+    }
+
+    fn forward(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        while !self.out.is_empty() {
+            match Pin::new(&mut self.inner).poll_write(cx, &self.out) {
+                Poll::Ready(Ok(n)) => {
+                    self.out.drain(..n);
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<W: AsyncWrite + Unpin + Send> AsyncWrite for FrameDropper<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = &mut *self;
+        this.scan.extend_from_slice(buf);
+        this.classify();
+        match this.forward(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
+            // Bytes are internally buffered; the write is accepted in full
+            // even while `inner` backpressures (flushed on a later poll).
+            Poll::Pending => Poll::Ready(Ok(buf.len())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        if this.forward(cx)?.is_pending() {
+            return Poll::Pending;
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        if this.forward(cx)?.is_pending() {
+            return Poll::Pending;
+        }
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
+// ---- Handlers ----
+
+/// Replies `acknowledge` to every request.
+fn echo_handler() -> xacpp::transport::RequestHandler {
+    Arc::new(|_session_id, _request| {
+        Box::pin(async { Ok(XacppResponse::acknowledge()) })
+            as Pin<Box<dyn std::future::Future<Output = Result<XacppResponse, XacppError>> + Send>>
+    })
+}
+
+// ---- Tests ----
+
+/// >1 MiB payload: many working frames + tail frame, byte-for-byte delivery.
+#[tokio::test]
+async fn large_payload_roundtrip_multi_frame() {
+    let mut cfg_a = test_config();
+    cfg_a.sender.frame_size = 256 * 1024; // 2 MiB → 8 frames + tail
+    let (_a, session_a, _b, session_b) = connected_reliable_pair(cfg_a, test_config()).await;
+
+    let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel();
+    session_b.on_binary(Arc::new(move |txid, payload| {
+        let _ = delivered_tx.send((txid, payload));
+    }));
+
+    let payload = pattern(2 * 1024 * 1024 + 137);
+    let txid = session_a.send_binary(payload.clone(), None).await.unwrap();
+
+    let (got_txid, got) = tokio::time::timeout(Duration::from_secs(15), delivered_rx.recv())
+        .await
+        .expect("delivery within timeout")
+        .expect("channel open");
+    assert_eq!(got_txid, txid, "txid identity preserved end-to-end");
+    assert_eq!(got.len(), payload.len(), "length exact");
+    assert!(got == payload, "bytes equal");
+}
+
+/// First transmission of one working frame is swallowed by a lossy link;
+/// NACK feedback and/or RTO retransmission recovers, delivery completes.
+#[tokio::test]
+async fn lost_frame_recovered_by_retransmission() {
+    let mut cfg = test_config();
+    cfg.nack_feedback_interval_ms = 60;
+    cfg.sender.rto_initial_ms = 150;
+
+    // Lossy A→B link: drop the first DATA_BINARY seq=1 frame.
+    let (a, b) = tokio::io::duplex(DUPLEX_BUF);
+    let (a_read, a_write) = tokio::io::split(a);
+    let (b_read, b_write) = tokio::io::split(b);
+    let lossy_a: StdioTransport = StdioTransport::new(
+        Box::pin(FrameDropper::new(a_write, Some(1))) as BoxedWriter,
+        Box::pin(BufReader::new(a_read)) as BoxedReader,
+    );
+    let b_transport: StdioTransport = StdioTransport::new(
+        Box::pin(b_write) as BoxedWriter,
+        Box::pin(BufReader::new(b_read)) as BoxedReader,
+    );
+
+    let session_a = Arc::new(XacppSession::new(Some(cfg)));
+    let session_b = Arc::new(XacppSession::new(Some(cfg)));
+    let a: Arc<StdioTransport> = Arc::new(lossy_a);
+    let b: Arc<StdioTransport> = Arc::new(b_transport);
+    // Connect first, then wire (attach to a live connection).
+    a.connect().await.unwrap();
+    b.connect().await.unwrap();
+    session_a
+        .wire(Arc::clone(&a) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+    session_b
+        .wire(Arc::clone(&b) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+
+    let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel();
+    session_b.on_binary(Arc::new(move |txid, payload| {
+        let _ = delivered_tx.send((txid, payload));
+    }));
+
+    // 4 KiB at 1 KiB frames → seq 0..4; seq 1 first transmission is dropped.
+    let payload = pattern(4096);
+    session_a.send_binary(payload.clone(), None).await.unwrap();
+
+    let got = tokio::time::timeout(Duration::from_secs(10), delivered_rx.recv())
+        .await
+        .expect("delivery within timeout (retransmission path)")
+        .expect("channel open");
+    assert_eq!(got.1.len(), payload.len(), "length exact");
+    assert!(got.1 == payload, "bytes equal after recovery");
+}
+
+/// Transfer interrupted mid-way, both sides reconnect with the *same*
+/// logical sessions wired to fresh transports: the transfer state lives on
+/// the session, so the RESUME handshake bridges the connection boundary and
+/// the transfer completes — breakpoint resume is the natural consequence of
+/// session-owned state.
+///
+/// "Mid-way" is manufactured deterministically: connection 1 drops the
+/// seq-3 working frame and both retransmission paths are disabled (no NACK
+/// feedback on the receiver, no RTO on the sender), so the receiver holds
+/// frames 0..2 (contiguous prefix, transaction incomplete) until the
+/// disconnect. On connection 2 the receiver's `connect` emits the RESUME
+/// request, the holder (its transfer state intact on the same session)
+/// answers and retransmits the missing frame.
+#[tokio::test]
+async fn resume_across_connections() {
+    let mut cfg_a = test_config();
+    cfg_a.sender.rto_initial_ms = u64::MAX; // conn 1: never RTO-retransmit
+    cfg_a.sender.rto_max_ms = u64::MAX;
+    let mut cfg_b = test_config();
+    cfg_b.nack_feedback_interval_ms = u64::MAX; // conn 1: never NACK
+
+    // Sessions outlive the connections they are wired to.
+    let session_a = Arc::new(XacppSession::new(Some(cfg_a)));
+    let session_b = Arc::new(XacppSession::new(Some(cfg_b)));
+
+    // Connection 1: lossy A→B link (drops the seq-3 DATA_BINARY frame).
+    let (a, b) = tokio::io::duplex(DUPLEX_BUF);
+    let (a_read, a_write) = tokio::io::split(a);
+    let (b_read, b_write) = tokio::io::split(b);
+    let lossy_a: StdioTransport = StdioTransport::new(
+        Box::pin(FrameDropper::new(a_write, Some(3))) as BoxedWriter,
+        Box::pin(BufReader::new(a_read)) as BoxedReader,
+    );
+    let tb1: StdioTransport = StdioTransport::new(
+        Box::pin(b_write) as BoxedWriter,
+        Box::pin(BufReader::new(b_read)) as BoxedReader,
+    );
+    let a1: Arc<StdioTransport> = Arc::new(lossy_a);
+    let tb1: Arc<StdioTransport> = Arc::new(tb1);
+    // Connect first, then wire (attach to a live connection).
+    a1.connect().await.unwrap();
+    tb1.connect().await.unwrap();
+    session_a
+        .wire(Arc::clone(&a1) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+    session_b
+        .wire(Arc::clone(&tb1) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+
+    let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel();
+    session_b.on_binary(Arc::new(move |txid, payload| {
+        let _ = delivered_tx.send((txid, payload));
+    }));
+
+    let txid = session_a.send_binary(pattern(4096), None).await.unwrap();
+
+    // Wait out a quiet window for the deterministic partial state: frames
+    // 0..2 stored on B (a memory duplex delivers them within milliseconds —
+    // the window is a wide safety margin), seq 3 dropped once and both
+    // retransmission paths disabled, so nothing else moves on this
+    // connection. (The old internal-state probe is gone: the observable
+    // verdict is the resumed delivery after the reconnect below.)
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    a1.disconnect().await.unwrap();
+    drop(a1);
+    drop(tb1);
+
+    // Connection 2: fresh clean transports, the SAME sessions wired again —
+    // the receiver's wire emits the RESUME request (its bytes queue in the
+    // duplex until the holder's reader starts), the holder's untouched send
+    // state answers and retransmits.
+    let (ta2, tb2) = duplex_pair();
+    let ta2: Arc<StdioTransport> = Arc::new(ta2);
+    let tb2: Arc<StdioTransport> = Arc::new(tb2);
+    // Receiver side first: its wire emits the RESUME request; the bytes
+    // wait in the duplex until the holder's reader starts.
+    tb2.connect().await.unwrap();
+    session_b
+        .wire(Arc::clone(&tb2) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+    ta2.connect().await.unwrap();
+    session_a
+        .wire(Arc::clone(&ta2) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+
+    let got = tokio::time::timeout(Duration::from_secs(10), delivered_rx.recv())
+        .await
+        .expect("delivery within timeout (resume path)")
+        .expect("channel open");
+    assert_eq!(got.1.len(), 4096, "resumed length exact");
+    assert!(got.1 == pattern(4096), "resumed bytes equal");
+    let _ = txid;
+}
+
+/// Backpressure: at the unacknowledged-bytes cap `send_binary` fails fast
+/// with `backpressure_stall` and never blocks the caller.
+#[tokio::test]
+async fn backpressure_fails_fast_at_cap() {
+    let mut cfg_a = test_config();
+    cfg_a.sender.backpressure_cap_bytes = 2048; // exactly one full payload
+    // Peer's ACK export disabled (batching window infinite) → no ACKs ever
+    // arrive → the cap stays hit.
+    let mut cfg_b = test_config();
+    cfg_b.ack_batch_interval_ms = u64::MAX;
+    cfg_b.ack_batch_frames = u32::MAX;
+    let (ta, tb) = duplex_pair();
+    let session_a = Arc::new(XacppSession::new(Some(cfg_a)));
+    let session_b = Arc::new(XacppSession::new(Some(cfg_b)));
+    let a: Arc<StdioTransport> = Arc::new(ta);
+    let b: Arc<StdioTransport> = Arc::new(tb);
+    // Connect first, then wire (attach to a live connection).
+    a.connect().await.unwrap();
+    b.connect().await.unwrap();
+    session_a
+        .wire(Arc::clone(&a) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+    session_b
+        .wire(Arc::clone(&b) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+
+    session_a.send_binary(pattern(2048), None).await.unwrap();
+
+    let second = session_a.send_binary(pattern(16), None).await.unwrap_err();
+    match second {
+        XacppError::Application { code, .. } => {
+            assert_eq!(code, "backpressure_stall", "expected stall error code");
+        }
+        other => panic!("expected backpressure Application error, got {other:?}"),
+    }
+}
+
+/// One side sends heartbeats, the other stays silent: the side receiving
+/// nothing declares the connection dead (watch flips true).
+#[tokio::test]
+async fn silent_peer_times_out_connection() {
+    let mut cfg_a = test_config();
+    cfg_a.heartbeat_interval_ms = 50; // A keeps proving liveness
+    cfg_a.silent_timeout_ms = 250; // A receives nothing from B → A dies
+    let mut cfg_b = test_config();
+    cfg_b.heartbeat_interval_ms = u64::MAX; // B never sends anything
+    cfg_b.silent_timeout_ms = 10_000; // B receives A's heartbeats → alive
+
+    let (a, _sa, b, _sb) = connected_reliable_pair(cfg_a, cfg_b).await;
+
+    let a_closed = a.closed();
+    let b_closed = b.closed();
+
+    // A receives nothing from B → A goes silent-timeout and kills the link.
+    let a_dead = wait_until(Duration::from_secs(5), || *a_closed.borrow()).await;
+    assert!(
+        a_dead,
+        "silent sender (no inbound frames) must be declared dead"
+    );
+
+    // Killing A's side tears the duplex down; B observes EOF → closed too.
+    let b_dead = wait_until(Duration::from_secs(5), || *b_closed.borrow()).await;
+    assert!(b_dead, "peer side observes the teardown");
+}
+
+/// The envelope channel is untouched by the transfer wiring: wired
+/// sessions keep request/response flowing; an unwired session rejects
+/// `send_binary` with NotConnected (never silently drops the payload).
+#[tokio::test]
+async fn envelope_channel_regression_with_bound_session() {
+    // Handler must be registered before connect (transport contract).
+    let (ta, tb) = duplex_pair();
+    let session_a = Arc::new(XacppSession::new(Some(test_config())));
+    let session_b = Arc::new(XacppSession::new(Some(test_config())));
+    let ta: Arc<StdioTransport> = Arc::new(ta);
+    let tb: Arc<StdioTransport> = Arc::new(tb);
+    tb.on_request(echo_handler()).unwrap();
+    // Connect first, then wire (attach to a live connection).
+    ta.connect().await.unwrap();
+    tb.connect().await.unwrap();
+    session_a
+        .wire(Arc::clone(&ta) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+    session_b
+        .wire(Arc::clone(&tb) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+
+    let request = XacppRequest::Command(XacppCommand::generic("ping", serde_json::json!({})));
+    let response = ta
+        .send(None, request)
+        .await
+        .expect("envelope round trip with a wired session");
+    match response {
+        XacppResponse::Generic { name, .. } => {
+            assert_eq!(name, "acknowledge", "echo handler replied");
+        }
+        other => panic!("expected Generic response, got {other:?}"),
+    }
+
+    // Unwired session: send_binary reports NotConnected.
+    let unwired = XacppSession::new(None);
+    let err = unwired.send_binary(vec![1, 2, 3], None).await.unwrap_err();
+    assert!(matches!(err, XacppError::NotConnected));
+}
+
+/// Frame-type-driven dispatch (SPEC §5): a RESUME_RESPONSE payload
+/// arriving under the RESUME (`0x0004`) frame type is a malformed request
+/// — dropped with an error log, never guessed at (no payload-shape
+/// sniffing), no answer sent, connection stays up.
+#[tokio::test]
+async fn mismatched_resume_payload_frame_type_dropped() {
+    // Quiet config: no heartbeats or clock feedback inside the observation
+    // window, so "no answer frame" is observable.
+    let mut cfg = test_config();
+    cfg.heartbeat_interval_ms = u64::MAX;
+    cfg.silent_timeout_ms = 60_000;
+    cfg.ack_batch_interval_ms = u64::MAX;
+    cfg.nack_feedback_interval_ms = u64::MAX;
+
+    let (a, b) = tokio::io::duplex(DUPLEX_BUF);
+    let (mut a_read, mut a_write) = tokio::io::split(a);
+    let (b_read, b_write) = tokio::io::split(b);
+    let transport: Arc<StdioTransport> = Arc::new(StdioTransport::new(
+        Box::pin(b_write) as BoxedWriter,
+        Box::pin(BufReader::new(b_read)) as BoxedReader,
+    ));
+    let session = Arc::new(XacppSession::new(Some(cfg)));
+    transport.connect().await.unwrap();
+    session
+        .wire(Arc::clone(&transport) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+    let closed = transport.closed();
+
+    // Hand-crafted mismatch: response payload (17-byte entries) under the
+    // request frame type — request decoding must reject it.
+    let payload = ResumeResponsePayload {
+        entries: vec![ResumeStatusEntry {
+            transaction_id: [7u8; 16],
+            status: ResumeStatus::Resumed,
+        }],
+    }
+    .encode()
+    .unwrap();
+    let frame = Frame::new(FrameType::Resume, [0u8; 16], 0, 0, payload)
+        .encode()
+        .unwrap();
+    a_write.write_all(&frame).await.unwrap();
+    a_write.flush().await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !*closed.borrow(),
+        "malformed control frame must not kill the connection"
+    );
+    let mut probe = [0u8; 1];
+    let got = tokio::time::timeout(Duration::from_millis(200), a_read.read(&mut probe)).await;
+    assert!(
+        got.is_err(),
+        "no answer frame expected for a dropped malformed request"
+    );
+}
+
+/// ERROR `0x0002` with the structured 32-lowercase-hex id prefix releases
+/// the named receive slot; malformed prefixes (uppercase / non-hex) match
+/// nothing and release nothing. Behaviorally observable through delivery:
+/// a released slot cannot be completed by the remaining frames (they start
+/// above a gap with no prefix), while a retained slot completes and
+/// delivers normally.
+#[tokio::test]
+async fn error_transaction_expired_hex_prefix_discards_slot() {
+    let mut cfg = test_config();
+    cfg.heartbeat_interval_ms = u64::MAX;
+    cfg.silent_timeout_ms = 60_000;
+    cfg.ack_batch_interval_ms = u64::MAX;
+    cfg.nack_feedback_interval_ms = u64::MAX;
+
+    let (a, b) = tokio::io::duplex(DUPLEX_BUF);
+    let (mut a_read, mut a_write) = tokio::io::split(a);
+    let (b_read, b_write) = tokio::io::split(b);
+    let transport: Arc<StdioTransport> = Arc::new(StdioTransport::new(
+        Box::pin(b_write) as BoxedWriter,
+        Box::pin(BufReader::new(b_read)) as BoxedReader,
+    ));
+    let session = Arc::new(XacppSession::new(Some(cfg)));
+    transport.connect().await.unwrap();
+    session
+        .wire(Arc::clone(&transport) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+    let _ = &mut a_read;
+
+    let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel();
+    session.on_binary(Arc::new(move |txid, payload| {
+        let _ = delivered_tx.send((txid, payload));
+    }));
+
+    // Feed a partial DATA_BINARY transaction (seq 0 of a 3-frame one) and
+    // then the remaining frames (seq 1..2). If the ERROR released the slot,
+    // the tail frames start above a gap with no prefix — the transaction
+    // can never complete (no delivery). If the ERROR failed to release it,
+    // the slot completes and delivers.
+    async fn feed_partial(a_write: &mut (impl AsyncWrite + Unpin), txid: [u8; 16]) {
+        let frame = Frame::new(FrameType::DataBinary, txid, 3072, 0, vec![1u8; 1024])
+            .encode()
+            .unwrap();
+        a_write.write_all(&frame).await.unwrap();
+        a_write.flush().await.unwrap();
+    }
+    async fn feed_tail(a_write: &mut (impl AsyncWrite + Unpin), txid: [u8; 16]) {
+        for seq in 1..3u32 {
+            let frame = Frame::new(FrameType::DataBinary, txid, 3072, seq, vec![1u8; 1024])
+                .encode()
+                .unwrap();
+            a_write.write_all(&frame).await.unwrap();
+        }
+        a_write.flush().await.unwrap();
+    }
+    async fn feed_error(a_write: &mut (impl AsyncWrite + Unpin), payload: Vec<u8>) {
+        let frame = Frame::new(FrameType::Error, [0u8; 16], 0, 0, payload)
+            .encode()
+            .unwrap();
+        a_write.write_all(&frame).await.unwrap();
+        a_write.flush().await.unwrap();
+    }
+
+    // Negative case first (uppercase hex is not the lowercase format — no
+    // match, the slot stays): the transaction completes and delivers.
+    let txid2 = [11u8; 16];
+    feed_partial(&mut a_write, txid2).await;
+    let bad = ErrorPayload {
+        code: error_codes::TRANSACTION_EXPIRED,
+        message: "ABCDEF0123456789ABCDEF0123456789".to_string(),
+    }
+    .encode()
+    .unwrap();
+    feed_error(&mut a_write, bad).await;
+    feed_tail(&mut a_write, txid2).await;
+    let got = tokio::time::timeout(Duration::from_secs(3), delivered_rx.recv())
+        .await
+        .expect("retained slot must complete and deliver")
+        .expect("delivery channel open");
+    assert_eq!(got.0, txid2, "the malformed prefix released nothing");
+    assert_eq!(
+        got.1.len(),
+        3072,
+        "payload assembled from the retained slot"
+    );
+
+    // Positive case (exact 32-lowercase-hex prefix releases the slot): the
+    // tail frames can never complete the released transaction — no
+    // delivery within the window.
+    let txid = [9u8; 16];
+    feed_partial(&mut a_write, txid).await;
+    let good = ErrorPayload {
+        code: error_codes::TRANSACTION_EXPIRED,
+        message: uuid::Uuid::from_bytes(txid).simple().to_string(),
+    }
+    .encode()
+    .unwrap();
+    feed_error(&mut a_write, good).await;
+    feed_tail(&mut a_write, txid).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        delivered_rx.try_recv().is_err(),
+        "structured hex prefix must release the slot: no delivery possible from a gap"
+    );
+}
+
+/// Delivery semantics vs handler presence: the final ACK is emitted on
+/// completion regardless of a registered binary handler (§5: "a final ACK
+/// on completion"); a payload completed without a handler is retained (not
+/// silently dropped) and handed over exactly once once a handler registers.
+/// A follow-up transaction takes the normal immediate path — the deferred
+/// drain never duplicates either delivery.
+#[tokio::test]
+async fn completed_without_handler_retained_then_delivered_exactly_once() {
+    let (_a, session_a, _b, session_b) =
+        connected_reliable_pair(test_config(), test_config()).await;
+
+    // A observes the final ACK via the send completion callback: its firing
+    // proves B completed the transaction and emitted the final ACK; the
+    // result reports the transaction id as confirmed.
+    let payload = pattern(4096);
+    let (acked_tx, acked_rx) = tokio::sync::oneshot::channel();
+    let acked_tx = Arc::new(std::sync::Mutex::new(Some(acked_tx)));
+    let txid = session_a
+        .send_binary(
+            payload.clone(),
+            Some(Arc::new(move |result| {
+                assert!(result.confirmed, "final ACK must confirm the delivery");
+                if let Some(tx) = acked_tx.lock().unwrap().take() {
+                    let _ = tx.send(result.transaction_id);
+                }
+            })),
+        )
+        .await
+        .unwrap();
+
+    let acked = tokio::time::timeout(Duration::from_secs(10), acked_rx)
+        .await
+        .expect("final ACK within timeout")
+        .expect("completion channel open");
+    assert_eq!(acked, txid, "callback carries the transaction id");
+
+    // Completed slot retained on B (no handler registered yet): observable
+    // behaviorally — the payload is delivered exactly once once a handler
+    // registers (below); the old internal-state probe is gone.
+
+    // Register the handler: the retained payload is delivered exactly once.
+    let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel();
+    session_b.on_binary(Arc::new(move |txid, payload| {
+        let _ = delivered_tx.send((txid, payload));
+    }));
+
+    let got = tokio::time::timeout(Duration::from_secs(10), delivered_rx.recv())
+        .await
+        .expect("deferred delivery within timeout")
+        .expect("delivery channel open");
+    assert_eq!(got.0, txid, "deferred delivery keeps txid identity");
+    assert!(got.1 == payload, "deferred payload bytes equal");
+
+    // Follow-up transaction: normal immediate path, no interference.
+    let second = pattern(2048);
+    let txid2 = session_a.send_binary(second.clone(), None).await.unwrap();
+    let mut second_seen = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !second_seen {
+        while let Ok((id, bytes)) = delivered_rx.try_recv() {
+            assert_eq!(id, txid2, "exactly-once: first txid never redelivered");
+            assert!(bytes == second, "second payload bytes equal");
+            second_seen = true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(second_seen, "second transaction delivered immediately");
+
+    // Many clock ticks later: no duplicate delivery for either transaction.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        delivered_rx.try_recv().is_err(),
+        "no duplicate delivery for either transaction"
+    );
+}
+
+// ---- send_binary completion: terminal states on failure paths ----
+
+type InjectWriter = tokio::io::WriteHalf<tokio::io::DuplexStream>;
+
+/// Single-ended rig: a transfer session wired to a transport whose peer
+/// is only a raw write end — frames are injected into the session's inbound
+/// stream, and nothing ever answers back (no ACKs, no RESUME traffic).
+async fn single_ended_session(cfg: TransferConfig) -> (Arc<XacppSession>, InjectWriter) {
+    let (a, b) = tokio::io::duplex(DUPLEX_BUF);
+    let (_a_read, a_write) = tokio::io::split(a);
+    let (b_read, b_write) = tokio::io::split(b);
+    let transport: Arc<StdioTransport> = Arc::new(StdioTransport::new(
+        Box::pin(b_write) as BoxedWriter,
+        Box::pin(BufReader::new(b_read)) as BoxedReader,
+    ));
+    let session = Arc::new(XacppSession::new(Some(cfg)));
+    transport.connect().await.unwrap();
+    session
+        .wire(Arc::clone(&transport) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+    (Arc::clone(&session), a_write)
+}
+
+async fn inject_frame(w: &mut (impl AsyncWrite + Unpin), frame: Frame) {
+    let wire = frame.encode().unwrap();
+    w.write_all(&wire).await.unwrap();
+    w.flush().await.unwrap();
+}
+
+/// Completion timers off: no heartbeat, no silent kill, no batched ACK
+/// export, no NACK feedback — the session only reacts to injected frames
+/// (and, for the expiry test, its own retention sweep).
+fn quiet_config() -> TransferConfig {
+    let mut cfg = test_config();
+    cfg.heartbeat_interval_ms = u64::MAX;
+    cfg.silent_timeout_ms = 60_000;
+    cfg.ack_batch_interval_ms = u64::MAX;
+    cfg.nack_feedback_interval_ms = u64::MAX;
+    cfg
+}
+
+/// RESUME rejected: the holder reports its copy gone, so our pending send
+/// completion must fire exactly once as unconfirmed and the entry must
+/// leave the completions map (a replay never fires again).
+#[tokio::test]
+async fn send_completion_fires_unconfirmed_on_resume_rejected() {
+    let (session, mut peer_write) = single_ended_session(quiet_config()).await;
+
+    let (results_tx, mut results_rx) = tokio::sync::mpsc::unbounded_channel();
+    let txid = session
+        .send_binary(
+            pattern(1024),
+            Some(Arc::new(move |result| {
+                let _ = results_tx.send(result);
+            })),
+        )
+        .await
+        .unwrap();
+
+    let resp = ResumeResponsePayload {
+        entries: vec![ResumeStatusEntry {
+            transaction_id: txid,
+            status: ResumeStatus::Rejected,
+        }],
+    };
+    let frame = Frame::new(
+        FrameType::ResumeResponse,
+        [0u8; 16],
+        0,
+        0,
+        resp.encode().unwrap(),
+    );
+    inject_frame(&mut peer_write, frame).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(5), results_rx.recv())
+        .await
+        .expect("completion within timeout")
+        .expect("callback fired");
+    assert_eq!(result.transaction_id, txid);
+    assert!(
+        !result.confirmed,
+        "RESUME rejected must release the completion unconfirmed"
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        results_rx.try_recv().is_err(),
+        "completion must fire exactly once"
+    );
+}
+
+/// Retention expiry: nobody ever answers, so the clock's retention sweep
+/// tombstones the copy and the completion must fire exactly once as
+/// unconfirmed.
+#[tokio::test]
+async fn send_completion_fires_unconfirmed_on_retention_expiry() {
+    let mut cfg = quiet_config();
+    cfg.sender.copy_retention_ms = 300;
+    let (session, _peer_write) = single_ended_session(cfg).await;
+
+    let (results_tx, mut results_rx) = tokio::sync::mpsc::unbounded_channel();
+    let txid = session
+        .send_binary(
+            pattern(1024),
+            Some(Arc::new(move |result| {
+                let _ = results_tx.send(result);
+            })),
+        )
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), results_rx.recv())
+        .await
+        .expect("completion within timeout")
+        .expect("callback fired");
+    assert_eq!(result.transaction_id, txid);
+    assert!(
+        !result.confirmed,
+        "retention expiry must release the completion unconfirmed"
+    );
+
+    // Later sweeps only drop the tombstone — never a second fire.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        results_rx.try_recv().is_err(),
+        "completion must fire exactly once"
+    );
+}
+
+/// Repeated final ACK: the completion fires exactly once (confirmed), and
+/// replaying the same ACK never fires again — the map entry is consumed by
+/// the first fire.
+#[tokio::test]
+async fn send_completion_fires_exactly_once_on_repeated_ack() {
+    let (session, mut peer_write) = single_ended_session(quiet_config()).await;
+
+    let (results_tx, mut results_rx) = tokio::sync::mpsc::unbounded_channel();
+    let txid = session
+        .send_binary(
+            pattern(1024),
+            Some(Arc::new(move |result| {
+                let _ = results_tx.send(result);
+            })),
+        )
+        .await
+        .unwrap();
+
+    // Final ACK for the single frame (1024-byte payload at a 1024-byte
+    // frame size = one frame, seq 0).
+    let ack = AckPayload {
+        entries: vec![AckEntry {
+            transaction_id: txid,
+            highest_contiguous_seq: 0,
+            received_frames: 1,
+        }],
+    };
+    let frame = Frame::new(FrameType::Ack, [0u8; 16], 0, 0, ack.encode().unwrap());
+    inject_frame(&mut peer_write, frame.clone()).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(5), results_rx.recv())
+        .await
+        .expect("completion within timeout")
+        .expect("callback fired");
+    assert_eq!(result.transaction_id, txid);
+    assert!(result.confirmed, "final ACK must confirm the delivery");
+
+    // Replay the identical final ACK: the entry is gone, no second fire.
+    inject_frame(&mut peer_write, frame).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        results_rx.try_recv().is_err(),
+        "repeated ACK must not fire the completion again"
+    );
+}
+
+// ---- Expert-review fixes: envelope liveness (S1) / zombie clock (S2) / double wire (S5) ----
+
+const FRAME_TYPE_HEARTBEAT: u16 = 0x0005;
+
+/// Single-ended rig with both peer halves accessible: `peer_write` injects
+/// frames into the session's inbound stream, `peer_read` collects the
+/// session's outbound frames (heartbeats etc.).
+async fn single_ended_pair(
+    cfg: TransferConfig,
+) -> (
+    Arc<StdioTransport>,
+    Arc<XacppSession>,
+    tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    tokio::io::ReadHalf<tokio::io::DuplexStream>,
+) {
+    let (a, b) = tokio::io::duplex(DUPLEX_BUF);
+    let (a_read, a_write) = tokio::io::split(a);
+    let (b_read, b_write) = tokio::io::split(b);
+    let transport: Arc<StdioTransport> = Arc::new(StdioTransport::new(
+        Box::pin(b_write) as BoxedWriter,
+        Box::pin(BufReader::new(b_read)) as BoxedReader,
+    ));
+    let session = Arc::new(XacppSession::new(Some(cfg)));
+    transport.connect().await.unwrap();
+    session
+        .wire(Arc::clone(&transport) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+    (transport, session, a_write, a_read)
+}
+
+/// Count frames of a wire type on the raw peer read half for `window`
+/// (frame-boundary scan: 36-byte header, type at bytes 6..8, length at
+/// bytes 32..36, 4-byte trailing CRC).
+async fn count_frames(
+    mut read: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    frame_type: u16,
+    window: Duration,
+) -> u32 {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut buf = [0u8; 4096];
+    let mut scan: Vec<u8> = Vec::new();
+    let mut count = 0u32;
+    while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) {
+        match tokio::time::timeout(remaining, read.read(&mut buf)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => {
+                scan.extend_from_slice(&buf[..n]);
+                loop {
+                    let Some(pos) = scan.windows(4).position(|w| w == MAGIC) else {
+                        scan.clear();
+                        break;
+                    };
+                    scan.drain(..pos);
+                    if scan.len() < HEADER_LEN {
+                        break;
+                    }
+                    let len = u32::from_be_bytes([scan[32], scan[33], scan[34], scan[35]]) as usize;
+                    let total = HEADER_LEN + len + CRC_LEN;
+                    if scan.len() < total {
+                        break;
+                    }
+                    let ftype = u16::from_be_bytes([scan[6], scan[7]]);
+                    if ftype == frame_type {
+                        count += 1;
+                    }
+                    scan.drain(..total);
+                }
+            }
+            Ok(Err(_)) => break,
+        }
+    }
+    count
+}
+
+/// SPEC §5: any inbound frame refreshes the peer-activity clock — including
+/// envelope (`DATA_JSON`) frames, which never reach the transfer dispatch.
+/// A connection kept alive purely by envelope traffic (no control frames,
+/// no heartbeat round-trips) must not be false-killed by the silent-peer
+/// detector.
+#[tokio::test]
+async fn envelope_only_traffic_refreshes_activity_clock() {
+    let mut cfg = test_config();
+    cfg.silent_timeout_ms = 400;
+    cfg.heartbeat_interval_ms = u64::MAX;
+    let (transport, _session, mut peer_write, _peer_read) = single_ended_pair(cfg).await;
+    let closed = transport.closed();
+
+    // Peer keeps only the envelope channel busy: a `DATA_JSON` frame every
+    // 100 ms (reader-side responses for unknown ids are dropped) and never
+    // a control frame.
+    let injector = tokio::spawn(async move {
+        for i in 0..12 {
+            let envelope = XacppEnvelope::Response {
+                id: format!("e{i}"),
+                session_id: None,
+                payload: XacppResponse::Established {
+                    session_id: "s".into(),
+                    credentials: "c".into(),
+                },
+            };
+            let json = serde_json::to_vec(&envelope).unwrap();
+            let frame = Frame::new(FrameType::DataJson, [0u8; 16], json.len() as u32, 0, json);
+            inject_frame(&mut peer_write, frame).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    // Well past three silent timeouts: the connection must still be up.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(
+        !*closed.borrow(),
+        "envelope-only liveness must not be false-killed by the silent-peer detector"
+    );
+    injector.await.unwrap();
+}
+
+/// Re-wiring (unwire, then wire a fresh session onto the same transport)
+/// keeps exactly one clock: heartbeats continue at the single-clock rate
+/// and never double (a zombie clock left from the previous wiring would).
+#[tokio::test]
+async fn rewire_after_unwire_keeps_single_clock() {
+    let mut cfg = test_config();
+    cfg.heartbeat_interval_ms = 40;
+    cfg.silent_timeout_ms = 60_000;
+    let (transport, session, _peer_write, peer_read) = single_ended_pair(cfg).await;
+
+    // Collect heartbeats over a window spanning the rewire.
+    let counter = tokio::spawn(async move {
+        count_frames(peer_read, FRAME_TYPE_HEARTBEAT, Duration::from_millis(600)).await
+    });
+
+    // Mid-window: swap the wiring to a fresh session (same transport).
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    session.unwire().await;
+    let session2 = Arc::new(XacppSession::new(Some(cfg)));
+    session2
+        .wire(Arc::clone(&transport) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+
+    let count = counter.await.unwrap();
+    // Single clock at 40 ms over ~600 ms: ~12-15 beats; a doubled (zombie)
+    // clock would land at 20+. Guard both directions: alive (>= 4) and
+    // single-sourced (< 19).
+    assert!(
+        (4..19).contains(&count),
+        "expected single-clock heartbeat rate, got {count} beats in the window"
+    );
+}
+
+/// Session-level wiring semantics (the narrow-interface form): re-wiring a
+/// session onto a new transport replaces its stale wiring idempotently
+/// (reconnect), and after `unwire` the transport is free for another
+/// session to attach. (The old transport-level mount guard is gone with the
+/// fat trait: the transport only stores hooks — see `TransferWiring`.)
+#[tokio::test]
+async fn rewire_replaces_stale_wiring_and_releases_transport() {
+    let (ta, tb) = duplex_pair();
+    let ta: Arc<StdioTransport> = Arc::new(ta);
+    let tb: Arc<StdioTransport> = Arc::new(tb);
+
+    let sa = Arc::new(XacppSession::new(None));
+    ta.connect().await.unwrap();
+    tb.connect().await.unwrap();
+
+    // sa attaches to ta...
+    sa.wire(Arc::clone(&ta) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+    // ...re-attaches to tb, replacing its stale wiring (reconnect shape)...
+    sa.wire(Arc::clone(&tb) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+    // ...and detaches, after which sb can attach to ta cleanly.
+    sa.unwire().await;
+    let sb = Arc::new(XacppSession::new(None));
+    sb.wire(Arc::clone(&ta) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+    sb.unwire().await;
+}
+
+/// Reconnect-after-silence: the silent-timeout anchor travels with the
+/// session across connections (transaction state does), but the observation
+/// window belongs to the current connection. A session re-wired after a
+/// silent-timeout disconnect must not inherit the previous connection's
+/// accumulated silence and die on the new connection's first tick
+/// (reconnect death loop): wire reopens the window, so the new connection
+/// gets a full silent timeout of grace — and the detector stays armed on
+/// the fresh window (no peer traffic past the deadline still kills it).
+#[tokio::test]
+async fn rewiring_after_silent_timeout_resets_liveness_window() {
+    let mut cfg = test_config();
+    cfg.silent_timeout_ms = 400;
+    cfg.heartbeat_interval_ms = u64::MAX;
+
+    // Connection 1: left fully silent → the session self-tears it down,
+    // leaving the anchor ~a full window in the past.
+    let (transport1, session, _w1, _r1) = single_ended_pair(cfg).await;
+    let closed1 = transport1.closed();
+    assert!(
+        wait_until(Duration::from_millis(2_000), || *closed1.borrow()).await,
+        "silent peer must tear the connection down through the clock"
+    );
+
+    // Connection 2: same session (transaction state travels), fresh
+    // transport. The wire must reset the liveness anchor.
+    let (a2, b2) = tokio::io::duplex(DUPLEX_BUF);
+    let (a2_read, a2_write) = tokio::io::split(a2);
+    let (b2_read, b2_write) = tokio::io::split(b2);
+    let transport2: Arc<StdioTransport> = Arc::new(StdioTransport::new(
+        Box::pin(b2_write) as BoxedWriter,
+        Box::pin(BufReader::new(b2_read)) as BoxedReader,
+    ));
+    transport2.connect().await.unwrap();
+    session
+        .wire(Arc::clone(&transport2) as Arc<dyn XacppTransport>)
+        .await
+        .unwrap();
+    let closed2 = transport2.closed();
+
+    // Partway into the fresh window: still alive. The inherited-silence bug
+    // killed the connection within the first tick (~20 ms) — a quarter of
+    // the window has a wide margin either way.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !*closed2.borrow(),
+        "re-wired session must not inherit the previous connection's silence"
+    );
+
+    // The detector stays armed on the fresh window: a full silent timeout
+    // without peer traffic kills the new connection too (the reset must not
+    // have disabled the deadline, only moved its origin).
+    assert!(
+        wait_until(Duration::from_millis(2_000), || *closed2.borrow()).await,
+        "fresh window must still enforce the silent-timeout deadline"
+    );
+    drop((a2_write, a2_read));
+}

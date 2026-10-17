@@ -10,17 +10,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 
 use xacpp::events::{XacppActivityEvent, XacppEvent};
+use xacpp::frame::{FrameDecoder, FrameType};
 use xacpp::message::{XacppRequest, XacppResponse};
 use xacpp::transport::XacppTransport;
 use xacpp::transport::socket::SocketTransport;
 
-/// Extract the event sequence number from a raw JSONL frame.
-fn frame_seq(line: &str) -> Option<u64> {
-    let v: Value = serde_json::from_str(line).ok()?;
+/// Extract the event sequence number from a `DATA_JSON` frame payload.
+fn frame_seq(payload: &[u8]) -> Option<u64> {
+    let v: Value = serde_json::from_slice(payload).ok()?;
     if v["type"] != "request" {
         return None;
     }
@@ -33,17 +34,29 @@ async fn raw_seq_peer(expected: usize) -> (String, tokio::task::JoinHandle<Vec<u
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let handle = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut lines = BufReader::new(stream).lines();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut decoder = FrameDecoder::new();
         let mut seqs = Vec::new();
-        while seqs.len() < expected {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    if let Some(seq) = frame_seq(&line) {
-                        seqs.push(seq);
-                    }
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = match stream.read(&mut buf).await {
+                Ok(0) => break, // EOF
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            let frames = match decoder.feed(&buf[..n]) {
+                Ok(frames) => frames,
+                Err(_) => break,
+            };
+            for frame in frames {
+                if frame.frame_type == FrameType::DataJson
+                    && let Some(seq) = frame_seq(&frame.payload)
+                {
+                    seqs.push(seq);
                 }
-                _ => break,
+            }
+            if seqs.len() >= expected {
+                break;
             }
         }
         seqs

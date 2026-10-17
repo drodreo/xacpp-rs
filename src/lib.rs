@@ -9,12 +9,12 @@
 //! ```text
 //! ┌──────────────────────────────────────────────────────────────┐
 //! │  Peer (Protocol Layer)                                        │
-//! │  Typed operations: request_command / request_event            │
-//! │  Session routing: session_id → XacppSessionHandler           │
+//! │  Lifecycle orchestration: connect / negotiate / establish /    │
+//! │  disconnect / state; session routing: sid → SessionHandler     │
 //! ├──────────────────────────────────────────────────────────────┤
 //! │  Session (Session Layer)                                      │
-//! │  Holds XacppSessionHandler, sends directly to Transport       │
-//! │  Does not go through Peer                                     │
+//! │  Owns the transfer state (SPEC §5); request_command /         │
+//! │  request_event / send_event / send_binary to Transport        │
 //! ├──────────────────────────────────────────────────────────────┤
 //! │  Transport (Transport Layer)                                  │
 //! │  Single semantic: send (request-response), caller chooses     │
@@ -24,15 +24,16 @@
 //! │  Unaware of specific business event types                     │
 //! ├──────────────────────────────────────────────────────────────┤
 //! │  Underlying Pipe (Stdio / TCP / WebSocket)                   │
-//! │  Pure byte stream I/O, frame splitting (JSONL)              │
+//! │  Pure byte stream I/O, binary frame codec (SPEC §3/§4)       │
 //! │  Unaware of requests, responses, or events                    │
 //! └──────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! ## Wire Message Format
 //!
-//! All wire messages are envelope structures (`XacppEnvelope`),
-//! the `type` field routes requests/responses, `payload` carries the payload:
+//! Wire traffic is binary frames (SPEC §3/§4); envelopes (`XacppEnvelope`)
+//! travel as the payload of `DATA_JSON` frames — the `type` field routes
+//! requests/responses, `payload` carries the operation:
 //!
 //! ```json
 //! Request: {"type":"request","id":"r1","payload":{"kind":"command","payload":{"establish":{}}}}
@@ -53,10 +54,14 @@
 pub mod activity_ref;
 pub mod capability;
 pub mod commands;
+pub mod control;
 pub mod error;
 pub mod events;
+pub mod frame;
 pub mod handler;
 pub mod message;
 pub mod peer;
+pub mod reassemble;
 pub mod session;
+pub mod transaction;
 pub mod transport;

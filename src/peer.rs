@@ -4,14 +4,19 @@
 //!
 //! Peer is a protocol layer entity, representing one endpoint in a communication link. Core responsibilities:
 //!
-//! - **Typed operations**: Encapsulates Transport's payload layer API into semantically clear Command / Event operations
+//! - **Lifecycle orchestration**: connect / negotiate / establish / disconnect / state (pure
+//!   lifecycle — outgoing communication goes through the session)
 //! - **Protocol state machine**: Manages connection state
 //! - **Session routing**: Routes inbound requests to corresponding Session handler based on session_id
 //!
-//! ## Boundary with Transport
+//! ## Boundary with Transport and Session
 //!
 //! Peer holds `Arc<dyn XacppTransport>` (composition), all underlying IO is delegated to Transport.
 //! Peer is unaware of envelope id, encoding/decoding, request-response correlation and other details (all encapsulated by Transport).
+//! The initiator-side [`XacppSession`] is handed in at construction and wired automatically:
+//! `connect` wires it to the transport, `establish` backfills the identity, `disconnect` unwires.
+//! The responder side constructs and wires its sessions inside `on_establish` (the library does
+//! not force an identity-matching strategy).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,7 +26,6 @@ use tokio::sync::{Mutex, RwLock};
 use crate::capability::{Capabilities, EffectiveCapabilities};
 use crate::commands::XacppCommand;
 use crate::error::XacppError;
-use crate::events::XacppActivityEvent;
 use crate::handler::{EstablishHandler, NegotiateHandler, XacppSessionHandler};
 use crate::message::{XacppRequest, XacppResponse};
 use crate::session::XacppSession;
@@ -52,6 +56,11 @@ struct PeerInner {
 #[derive(Clone)]
 pub struct XacppPeer {
     transport: Arc<dyn XacppTransport>,
+    /// Initiator-side logical session (handed in at construction, wired
+    /// automatically by `connect` / `establish` / `disconnect`). Responder
+    /// side: `None` — sessions are constructed and wired by the consumer
+    /// inside `on_establish`.
+    session: Option<Arc<XacppSession>>,
     inner: Arc<Mutex<PeerInner>>,
     /// Shared emit_events cache for Responder-side negotiation in connect closure.
     /// The closure cannot access `inner` directly, so we use this Arc to share state.
@@ -65,15 +74,22 @@ pub struct XacppPeer {
 impl XacppPeer {
     /// Creates a new Peer instance.
     ///
+    /// `session`: initiator-side logical session (`Some`); the peer wires it
+    /// to the transport on `connect`, backfills identity + negotiated
+    /// emit_events on `establish`, and unwires on `disconnect`.
+    /// Responder side: pass `None`.
+    ///
     /// Initial state is `Disconnected`; call `connect` to establish a connection.
     pub fn new(
         capabilities: Capabilities,
         transport: Arc<dyn XacppTransport>,
+        session: Option<Arc<XacppSession>>,
         negotiate_handler: Arc<dyn NegotiateHandler>,
         establish_handler: Arc<dyn EstablishHandler>,
     ) -> Self {
         Self {
             transport,
+            session,
             inner: Arc::new(Mutex::new(PeerInner {
                 state: PeerState::Disconnected,
                 remote_capabilities: Capabilities {
@@ -257,6 +273,16 @@ impl XacppPeer {
             }))?;
 
         self.transport.connect().await?;
+
+        // Wire the initiator-side session now that the connection is live:
+        // the session's transfer clock starts (self-driven) and the RESUME
+        // handshake runs through the write surface (attach-to-a-live-
+        // connection semantics). Idempotent: a retry after a failed
+        // `connect` attempt replaces the stale wiring.
+        if let Some(session) = &self.session {
+            session.wire(Arc::clone(&self.transport)).await?;
+        }
+
         let mut inner = self.inner.lock().await;
         if inner.state == PeerState::Disconnected {
             inner.state = PeerState::Connected;
@@ -267,7 +293,8 @@ impl XacppPeer {
     /// Establishes a logical session.
     ///
     /// Sends Establish command to the peer with optional authentication credentials and session handler.
-    /// Handler is registered to Peer routing table, Session is responsible for sending.
+    /// Handler is registered to Peer routing table; the initiator-side session (handed in at
+    /// construction) gets its identity backfilled and is returned.
     ///
     /// If the responder returns `EstablishPrepare` (challenge path), `verify_challenge` is invoked
     /// to validate the challenge; on success, an `EstablishConfirm` is sent to complete the handshake.
@@ -276,7 +303,13 @@ impl XacppPeer {
         credentials: Option<String>,
         handler: Arc<dyn XacppSessionHandler>,
         verify_challenge: impl FnOnce(String) -> Result<(), XacppError>,
-    ) -> Result<XacppSession, XacppError> {
+    ) -> Result<Arc<XacppSession>, XacppError> {
+        let session = Arc::clone(self.session.as_ref().ok_or_else(|| {
+            XacppError::Internal(
+                "establish requires an initiator-side session (pass Some at XacppPeer::new)".into(),
+            )
+        })?);
+
         let state = self.state().await;
         if state != PeerState::Negotiated {
             return Err(XacppError::Internal(format!(
@@ -320,11 +353,14 @@ impl XacppPeer {
                     .write()
                     .await
                     .insert(session_id.clone(), Arc::clone(&handler));
-                Ok(XacppSession::new(
-                    Arc::clone(&self.transport),
-                    session_id,
-                    credentials,
-                ))
+                session
+                    .backfill(
+                        session_id,
+                        credentials,
+                        self.inner.lock().await.emit_events.clone(),
+                    )
+                    .await;
+                Ok(session)
             }
             XacppResponse::EstablishPrepare { challenge } => {
                 log::debug!(
@@ -355,11 +391,14 @@ impl XacppPeer {
                             .write()
                             .await
                             .insert(session_id.clone(), Arc::clone(&handler));
-                        Ok(XacppSession::new(
-                            Arc::clone(&self.transport),
-                            session_id,
-                            credentials,
-                        ))
+                        session
+                            .backfill(
+                                session_id,
+                                credentials,
+                                self.inner.lock().await.emit_events.clone(),
+                            )
+                            .await;
+                        Ok(session)
                     }
                     XacppResponse::EstablishReject { reason } => {
                         log::debug!(
@@ -402,6 +441,11 @@ impl XacppPeer {
 
     /// Disconnects.
     pub async fn disconnect(&self) -> Result<(), XacppError> {
+        // Unwire the initiator-side session first (clock stops, inbound
+        // routing detaches — transaction state stays with the session).
+        if let Some(session) = &self.session {
+            session.unwire().await;
+        }
         self.transport.disconnect().await?;
         let mut inner = self.inner.lock().await;
         inner.state = PeerState::Disconnected;
@@ -413,63 +457,5 @@ impl XacppPeer {
         inner.emit_events.clear();
         self.sessions.write().await.clear();
         Ok(())
-    }
-
-    // ---- Outgoing Requests ----
-
-    /// Sends a command and waits for a response (no session context).
-    pub async fn request_command(
-        &self,
-        session_id: Option<&str>,
-        command: XacppCommand,
-    ) -> Result<XacppResponse, XacppError> {
-        self.transport
-            .send(session_id, XacppRequest::Command(command))
-            .await
-    }
-
-    /// Sends an interactive event and waits for a response (no session context).
-    ///
-    /// Protocol layer validates that the event name is in the negotiated emit_events capability.
-    pub async fn request_event(
-        &self,
-        session_id: Option<&str>,
-        event: XacppActivityEvent,
-    ) -> Result<XacppResponse, XacppError> {
-        // Validate event name against the negotiated emit_events capability
-        let event_name = &event.event.name;
-        let emit_events = self.inner.lock().await.emit_events.clone();
-        if !emit_events.is_empty() && !emit_events.contains(event_name) {
-            return Err(XacppError::Internal(format!(
-                "event '{}' not in negotiated emit_events capability",
-                event_name
-            )));
-        }
-        self.transport
-            .send(session_id, XacppRequest::Event(event))
-            .await
-    }
-
-    /// Sends an interactive event fire-and-forget (no session context):
-    /// returns as soon as the frame is queued, never waits for the ack.
-    ///
-    /// Protocol layer validates that the event name is in the negotiated emit_events capability.
-    pub async fn send_event(
-        &self,
-        session_id: Option<&str>,
-        event: XacppActivityEvent,
-    ) -> Result<(), XacppError> {
-        // Validate event name against the negotiated emit_events capability
-        let event_name = &event.event.name;
-        let emit_events = self.inner.lock().await.emit_events.clone();
-        if !emit_events.is_empty() && !emit_events.contains(event_name) {
-            return Err(XacppError::Internal(format!(
-                "event '{}' not in negotiated emit_events capability",
-                event_name
-            )));
-        }
-        self.transport
-            .send_faf(session_id, XacppRequest::Event(event))
-            .await
     }
 }

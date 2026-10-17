@@ -31,6 +31,10 @@ pub enum XacppError {
     /// Handshake rejected.
     #[error("establish rejected: {reason}")]
     EstablishReject { reason: String },
+    /// Operation invalid in the current state (e.g. wiring a session onto
+    /// a transport that already has one mounted).
+    #[error("invalid state: {0}")]
+    InvalidState(String),
     /// Internal handler error.
     #[error("internal error: {0}")]
     Internal(String),
@@ -51,6 +55,7 @@ impl XacppError {
             Self::NoHandler => "no_handler",
             Self::InvalidRequest(_) => "invalid_request",
             Self::EstablishReject { .. } => "establish_rejected",
+            Self::InvalidState(_) => "invalid_state",
             Self::Internal(_) => "internal_error",
             Self::Application { code, .. } => code,
         }

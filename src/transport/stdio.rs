@@ -1,10 +1,15 @@
 //! Stdio Transport Implementation.
 //!
-//! Communicates via stdin/stdout pipe handles using JSONL frame protocol (one message per line, delimited by `\n`).
+//! Communicates via stdin/stdout pipe handles using the binary frame wire
+//! protocol (SPEC §3): envelopes are carried as `DATA_JSON` frames.
 //!
 //! All outbound frames (requests, events, responses) go through the single
 //! ordered egress queue (see `super::egress`): one drain task owns the write
 //! half and writes frames FIFO in submission order.
+//!
+//! Log-bypass note: the frame decoder's magic scan silently tolerates
+//! non-frame garbage bytes on this pipe; child process logs are expected
+//! on stderr, not on stdout.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -12,13 +17,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite};
+use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::{Mutex, RwLock, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::egress::{self, Egress, PendingSlot};
-use super::{RequestHandler, XacppTransport};
+use super::transfer::TransferActivityHandlers;
+use super::{RequestHandler, TransferWiring, XacppTransport};
 use crate::error::XacppError;
+use crate::frame::{Frame, FrameDecoder, FrameType};
 use crate::message::{XacppEnvelope, XacppRequest, XacppResponse};
 
 /// Shared state: accessed via Arc between accept loop and main task.
@@ -37,12 +44,19 @@ pub struct StdioTransport {
     /// Write half parked before connect.
     parked_writer: Mutex<Option<Pin<Box<dyn AsyncWrite + Send>>>>,
     reader: Mutex<Option<Pin<Box<dyn AsyncBufRead + Send>>>>,
-    /// Ordered egress entry (present after connect).
-    egress: Mutex<Option<Egress>>,
+    /// Ordered egress entry (present after connect). Plain std lock: the
+    /// narrow wiring methods (`write_control_frame` / `write_data_frame`)
+    /// are sync signatures, and the critical section is a clone.
+    egress: std::sync::Mutex<Option<Egress>>,
     /// Connection-close broadcast (see `XacppTransport::closed`).
     closed_tx: watch::Sender<bool>,
     shared: Arc<SharedState>,
     next_id: Arc<AtomicU64>,
+    /// Inbound transfer hooks (registered by the wired transfer session
+    /// through `TransferWiring::on_transfer_activity`; `None` = unwired —
+    /// non-envelope frames are debug-ignored). Shared with the reader task
+    /// so a late registration routes inbound frames immediately.
+    transfer_hooks: Arc<std::sync::RwLock<Option<TransferActivityHandlers>>>,
     /// Connection operation mutex, ensures connect / disconnect do not execute concurrently.
     connect_lock: Mutex<()>,
 }
@@ -56,7 +70,7 @@ impl StdioTransport {
         Self {
             parked_writer: Mutex::new(Some(writer)),
             reader: Mutex::new(Some(reader)),
-            egress: Mutex::new(None),
+            egress: std::sync::Mutex::new(None),
             closed_tx,
             shared: Arc::new(SharedState {
                 request_handler: RwLock::new(None),
@@ -66,6 +80,7 @@ impl StdioTransport {
                 accept_handle: Mutex::new(None),
             }),
             next_id: Arc::new(AtomicU64::new(1)),
+            transfer_hooks: Arc::new(std::sync::RwLock::new(None)),
             connect_lock: Mutex::new(()),
         }
     }
@@ -74,16 +89,19 @@ impl StdioTransport {
         format!("r{}", self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Serialize wire message (JSONL payload without trailing newline).
+    /// Serialize an envelope into a complete binary wire frame: envelope JSON
+    /// wrapped as a single-frame `DATA_JSON` transaction
+    /// ([`super::encode_data_json_frame`]).
     fn serialize_envelope(msg: &XacppEnvelope) -> Result<Vec<u8>, XacppError> {
-        serde_json::to_vec(msg).map_err(|e| XacppError::Internal(e.to_string()))
+        let json = serde_json::to_vec(msg).map_err(|e| XacppError::Internal(e.to_string()))?;
+        super::encode_data_json_frame(&json)
     }
 
     /// Clone the ordered egress entry (`Err(NotConnected)` before connect).
-    async fn egress(&self) -> Result<Egress, XacppError> {
+    fn egress(&self) -> Result<Egress, XacppError> {
         self.egress
             .lock()
-            .await
+            .expect("poisoned egress lock")
             .clone()
             .ok_or(XacppError::NotConnected)
     }
@@ -105,9 +123,15 @@ impl StdioTransport {
 
             let envelope = match serde_json::from_slice::<XacppEnvelope>(&data) {
                 Ok(msg) => msg,
+                // Only reachable for a `DATA_JSON` frame whose payload is not
+                // a valid envelope (garbage bytes never get this far — the
+                // frame decoder's magic scan drops them). Peer-side bug:
+                // skip. Child logs belong on stderr.
                 Err(_) => {
                     let text = String::from_utf8_lossy(&data);
-                    log::debug!("[xacpp::stdio::log] {text}");
+                    log::debug!(
+                        "[xacpp::stdio] skipping DATA_JSON payload with invalid envelope: {text}"
+                    );
                     continue;
                 }
             };
@@ -197,7 +221,7 @@ impl XacppTransport for StdioTransport {
             .await
             .take()
             .ok_or(XacppError::AlreadyConnected)?;
-        let reader = self
+        let mut reader = self
             .reader
             .lock()
             .await
@@ -211,19 +235,68 @@ impl XacppTransport for StdioTransport {
             Arc::clone(&self.shared.pending),
             self.closed_tx.clone(),
         );
-        *self.egress.lock().await = Some(egress.clone());
+        *self.egress.lock().expect("poisoned egress lock") = Some(egress.clone());
 
         let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(256);
+        let reader_hooks = Arc::clone(&self.transfer_hooks);
         let reader_handle = tokio::spawn(async move {
-            let mut lines = reader.lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
-                        if frame_tx.send(Ok(line.into_bytes())).await.is_err() {
-                            break;
+            // Binary wire: chunk-read the stream into the frame decoder.
+            // `DATA_JSON` payloads forward to the accept loop (envelope
+            // channel). Every other frame routes into the registered
+            // transfer hooks (control dispatch + `DATA_BINARY` reassembly).
+            // The hooks are re-read per frame so a late registration
+            // (responder side, after connect) routes immediately.
+            let mut decoder = FrameDecoder::new();
+            let mut buf = [0u8; 8192];
+            'read: loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        let frames = match decoder.feed(&buf[..n]) {
+                            Ok(frames) => frames,
+                            // Fatal (version mismatch / CRC / size limits,
+                            // SPEC §7): decoder state is drained — surface as
+                            // a connection error and tear down.
+                            Err(e) => {
+                                log::error!("reader: fatal frame decode error: {e}");
+                                let io_err =
+                                    std::io::Error::new(std::io::ErrorKind::InvalidData, e);
+                                let _ = frame_tx.send(Err(io_err)).await;
+                                break;
+                            }
+                        };
+                        for frame in frames {
+                            match frame.frame_type {
+                                FrameType::DataJson => {
+                                    // SPEC §5: any inbound frame refreshes the
+                                    // peer-activity clock. Envelope frames never
+                                    // reach the transfer dispatch point, so the
+                                    // reader refreshes here — an envelope-only
+                                    // connection must not look like a silent
+                                    // peer to the clock.
+                                    let hooks =
+                                        reader_hooks.read().expect("poisoned hooks lock").clone();
+                                    if let Some(hooks) = hooks {
+                                        (hooks.on_activity)().await;
+                                    }
+                                    if frame_tx.send(Ok(frame.payload)).await.is_err() {
+                                        break 'read;
+                                    }
+                                }
+                                other => {
+                                    let hooks =
+                                        reader_hooks.read().expect("poisoned hooks lock").clone();
+                                    if let Some(hooks) = hooks {
+                                        (hooks.on_frame)(frame).await;
+                                    } else {
+                                        log::debug!(
+                                            "reader: ignoring non-DATA_JSON frame (type {other:?}) — no transfer session wired"
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
-                    Ok(None) => break,
                     Err(e) => {
                         let _ = frame_tx.send(Err(e)).await;
                         break;
@@ -251,7 +324,7 @@ impl XacppTransport for StdioTransport {
         // Stop accepting new outbound traffic, then shut the egress down
         // (queued frames flush FIFO before the writer closes).
         self.shared.connected.store(false, Ordering::Release);
-        if let Some(egress) = self.egress.lock().await.take() {
+        if let Some(egress) = self.egress.lock().expect("poisoned egress lock").take() {
             egress.close();
         }
 
@@ -288,7 +361,7 @@ impl XacppTransport for StdioTransport {
             pending.insert(id.clone(), PendingSlot::Respond(tx));
         }
 
-        let egress = self.egress().await?;
+        let egress = self.egress()?;
         if let Err(e) = egress.send_acked(frame).await {
             self.shared.pending.lock().await.remove(&id);
             return Err(e);
@@ -323,7 +396,7 @@ impl XacppTransport for StdioTransport {
             .await
             .insert(id.clone(), PendingSlot::Drop);
 
-        let egress = self.egress().await?;
+        let egress = self.egress()?;
         if let Err(e) = egress.send_faf(frame) {
             self.shared.pending.lock().await.remove(&id);
             return Err(e);
@@ -346,5 +419,24 @@ impl XacppTransport for StdioTransport {
 
     fn closed(&self) -> watch::Receiver<bool> {
         self.closed_tx.subscribe()
+    }
+}
+
+impl TransferWiring for StdioTransport {
+    fn write_control_frame(&self, bytes: Vec<u8>) -> Result<(), XacppError> {
+        let egress = self.egress()?;
+        egress.send_control(bytes)
+    }
+
+    fn write_data_frame(&self, frame: Frame) -> Result<(), XacppError> {
+        let egress = self.egress()?;
+        let wire = frame
+            .encode()
+            .map_err(|e| XacppError::Internal(e.to_string()))?;
+        egress.send_faf(wire)
+    }
+
+    fn on_transfer_activity(&self, handlers: Option<TransferActivityHandlers>) {
+        *self.transfer_hooks.write().expect("poisoned hooks lock") = handlers;
     }
 }

@@ -481,7 +481,10 @@ fn test_wire_response_generic_roundtrip() {
     assert!(json.contains(r#""id":"r2""#), "json: {json}");
     assert!(json.contains(r#""generic""#), "json: {json}");
     assert!(json.contains(r#""name":"action""#), "json: {json}");
-    assert!(json.contains(r#""data":{"type":"approve"}"#), "json: {json}");
+    assert!(
+        json.contains(r#""data":{"type":"approve"}"#),
+        "json: {json}"
+    );
 
     let de: XacppEnvelope = serde_json::from_str(&json).unwrap();
     match de {
@@ -659,10 +662,7 @@ fn test_action_request_payload_roundtrip() {
     let json = serde_json::to_string(&payload).unwrap();
     assert!(json.contains(r#""toolName":"bash""#), "json: {json}");
     assert!(json.contains(r#""alert":"warn""#), "json: {json}");
-    assert!(
-        json.contains(r#""origin":["sub-task-a"]"#),
-        "json: {json}"
-    );
+    assert!(json.contains(r#""origin":["sub-task-a"]"#), "json: {json}");
     assert!(json.contains(r#""requestId":"req-1""#), "json: {json}");
 
     let de: ActionRequestPayload = serde_json::from_str(&json).unwrap();
@@ -756,10 +756,7 @@ fn test_sensitive_info_operation_payload_roundtrip() {
     let json = serde_json::to_string(&payload).unwrap();
     assert!(json.contains(r#""collect""#), "json: {json}");
     assert!(json.contains(r#""siType":"secret""#), "json: {json}");
-    assert!(
-        json.contains(r#""origin":["sub-task-a"]"#),
-        "json: {json}"
-    );
+    assert!(json.contains(r#""origin":["sub-task-a"]"#), "json: {json}");
     assert!(!json.contains(r#""requestId""#), "json: {json}");
 
     let de: SensitiveInfoOperationPayload = serde_json::from_str(&json).unwrap();
@@ -828,10 +825,7 @@ fn test_interaction_payloads_legacy_origin_default() {
 /// child of the consuming activity).
 #[test]
 fn test_interaction_payloads_origin_chain_roundtrip() {
-    let chain = vec![
-        "grandchild".to_string(),
-        "direct-child".to_string(),
-    ];
+    let chain = vec!["grandchild".to_string(), "direct-child".to_string()];
     let payload = QuestionPayload {
         question: "continue?".into(),
         options: vec!["yes".into()],
