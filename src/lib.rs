@@ -51,17 +51,11 @@
 //! - **Peer to upper**: exposes typed `establish` / `request_command` / `request_event`
 //! - **Session to upper**: holds `XacppSessionHandler`, sends/receives directly through Transport
 
-pub mod activity_ref;
-pub mod capability;
-pub mod commands;
-pub mod control;
-pub mod error;
-pub mod events;
-pub mod frame;
-pub mod handler;
-pub mod message;
-pub mod peer;
-pub mod reassemble;
+pub mod carrier;
+pub mod ext {
+    pub mod fetch;
+}
+pub mod reliability;
 pub mod session;
-pub mod transaction;
-pub mod transport;
+pub mod transfer;
+pub mod wire;

@@ -11,26 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::control::AckEntry;
-
-/// Reassembler tunables.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReassemblerConfig {
-    /// Incomplete transactions untouched for longer than this are dropped
-    /// by [`TransactionReassembler::expire_stale`] (ms). Completed slots
-    /// are never swept — delivery is the holder's job.
-    pub stale_retention_ms: u64,
-}
-
-impl Default for ReassemblerConfig {
-    fn default() -> Self {
-        // SPEC §5: RECOMMENDED copy retention 120 s (mirrored on the
-        // receive side for incomplete-transaction staleness).
-        Self {
-            stale_retention_ms: 120_000,
-        }
-    }
-}
+use crate::wire::control::AckEntry;
 
 /// Reassembly error — one frame or transaction rejected, the reassembler
 /// itself stays usable (per-slot isolation).
@@ -67,13 +48,19 @@ pub enum ReassemblyError {
 }
 
 /// Outcome of feeding one frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiveOutcome {
     /// Frame stored; `complete` reports whether the §3 criteria now hold
-    /// (deliver via [`TransactionReassembler::take_completed`]).
+    /// (deliver via [`TransactionReassembler::take_completed`]). `emitted`
+    /// carries the frames newly covered by the contiguous prefix, in `seq`
+    /// order — populated only when the caller asked for streaming emission
+    /// (streaming consumers clone them out while the stored copy stays for
+    /// aggregation / ACK bookkeeping).
     Accepted {
         /// Transaction became complete with this frame.
         complete: bool,
+        /// Newly contiguous frames `(seq, bytes)`.
+        emitted: Vec<(u32, Vec<u8>)>,
     },
     /// Same-`seq` frame already stored — duplicate (retransmission);
     /// ignored, counts and bytes unchanged.
@@ -94,8 +81,6 @@ struct Slot {
     /// Highest `seq` such that all frames `0..=seq` are stored;
     /// `None` while frame 0 has not arrived.
     contiguous_prefix: Option<u32>,
-    /// Last accepted-frame instant (ms, caller-injected clock).
-    last_activity_ms: u64,
 }
 
 impl Slot {
@@ -121,36 +106,46 @@ impl Slot {
 ///
 /// Pure synchronous component; all timing (staleness) is injected as
 /// millisecond instants by the caller.
+///
+/// No terminal trace is kept (SPEC §5 v1.1 stateless kernel — no
+/// tombstones): once a slot is released (completion delivery or explicit
+/// `discard`) the txid simply has no slot. An inbound frame for a slotless
+/// id OPENS a fresh slot — late retransmissions of an already-finished
+/// transaction are absorbed idempotently this way (never delivered twice:
+/// delivery consumes the slot). If the holder no longer holds the
+/// transaction, the resurrected slot can never complete and is cancelled
+/// by the recovery cross-check (SPEC §5) on the holder's next declaration.
 #[derive(Debug)]
 pub struct TransactionReassembler {
     slots: HashMap<[u8; 16], Slot>,
-    config: ReassemblerConfig,
 }
 
 impl Default for TransactionReassembler {
     fn default() -> Self {
-        Self::new(ReassemblerConfig::default())
+        Self::new()
     }
 }
 
 impl TransactionReassembler {
-    /// Create a reassembler with the given configuration.
-    pub fn new(config: ReassemblerConfig) -> Self {
+    /// Create a reassembler. No tunables: the time-based sweep is retired
+    /// (SPEC §5 v3 — slots live until completion or explicit `discard`).
+    pub fn new() -> Self {
         Self {
             slots: HashMap::new(),
-            config,
         }
-    }
-
-    /// Borrowed configuration.
-    pub fn config(&self) -> &ReassemblerConfig {
-        &self.config
     }
 
     /// Feed one frame into its transaction slot.
     ///
     /// `frame_len` is validated against `payload.len()` (defence against
     /// caller bugs; the wire-level check lives in the frame decoder).
+    ///
+    /// `emit`: when `true`, the returned [`ReceiveOutcome::Accepted`]
+    /// carries the frames newly covered by the contiguous prefix (streaming
+    /// consumers); `false` skips the cloning cost (aggregate-only paths).
+    /// `_now_ms` is retained for time-injection API uniformity (the retired
+    /// stale-sweep was its only consumer).
+    #[allow(clippy::too_many_arguments)]
     pub fn receive_frame(
         &mut self,
         transaction_id: [u8; 16],
@@ -158,7 +153,8 @@ impl TransactionReassembler {
         total_len: u32,
         frame_len: usize,
         payload: &[u8],
-        now_ms: u64,
+        _now_ms: u64,
+        emit: bool,
     ) -> Result<ReceiveOutcome, ReassemblyError> {
         if frame_len != payload.len() {
             return Err(ReassemblyError::FrameLenMismatch {
@@ -171,13 +167,17 @@ impl TransactionReassembler {
             // before the slot is opened so no garbage slot is created.
             return Err(ReassemblyError::EmptyTotalLen);
         }
+        let previous_prefix_end = self
+            .slots
+            .get(&transaction_id)
+            .and_then(|slot| slot.contiguous_prefix)
+            .map_or(0, |h| h + 1);
         let slot = self.slots.entry(transaction_id).or_insert_with(|| Slot {
             total_len,
             frames: BTreeMap::new(),
             received_frames: 0,
             received_bytes: 0,
             contiguous_prefix: None,
-            last_activity_ms: now_ms,
         });
         if slot.total_len != total_len {
             return Err(ReassemblyError::TotalLenConflict {
@@ -195,11 +195,25 @@ impl TransactionReassembler {
         slot.frames.insert(seq, payload.to_vec());
         slot.received_frames += 1;
         slot.received_bytes += payload.len() as u64;
-        slot.last_activity_ms = now_ms;
         slot.advance_contiguous();
-        Ok(ReceiveOutcome::Accepted {
-            complete: slot.is_complete(),
-        })
+        let complete = slot.is_complete();
+        let mut emitted = Vec::new();
+        if emit {
+            let new_prefix_end = slot
+                .contiguous_prefix
+                .map_or(previous_prefix_end.saturating_sub(1), |h| h + 1);
+            for covered in previous_prefix_end..new_prefix_end {
+                if let Some(bytes) = slot.frames.get(&covered) {
+                    emitted.push((covered, bytes.clone()));
+                }
+            }
+        }
+        Ok(ReceiveOutcome::Accepted { complete, emitted })
+    }
+
+    /// Whether the transaction has an open (or completed, undelivered) slot.
+    pub fn contains_transaction(&self, transaction_id: [u8; 16]) -> bool {
+        self.slots.contains_key(&transaction_id)
     }
 
     /// Whether the §3 criteria currently hold for the transaction.
@@ -207,6 +221,16 @@ impl TransactionReassembler {
         self.slots
             .get(&transaction_id)
             .is_some_and(Slot::is_complete)
+    }
+
+    /// Byte accounting of a transaction: the bytes stored so far and the
+    /// declared total (`None` = no slot for this id).
+    ///
+    /// The gap `declared - received` is what a TRANSACTION_COMPLETED
+    /// frame with missing bytes exposes to the consumer.
+    pub fn byte_progress(&self, transaction_id: [u8; 16]) -> Option<(u64, u32)> {
+        let slot = self.slots.get(&transaction_id)?;
+        Some((slot.received_bytes, slot.total_len))
     }
 
     /// Hand out the assembled payload and release the slot.
@@ -265,35 +289,21 @@ impl TransactionReassembler {
             .collect()
     }
 
-    /// Ids of all open (incomplete) transaction slots — the integration
-    /// layer drives periodic ACK / RESUME emission over these.
+    /// Ids of all transaction slots (open or completed-undelivered) — the
+    /// integration layer drives periodic ACK emission over these, and the
+    /// recovery cross-check filters them down to the incomplete ones.
     pub fn open_transactions(&self) -> impl Iterator<Item = [u8; 16]> + '_ {
         self.slots.keys().copied()
     }
 
-    /// Drop incomplete transactions whose last accepted frame is older
-    /// than the configured retention; returns the dropped ids. Completed
-    /// slots are never swept here.
-    pub fn expire_stale(&mut self, now_ms: u64) -> Vec<[u8; 16]> {
-        let retention = self.config.stale_retention_ms;
-        let stale: Vec<[u8; 16]> = self
-            .slots
-            .iter()
-            .filter(|(_, slot)| {
-                !slot.is_complete() && now_ms.saturating_sub(slot.last_activity_ms) > retention
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in &stale {
-            self.slots.remove(id);
-        }
-        stale
-    }
-
     /// Drop the slot for `transaction_id` if present; returns `true` when a
-    /// slot existed. Integration hook for a peer `ERROR transaction_expired`
-    /// naming this transaction — the holder's copy is gone, so the slot
-    /// would otherwise linger until [`Self::expire_stale`].
+    /// slot existed. Called when the transaction can never complete as far
+    /// as this side is concerned: the recovery cross-check (the holder's
+    /// RESUME declaration did not cover this still-open slot), a peer
+    /// `ERROR transaction_expired`, or a local TRANSACTION_ABORT. There is
+    /// no time-based sweep: slots live until they complete or are
+    /// explicitly dropped (SPEC §5 revised — copy lifetime = transaction
+    /// lifetime).
     pub fn discard(&mut self, transaction_id: [u8; 16]) -> bool {
         self.slots.remove(&transaction_id).is_some()
     }
@@ -302,7 +312,7 @@ impl TransactionReassembler {
 /// Upper bound for a NACK missing-seq list so one entry still fits the
 /// 16 KiB control payload: `1 (count) + 16 (id) + 2 (missing_count)` then
 /// 4 bytes per seq.
-pub const MAX_NACK_MISSING_ENTRIES: usize = (crate::control::CONTROL_PAYLOAD_CAP - 19) / 4;
+pub const MAX_NACK_MISSING_ENTRIES: usize = (crate::wire::control::CONTROL_PAYLOAD_CAP - 19) / 4;
 
 #[cfg(test)]
 mod tests {
@@ -338,10 +348,10 @@ mod tests {
         for &idx in order {
             let (seq, len, payload) = &frames[idx];
             let outcome = reassembler
-                .receive_frame(id, *seq, total_len, *len, payload, 1_000)
+                .receive_frame(id, *seq, total_len, *len, payload, 1_000, false)
                 .expect("frame accepted");
             match outcome {
-                ReceiveOutcome::Accepted { complete } => completed |= complete,
+                ReceiveOutcome::Accepted { complete, .. } => completed |= complete,
                 ReceiveOutcome::Duplicate => {}
             }
         }
@@ -392,12 +402,15 @@ mod tests {
         let id = txid(4);
         let payload = vec![1u8; 4];
         assert_eq!(
-            r.receive_frame(id, 0, 8, 4, &payload, 100).unwrap(),
-            ReceiveOutcome::Accepted { complete: false }
+            r.receive_frame(id, 0, 8, 4, &payload, 100, false).unwrap(),
+            ReceiveOutcome::Accepted {
+                complete: false,
+                emitted: vec![]
+            }
         );
         // Same seq again — ignored, no byte or count growth.
         assert_eq!(
-            r.receive_frame(id, 0, 8, 4, &payload, 200).unwrap(),
+            r.receive_frame(id, 0, 8, 4, &payload, 200, false).unwrap(),
             ReceiveOutcome::Duplicate
         );
         let entry = r.ack_entry(id).unwrap();
@@ -411,12 +424,12 @@ mod tests {
         let id = txid(4);
         let p0 = vec![1u8; 4];
         let p1 = vec![2u8; 4];
-        r.receive_frame(id, 0, 8, 4, &p0, 100).unwrap();
-        r.receive_frame(id, 1, 8, 4, &p1, 100).unwrap();
+        r.receive_frame(id, 0, 8, 4, &p0, 100, false).unwrap();
+        r.receive_frame(id, 1, 8, 4, &p1, 100, false).unwrap();
         assert!(r.is_complete(id));
         // Retransmitted tail frame before the final ACK arrives.
         assert_eq!(
-            r.receive_frame(id, 1, 8, 4, &p1, 150).unwrap(),
+            r.receive_frame(id, 1, 8, 4, &p1, 150, false).unwrap(),
             ReceiveOutcome::Duplicate
         );
         assert_eq!(r.take_completed(id).unwrap(), [p0, p1].concat());
@@ -429,15 +442,21 @@ mod tests {
         let p0 = vec![10u8; 4];
         let p1 = vec![11u8; 4];
         let p2 = vec![12u8; 4];
-        r.receive_frame(id, 0, 12, 4, &p0, 100).unwrap();
-        r.receive_frame(id, 2, 12, 4, &p2, 100).unwrap();
+        r.receive_frame(id, 0, 12, 4, &p0, 100, false).unwrap();
+        r.receive_frame(id, 2, 12, 4, &p2, 100, false).unwrap();
         let entry = r.ack_entry(id).unwrap();
         assert_eq!(entry.highest_contiguous_seq, 0);
         assert_eq!(entry.received_frames, 2);
         assert_eq!(r.missing_seqs(id, MAX_NACK_MISSING_ENTRIES), vec![1]);
         // Fill the gap — completes.
-        let outcome = r.receive_frame(id, 1, 12, 4, &p1, 200).unwrap();
-        assert_eq!(outcome, ReceiveOutcome::Accepted { complete: true });
+        let outcome = r.receive_frame(id, 1, 12, 4, &p1, 200, false).unwrap();
+        assert_eq!(
+            outcome,
+            ReceiveOutcome::Accepted {
+                complete: true,
+                emitted: vec![]
+            }
+        );
         assert_eq!(r.take_completed(id).unwrap(), [p0, p1, p2].concat());
     }
 
@@ -447,9 +466,9 @@ mod tests {
         let id = txid(6);
         let p = |b: u8| vec![b; 1];
         // Stored: 0, 3, 5 (total needs bytes only; contiguity is what matters).
-        r.receive_frame(id, 0, 5, 1, &p(0), 100).unwrap();
-        r.receive_frame(id, 3, 5, 1, &p(3), 100).unwrap();
-        r.receive_frame(id, 5, 5, 1, &p(5), 100).unwrap();
+        r.receive_frame(id, 0, 5, 1, &p(0), 100, false).unwrap();
+        r.receive_frame(id, 3, 5, 1, &p(3), 100, false).unwrap();
+        r.receive_frame(id, 5, 5, 1, &p(5), 100, false).unwrap();
         assert_eq!(r.missing_seqs(id, MAX_NACK_MISSING_ENTRIES), vec![1, 2, 4]);
     }
 
@@ -460,7 +479,8 @@ mod tests {
         let p = |b: u8| vec![b; 1];
         // Stored: 0, 1, 4, 5 (total needs 6 bytes) → gaps at 2 and 3.
         for seq in [0u32, 1, 4, 5] {
-            r.receive_frame(id, seq, 6, 1, &p(seq as u8), 100).unwrap();
+            r.receive_frame(id, seq, 6, 1, &p(seq as u8), 100, false)
+                .unwrap();
         }
         assert_eq!(r.missing_seqs(id, 1), vec![2]);
         assert_eq!(r.missing_seqs(id, 2), vec![2, 3]);
@@ -476,8 +496,8 @@ mod tests {
         // transaction exports no ACK entry (SPEC §5 clarification:
         // h=0 would falsely claim frame 0 received); the gap surfaces
         // through NACK instead.
-        r.receive_frame(id, 1, 12, 4, &p, 100).unwrap();
-        r.receive_frame(id, 2, 12, 4, &p, 100).unwrap();
+        r.receive_frame(id, 1, 12, 4, &p, 100, false).unwrap();
+        r.receive_frame(id, 2, 12, 4, &p, 100, false).unwrap();
         assert_eq!(r.ack_entry(id), None);
         assert_eq!(r.missing_seqs(id, MAX_NACK_MISSING_ENTRIES), vec![0]);
     }
@@ -488,13 +508,13 @@ mod tests {
         let id = txid(10);
         let p = vec![7u8; 4];
         // Tail frames first (16 B = 4 frames): no prefix → no entry.
-        r.receive_frame(id, 1, 16, 4, &p, 100).unwrap();
-        r.receive_frame(id, 2, 16, 4, &p, 100).unwrap();
+        r.receive_frame(id, 1, 16, 4, &p, 100, false).unwrap();
+        r.receive_frame(id, 2, 16, 4, &p, 100, false).unwrap();
         assert_eq!(r.ack_entry(id), None);
         // Frame 0 arrives → prefix spans 0..=2 → entry exported with the
         // true progress; the known gap list is empty (seq 3 is an
         // unknowable tail, not reported).
-        r.receive_frame(id, 0, 16, 4, &p, 200).unwrap();
+        r.receive_frame(id, 0, 16, 4, &p, 200, false).unwrap();
         let entry = r.ack_entry(id).unwrap();
         assert_eq!(entry.highest_contiguous_seq, 2);
         assert_eq!(entry.received_frames, 3);
@@ -512,8 +532,8 @@ mod tests {
         let p = vec![9u8; 4];
         // Total needs 12 bytes (3 frames); only 0 and 1 arrived — the
         // missing tail frame is unknowable, not reported.
-        r.receive_frame(id, 0, 12, 4, &p, 100).unwrap();
-        r.receive_frame(id, 1, 12, 4, &p, 100).unwrap();
+        r.receive_frame(id, 0, 12, 4, &p, 100, false).unwrap();
+        r.receive_frame(id, 1, 12, 4, &p, 100, false).unwrap();
         assert_eq!(
             r.missing_seqs(id, MAX_NACK_MISSING_ENTRIES),
             Vec::<u32>::new()
@@ -528,10 +548,10 @@ mod tests {
         let b = txid(2);
         let pa = vec![1u8; 4];
         let pb = vec![2u8; 4];
-        r.receive_frame(a, 0, 8, 4, &pa, 100).unwrap();
-        r.receive_frame(b, 1, 8, 4, &pb, 100).unwrap();
+        r.receive_frame(a, 0, 8, 4, &pa, 100, false).unwrap();
+        r.receive_frame(b, 1, 8, 4, &pb, 100, false).unwrap();
         assert_eq!(r.open_transactions().count(), 2);
-        r.receive_frame(a, 1, 8, 4, &pa, 150).unwrap();
+        r.receive_frame(a, 1, 8, 4, &pa, 150, false).unwrap();
         assert_eq!(r.take_completed(a).unwrap(), [pa.clone(), pa].concat());
         assert_eq!(r.open_transactions().count(), 1);
         // b holds only seq 1 — no contiguous prefix, no ACK entry.
@@ -544,10 +564,10 @@ mod tests {
         let a = txid(1);
         let b = txid(2);
         let p = vec![5u8; 4];
-        r.receive_frame(a, 0, 8, 4, &p, 100).unwrap();
-        r.receive_frame(b, 0, 8, 4, &p, 100).unwrap();
-        r.receive_frame(a, 1, 8, 4, &p, 150).unwrap();
-        r.receive_frame(b, 1, 8, 4, &p, 150).unwrap();
+        r.receive_frame(a, 0, 8, 4, &p, 100, false).unwrap();
+        r.receive_frame(b, 0, 8, 4, &p, 100, false).unwrap();
+        r.receive_frame(a, 1, 8, 4, &p, 150, false).unwrap();
+        r.receive_frame(b, 1, 8, 4, &p, 150, false).unwrap();
         assert!(r.is_complete(a) && r.is_complete(b));
     }
 
@@ -556,8 +576,8 @@ mod tests {
         let mut r = TransactionReassembler::default();
         let id = txid(1);
         let p = vec![1u8; 4];
-        r.receive_frame(id, 0, 8, 4, &p, 100).unwrap();
-        let err = r.receive_frame(id, 1, 12, 4, &p, 100).unwrap_err();
+        r.receive_frame(id, 0, 8, 4, &p, 100, false).unwrap();
+        let err = r.receive_frame(id, 1, 12, 4, &p, 100, false).unwrap_err();
         assert_eq!(err, ReassemblyError::TotalLenConflict { first: 8, got: 12 });
     }
 
@@ -565,7 +585,7 @@ mod tests {
     fn frame_len_mismatch_rejected() {
         let mut r = TransactionReassembler::default();
         let err = r
-            .receive_frame(txid(1), 0, 8, 4, &[1, 2, 3], 100)
+            .receive_frame(txid(1), 0, 8, 4, &[1, 2, 3], 100, false)
             .unwrap_err();
         assert_eq!(
             err,
@@ -581,19 +601,23 @@ mod tests {
         let mut r = TransactionReassembler::default();
         let id = txid(1);
         let p4 = vec![1u8; 4];
-        r.receive_frame(id, 0, 8, 4, &p4, 100).unwrap();
-        r.receive_frame(id, 1, 8, 4, &p4, 100).unwrap();
-        let err = r.receive_frame(id, 2, 8, 4, &p4, 100).unwrap_err();
+        r.receive_frame(id, 0, 8, 4, &p4, 100, false).unwrap();
+        r.receive_frame(id, 1, 8, 4, &p4, 100, false).unwrap();
+        let err = r.receive_frame(id, 2, 8, 4, &p4, 100, false).unwrap_err();
         assert_eq!(err, ReassemblyError::TotalLenExceeded { total: 8 });
         // A single oversized frame on a fresh slot is rejected too.
-        let err = r.receive_frame(txid(2), 0, 4, 5, &[0; 5], 100).unwrap_err();
+        let err = r
+            .receive_frame(txid(2), 0, 4, 5, &[0; 5], 100, false)
+            .unwrap_err();
         assert_eq!(err, ReassemblyError::TotalLenExceeded { total: 4 });
     }
 
     #[test]
     fn empty_total_len_rejected() {
         let mut r = TransactionReassembler::default();
-        let err = r.receive_frame(txid(1), 0, 0, 0, &[], 100).unwrap_err();
+        let err = r
+            .receive_frame(txid(1), 0, 0, 0, &[], 100, false)
+            .unwrap_err();
         assert_eq!(err, ReassemblyError::EmptyTotalLen);
     }
 
@@ -602,35 +626,35 @@ mod tests {
         let mut r = TransactionReassembler::default();
         let id = txid(1);
         let p = vec![1u8; 4];
-        r.receive_frame(id, 0, 8, 4, &p, 100).unwrap();
+        r.receive_frame(id, 0, 8, 4, &p, 100, false).unwrap();
         assert_eq!(r.take_completed(id), None);
         assert!(r.ack_entry(id).is_some());
     }
 
     #[test]
-    fn stale_incomplete_swept_active_and_completed_kept() {
+    fn no_time_based_sweep_slots_survive_long_idle() {
+        // Retention sweep retired (SPEC §5 revised: copy lifetime =
+        // transaction lifetime): slots are never dropped for idleness —
+        // they live until completion or an explicit `discard`.
         let mut r = TransactionReassembler::default();
-        let stale_id = txid(1);
+        let idle_id = txid(1);
         let active_id = txid(2);
         let done_id = txid(3);
         let p = vec![1u8; 4];
-        r.receive_frame(stale_id, 0, 8, 4, &p, 0).unwrap();
-        r.receive_frame(active_id, 0, 8, 4, &p, 0).unwrap();
-        r.receive_frame(done_id, 0, 4, 4, &p, 0).unwrap();
-        // Active one keeps receiving; stale one goes quiet.
-        r.receive_frame(active_id, 1, 8, 4, &p, 100_000).unwrap();
-        let swept = r.expire_stale(150_000);
-        assert_eq!(swept, vec![stale_id]);
-        assert!(r.ack_entry(stale_id).is_none());
+        r.receive_frame(idle_id, 0, 8, 4, &p, 0, false).unwrap();
+        r.receive_frame(active_id, 0, 8, 4, &p, 0, false).unwrap();
+        r.receive_frame(done_id, 0, 4, 4, &p, 0, false).unwrap();
+        // Active one keeps receiving; the other goes quiet far beyond any
+        // historical retention window — everything must still be there.
+        r.receive_frame(active_id, 1, 8, 4, &p, 100_000, false)
+            .unwrap();
+        let open: std::collections::HashSet<[u8; 16]> = r.open_transactions().collect();
+        assert!(open.contains(&idle_id), "quiet slot is never swept");
+        assert!(open.contains(&active_id));
+        assert!(r.ack_entry(idle_id).is_some());
         assert!(r.ack_entry(active_id).is_some());
-        // Completed slot survives the sweep (awaiting take_completed).
+        // Completed slot survives too (awaiting take_completed).
         assert!(r.ack_entry(done_id).is_some());
-        // Custom retention shorter than one sweep interval also works.
-        let mut r2 = TransactionReassembler::new(ReassemblerConfig {
-            stale_retention_ms: 50,
-        });
-        r2.receive_frame(stale_id, 0, 8, 4, &p, 1_000).unwrap();
-        assert_eq!(r2.expire_stale(1_051), vec![stale_id]);
     }
 
     #[test]

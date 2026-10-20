@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::payload::AlertLevel;
-use crate::activity_ref::ActivityRef;
-use crate::commands::XacppCommand;
+use crate::wire::activity_ref::ActivityRef;
+use crate::wire::commands::XacppCommand;
 
 // ---- Tool Call Authorization ----
 

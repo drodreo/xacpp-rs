@@ -23,13 +23,13 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
 
-use crate::capability::{Capabilities, EffectiveCapabilities};
-use crate::commands::XacppCommand;
-use crate::error::XacppError;
-use crate::handler::{EstablishHandler, NegotiateHandler, XacppSessionHandler};
-use crate::message::{XacppRequest, XacppResponse};
+use crate::carrier::XacppTransport;
 use crate::session::XacppSession;
-use crate::transport::XacppTransport;
+use crate::session::handler::{EstablishHandler, NegotiateHandler, XacppSessionHandler};
+use crate::wire::capability::{Capabilities, EffectiveCapabilities};
+use crate::wire::commands::XacppCommand;
+use crate::wire::error::XacppError;
+use crate::wire::message::{XacppRequest, XacppResponse};
 
 /// Peer protocol state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,10 +216,10 @@ impl XacppPeer {
                         (None, XacppRequest::Command(XacppCommand::Establish { credentials })) => {
                             match establish_handler.on_establish(transport, credentials).await {
                                 Ok(decision) => match decision {
-                                    crate::handler::EstablishDecision::ChallengeRequired {
+                                    crate::session::handler::EstablishDecision::ChallengeRequired {
                                         challenge,
                                     } => Ok(XacppResponse::EstablishPrepare { challenge }),
-                                    crate::handler::EstablishDecision::Established {
+                                    crate::session::handler::EstablishDecision::Established {
                                         session_id,
                                         handler,
                                         credentials,
@@ -249,11 +249,28 @@ impl XacppPeer {
                         }
                         // Other requests without session_id are invalid
                         (None, _) => Err(XacppError::InvalidRequest("missing session_id".into())),
-                        // Route to Session handler
+                        // Route to Session handler. Fetch-family commands are
+                        // gated (SPEC §8.2): with no loaded fetch responder
+                        // the library answers `fetch_unavailable` loudly —
+                        // never a silent fall-through to the consumer. A
+                        // loaded responder receives the commands untouched
+                        // (the fetch kernel stays stateless).
                         (Some(sid), XacppRequest::Command(cmd)) => {
                             let handler = { sessions.read().await.get(&sid).cloned() };
                             match handler {
-                                Some(h) => h.on_command(cmd).await,
+                                Some(h) => {
+                                    if cmd.is_fetch_family() && !h.is_fetch_responder() {
+                                        Ok(XacppResponse::Error {
+                                            code: crate::wire::fetch::error_codes::FETCH_UNAVAILABLE
+                                                .into(),
+                                            message:
+                                                "fetch unsupported on this end (no fetch responder loaded)"
+                                                    .into(),
+                                        })
+                                    } else {
+                                        h.on_command(cmd).await
+                                    }
+                                }
                                 None => {
                                     Err(XacppError::Internal(format!("unknown session: {sid}")))
                                 }
@@ -304,11 +321,14 @@ impl XacppPeer {
         handler: Arc<dyn XacppSessionHandler>,
         verify_challenge: impl FnOnce(String) -> Result<(), XacppError>,
     ) -> Result<Arc<XacppSession>, XacppError> {
-        let session = Arc::clone(self.session.as_ref().ok_or_else(|| {
-            XacppError::Internal(
+        // The peer must hold an initiator-side session (the handshake is
+        // driven from it). Which session gets BOUND is decided by the
+        // responder's answer — see `session_for_establish`.
+        if self.session.is_none() {
+            return Err(XacppError::Internal(
                 "establish requires an initiator-side session (pass Some at XacppPeer::new)".into(),
-            )
-        })?);
+            ));
+        }
 
         let state = self.state().await;
         if state != PeerState::Negotiated {
@@ -353,6 +373,7 @@ impl XacppPeer {
                     .write()
                     .await
                     .insert(session_id.clone(), Arc::clone(&handler));
+                let session = self.session_for_establish(&session_id).await?;
                 session
                     .backfill(
                         session_id,
@@ -391,6 +412,7 @@ impl XacppPeer {
                             .write()
                             .await
                             .insert(session_id.clone(), Arc::clone(&handler));
+                        let session = self.session_for_establish(&session_id).await?;
                         session
                             .backfill(
                                 session_id,
@@ -437,6 +459,40 @@ impl XacppPeer {
                 )))
             }
         }
+    }
+
+    /// Session to bind for an establish success, driven by the
+    /// responder's answer (identity continuity is the responder's
+    /// verdict — credentials are the anchor, the answer's `session_id`
+    /// is the ruling):
+    ///
+    /// - The answer names the held session's bound identity — or the
+    ///   held session is not bound yet: the held session is reused, its
+    ///   transfer mount re-attached idempotently. Its transaction
+    ///   state, receive slots and send copies survive the re-establish.
+    /// - The answer names a different identity: a new logical session is
+    ///   born. The held session's transfer mount is detached first — the
+    ///   mount is a single slot, and an orphaned transfer clock never
+    ///   sees inbound activity again: its silence timer would declare
+    ///   the peer dead and tear THIS connection down ~90s later. The
+    ///   held session's envelope identity stays wired — the envelope
+    ///   channel routes by `session_id`, so coexisting sessions on one
+    ///   connection keep their command/event paths.
+    async fn session_for_establish(
+        &self,
+        session_id: &str,
+    ) -> Result<Arc<XacppSession>, XacppError> {
+        if let Some(held) = &self.session {
+            let bound = held.session_id().await;
+            if bound.is_empty() || bound == session_id {
+                held.attach_transfer(Arc::clone(&self.transport)).await?;
+                return Ok(Arc::clone(held));
+            }
+            held.detach_transfer().await;
+        }
+        let fresh = Arc::new(XacppSession::new(None));
+        fresh.wire(Arc::clone(&self.transport)).await?;
+        Ok(fresh)
     }
 
     /// Disconnects.

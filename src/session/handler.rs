@@ -12,12 +12,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::capability::EffectiveCapabilities;
-use crate::commands::XacppCommand;
-use crate::error::XacppError;
-use crate::events::XacppActivityEvent;
-use crate::message::{XacppRequest, XacppResponse};
-use crate::transport::XacppTransport;
+use crate::carrier::XacppTransport;
+use crate::wire::capability::EffectiveCapabilities;
+use crate::wire::commands::XacppCommand;
+use crate::wire::error::XacppError;
+use crate::wire::events::XacppActivityEvent;
+use crate::wire::message::{XacppRequest, XacppResponse};
 
 // ---- Request Callback Types ----
 
@@ -48,6 +48,14 @@ pub trait XacppSessionHandler: Send + Sync {
 
     /// Handles Event.
     async fn on_event(&self, event: XacppActivityEvent) -> Result<XacppResponse, XacppError>;
+
+    /// Whether this handler is a loaded fetch responder (SPEC §8.2
+    /// `fetch_unavailable` gate). Defaults to `false`: the peer then answers
+    /// fetch-family commands with `fetch_unavailable` loudly, without
+    /// calling into the consumer.
+    fn is_fetch_responder(&self) -> bool {
+        false
+    }
 }
 
 // ---- Negotiate Handler ----

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::xacpp_event::XacppEvent;
-use crate::activity_ref::ActivityRef;
+use crate::wire::activity_ref::ActivityRef;
 
 /// Activity-scoped event envelope.
 ///

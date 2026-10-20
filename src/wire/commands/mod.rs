@@ -9,8 +9,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::activity_ref::ActivityRef;
-use crate::capability::Capabilities;
+use crate::wire::activity_ref::ActivityRef;
+use crate::wire::capability::Capabilities;
 
 pub mod lifecycle;
 
@@ -36,6 +36,33 @@ pub enum XacppCommand {
 
     /// Confirm establishment after challenge verification.
     EstablishConfirm,
+
+    /// Fetch a resource by uri (symmetric pull channel, SPEC §8). The
+    /// provider (a consumer `SessionHandler.on_command` implementation)
+    /// answers `FetchReady` and streams the bytes as a `DATA_BINARY`
+    /// transaction. Protocol layer carries the command only — resource
+    /// policy and serving are the extension layer's business.
+    Fetch { uri: String },
+
+    /// Begin (or restart) transmission of the named resource transaction
+    /// (SPEC §8.3). Addressed to the transaction holder; the holder pulls
+    /// the stream up and answers success, or one of the fetch error codes.
+    FetchBegin { txid: String },
+
+    /// Flow-control request: the holder suspends transmission of the named
+    /// transaction (SPEC §8.3). A holder without pause support answers
+    /// `fetch_refused`.
+    FetchPause { txid: String },
+
+    /// Flow-control request: the holder continues transmission of the named
+    /// transaction (SPEC §8.3). A holder without resume support answers
+    /// `fetch_refused`.
+    FetchResume { txid: String },
+
+    /// Stop and release the named fetch transaction (SPEC §8.3). Addressed
+    /// to the transaction holder; idempotent on its side (completed or
+    /// unknown txid answers success).
+    FetchAbort { txid: String },
 
     // ---- Business command (handled by SessionHandler) ----
     /// Generic business command.
@@ -83,8 +110,27 @@ impl XacppCommand {
             XacppCommand::Negotiate { .. } => "negotiate",
             XacppCommand::Establish { .. } => "establish",
             XacppCommand::EstablishConfirm => "establish_confirm",
+            XacppCommand::Fetch { .. } => "fetch",
+            XacppCommand::FetchBegin { .. } => "fetch_begin",
+            XacppCommand::FetchPause { .. } => "fetch_pause",
+            XacppCommand::FetchResume { .. } => "fetch_resume",
+            XacppCommand::FetchAbort { .. } => "fetch_abort",
             XacppCommand::Generic { name, .. } => name,
         }
+    }
+
+    /// Whether the command belongs to the fetch family (SPEC §8): the five
+    /// protocol fetch commands, gated by the library when no fetch
+    /// responder is loaded (SPEC §8.2 `fetch_unavailable`).
+    pub fn is_fetch_family(&self) -> bool {
+        matches!(
+            self,
+            XacppCommand::Fetch { .. }
+                | XacppCommand::FetchBegin { .. }
+                | XacppCommand::FetchPause { .. }
+                | XacppCommand::FetchResume { .. }
+                | XacppCommand::FetchAbort { .. }
+        )
     }
 }
 

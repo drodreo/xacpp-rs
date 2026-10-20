@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// The effective event capability is the intersection of local `produce_events`
 /// and remote `accept_events`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Capabilities {
     /// JSON Schemas for commands this side can handle.

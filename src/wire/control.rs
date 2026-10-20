@@ -19,7 +19,7 @@
 //! Two directions never share a frame type — dispatch on `frame_type`,
 //! never on payload shape.
 
-use crate::frame::{FrameType, MAX_CONTROL_FRAME_LEN};
+use crate::wire::frame::{FrameType, MAX_CONTROL_FRAME_LEN};
 
 /// Control payload byte cap (§4 control-frame limit; identical bound).
 pub const CONTROL_PAYLOAD_CAP: usize = MAX_CONTROL_FRAME_LEN;
@@ -96,11 +96,15 @@ impl ResumeRequestPayload {
     pub const FRAME_TYPE: FrameType = FrameType::Resume;
 }
 
-/// RESUME request payload — receiver declares progress so the copy holder
-/// can answer per entry and retransmit missing frames.
+/// RESUME request payload — the holder declares its pending sends on
+/// wire-up so the receiver can adjudicate each entry (recovery
+/// discipline, SPEC §5).
 ///
-/// Wire layout: `u8 count (0..=255; 0 = nothing to resume)` + `count` ×
-/// 24-byte [`AckEntry`] (ACK entry shape per SPEC §5).
+/// Wire layout: `u8 count (0..=255)` + `count` ×
+/// 24-byte [`AckEntry`] (ACK entry shape per SPEC §5; the progress fields
+/// carry the holder's written progress — informational only, adjudication
+/// is by transaction id alone). A holder with nothing pending sends no
+/// frame at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeRequestPayload {
     /// Progress entries (0..=255).
@@ -154,7 +158,8 @@ impl ResumeResponsePayload {
     pub const FRAME_TYPE: FrameType = FrameType::ResumeResponse;
 }
 
-/// RESUME response payload — holder answers per request entry.
+/// RESUME response payload — the receiver's per-entry verdict on the
+/// holder's declaration (`resumed` = the resume instruction).
 ///
 /// Wire layout: `u8 count (0..=255)` + `count` × [`ResumeStatusEntry`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +173,61 @@ impl HeartbeatPayload {
     pub const FRAME_TYPE: FrameType = FrameType::Heartbeat;
 }
 
+impl TransactionPausePayload {
+    /// Wire frame type for this payload (payload ↔ frame type pairing).
+    pub const FRAME_TYPE: FrameType = FrameType::TransactionPause;
+}
+
+/// TRANSACTION_PAUSE payload — the holder has paused transmission of the
+/// named transaction (new frames and retransmission of it both suspended;
+/// SPEC §5).
+///
+/// Wire layout: `u8[16] transaction_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionPausePayload {
+    /// UUID of the paused transaction.
+    pub transaction_id: [u8; 16],
+}
+
+impl TransactionAbortPayload {
+    /// Wire frame type for this payload (payload ↔ frame type pairing).
+    pub const FRAME_TYPE: FrameType = FrameType::TransactionAbort;
+}
+
+impl TransactionCompletedPayload {
+    /// Wire frame type for this payload (payload ↔ frame type pairing).
+    pub const FRAME_TYPE: FrameType = FrameType::TransactionCompleted;
+}
+
+/// TRANSACTION_COMPLETED payload — the holder has closed the named
+/// transaction: every declared byte has been sent (SPEC §5).
+///
+/// The receiver uses it to tell "the sender is done" from "the bytes are
+/// still missing": a receiver whose byte count falls short of the declared
+/// total ends the stream explicitly (`Incomplete`) instead of waiting for
+/// bytes that will never arrive. The frame is **not** mandatory — a
+/// receiver that sees the bytes add up completes the transaction without
+/// it (older peers never send it).
+///
+/// Wire layout: `u8[16] transaction_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionCompletedPayload {
+    /// UUID of the completed transaction.
+    pub transaction_id: [u8; 16],
+}
+
+/// TRANSACTION_ABORT payload — the holder has abandoned the named
+/// transaction and released its retained copy; the receiver discards all
+/// received frames of it (SPEC §5). An aborted transaction id MUST NOT be
+/// reused on the connection.
+///
+/// Wire layout: `u8[16] transaction_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionAbortPayload {
+    /// UUID of the abandoned transaction.
+    pub transaction_id: [u8; 16],
+}
+
 /// HEARTBEAT payload — unidirectional liveness probe (no echo).
 ///
 /// Wire layout: `u32 monotonic_seq + u64 sender_epoch_ms` (12 bytes).
@@ -177,6 +237,66 @@ pub struct HeartbeatPayload {
     pub monotonic_seq: u32,
     /// Sender wall-clock epoch milliseconds.
     pub sender_epoch_ms: u64,
+}
+
+impl TransactionPausePayload {
+    /// Encode (16 bytes).
+    pub fn encode(&self) -> Result<Vec<u8>, ControlError> {
+        finish(self.transaction_id.to_vec())
+    }
+
+    /// Decode; rejects payloads that are not exactly 16 bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ControlError> {
+        if bytes.len() != 16 {
+            return Err(ControlError::LengthMismatch {
+                expected: 16,
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self {
+            transaction_id: fixed_field(bytes)?,
+        })
+    }
+}
+
+impl TransactionAbortPayload {
+    /// Encode (16 bytes).
+    pub fn encode(&self) -> Result<Vec<u8>, ControlError> {
+        finish(self.transaction_id.to_vec())
+    }
+
+    /// Decode; rejects payloads that are not exactly 16 bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ControlError> {
+        if bytes.len() != 16 {
+            return Err(ControlError::LengthMismatch {
+                expected: 16,
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self {
+            transaction_id: fixed_field(bytes)?,
+        })
+    }
+}
+
+impl TransactionCompletedPayload {
+    /// Encode (16 bytes).
+    pub fn encode(&self) -> Result<Vec<u8>, ControlError> {
+        finish(self.transaction_id.to_vec())
+    }
+
+    /// Decode; rejects payloads that are not exactly 16 bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ControlError> {
+        if bytes.len() != 16 {
+            return Err(ControlError::LengthMismatch {
+                expected: 16,
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self {
+            transaction_id: fixed_field(bytes)?,
+        })
+    }
 }
 
 impl ErrorPayload {
@@ -262,6 +382,18 @@ fn finish(out: Vec<u8>) -> Result<Vec<u8>, ControlError> {
     Ok(out)
 }
 
+/// Reads a fixed-width field out of a payload slice.
+///
+/// The callers validate the payload length before slicing, so the width
+/// always matches — this helper exists so a future layout change surfaces
+/// as a [`ControlError::LengthMismatch`] instead of a panic.
+fn fixed_field<const N: usize>(bytes: &[u8]) -> Result<[u8; N], ControlError> {
+    bytes.try_into().map_err(|_| ControlError::LengthMismatch {
+        expected: N,
+        actual: bytes.len(),
+    })
+}
+
 /// Entry-count range check used by both encode (Vec length) and decode
 /// (wire count byte).
 fn check_count(count: usize, min: usize, max: usize) -> Result<(), ControlError> {
@@ -300,7 +432,7 @@ impl AckPayload {
             });
         }
         Ok(Self {
-            entries: read_ack_entries(rest, count),
+            entries: read_ack_entries(rest, count)?,
         })
     }
 }
@@ -316,16 +448,16 @@ fn write_ack_entries(out: &mut Vec<u8>, entries: &[AckEntry]) {
 
 /// Parse exactly `count` × 24-byte ACK entries from `bytes`
 /// (`bytes.len() == count * ACK_ENTRY_LEN`, caller-checked).
-fn read_ack_entries(bytes: &[u8], count: usize) -> Vec<AckEntry> {
+fn read_ack_entries(bytes: &[u8], count: usize) -> Result<Vec<AckEntry>, ControlError> {
     bytes
         .chunks_exact(ACK_ENTRY_LEN)
         .take(count)
-        .map(|chunk| AckEntry {
-            transaction_id: chunk[0..16].try_into().expect("16-byte slice"),
-            highest_contiguous_seq: u32::from_be_bytes(
-                chunk[16..20].try_into().expect("4-byte slice"),
-            ),
-            received_frames: u32::from_be_bytes(chunk[20..24].try_into().expect("4-byte slice")),
+        .map(|chunk| {
+            Ok(AckEntry {
+                transaction_id: fixed_field(&chunk[0..16])?,
+                highest_contiguous_seq: u32::from_be_bytes(fixed_field(&chunk[16..20])?),
+                received_frames: u32::from_be_bytes(fixed_field(&chunk[20..24])?),
+            })
         })
         .collect()
 }
@@ -372,7 +504,7 @@ impl NackPayload {
                 });
             }
             let mut entry = NackEntry {
-                transaction_id: rest[0..16].try_into().expect("16-byte slice"),
+                transaction_id: fixed_field(&rest[0..16])?,
                 missing_seqs: Vec::new(),
             };
             let missing_count = u16::from_be_bytes([rest[16], rest[17]]) as usize;
@@ -386,8 +518,8 @@ impl NackPayload {
             }
             entry.missing_seqs = rest[..expected]
                 .chunks_exact(4)
-                .map(|c| u32::from_be_bytes(c.try_into().expect("4-byte slice")))
-                .collect();
+                .map(|c| fixed_field(c).map(u32::from_be_bytes))
+                .collect::<Result<Vec<u32>, ControlError>>()?;
             rest = &rest[expected..];
             entries.push(entry);
         }
@@ -429,7 +561,7 @@ impl ResumeRequestPayload {
             });
         }
         Ok(Self {
-            entries: read_ack_entries(rest, count),
+            entries: read_ack_entries(rest, count)?,
         })
     }
 }
@@ -467,7 +599,7 @@ impl ResumeResponsePayload {
         let mut entries = Vec::with_capacity(count);
         for chunk in rest.chunks_exact(RESUME_STATUS_ENTRY_LEN) {
             entries.push(ResumeStatusEntry {
-                transaction_id: chunk[0..16].try_into().expect("16-byte slice"),
+                transaction_id: fixed_field(&chunk[0..16])?,
                 status: ResumeStatus::from_u8(chunk[16])?,
             });
         }
@@ -492,8 +624,8 @@ impl HeartbeatPayload {
             });
         }
         Ok(Self {
-            monotonic_seq: u32::from_be_bytes(bytes[0..4].try_into().expect("4-byte slice")),
-            sender_epoch_ms: u64::from_be_bytes(bytes[4..12].try_into().expect("8-byte slice")),
+            monotonic_seq: u32::from_be_bytes(fixed_field(&bytes[0..4])?),
+            sender_epoch_ms: u64::from_be_bytes(fixed_field(&bytes[4..12])?),
         })
     }
 }

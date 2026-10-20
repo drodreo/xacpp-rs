@@ -1,3 +1,6 @@
+//! Session layer: logical sessions, peer lifecycle orchestration, session
+//! egress scheduling, and consumer-facing handler traits.
+
 //! XACPP logical session.
 //!
 //! Created via `XacppPeer::establish` on the initiator side; on the responder
@@ -19,20 +22,25 @@
 //! inbound binary/control frames into the session through the narrow
 //! `TransferWiring` hook surface. Breakpoint resume across reconnections is
 //! the natural consequence: wire the same session into the new transport
-//! and the RESUME handshake declares its incomplete receive transactions to
-//! the peer at wire time.
+//! and the recovery handshake runs at wire time (the holder declares its
+//! pending sends; the receiver adjudicates per transaction).
+
+pub mod egress;
+pub mod handler;
+pub mod peer;
 
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use crate::commands::XacppCommand;
-use crate::error::XacppError;
-use crate::events::XacppActivityEvent;
-use crate::message::{XacppRequest, XacppResponse};
-use crate::transport::{
-    BinaryHandler, CompletionCallback, TransferConfig, TransferSession, XacppTransport,
-};
+use crate::carrier::XacppTransport;
+use crate::reliability::stream::{BinaryMeta, BinarySink, StreamHandler};
+use crate::transfer::{BinaryHandler, CompletionCallback, TransferConfig, TransferSession};
+use crate::wire::commands::XacppCommand;
+use crate::wire::error::XacppError;
+use crate::wire::events::XacppActivityEvent;
+use crate::wire::fetch::FetchReadyMeta;
+use crate::wire::message::{XacppRequest, XacppResponse};
 
 /// XACPP logical session.
 ///
@@ -44,11 +52,11 @@ pub struct XacppSession {
     transfer: TransferSession,
     /// Session identifier. Empty until the identity is set (initiator:
     /// backfilled by `XacppPeer::establish` from the handshake response;
-    /// responder: set by the consumer inside `on_establish`). Plain lock:
+    /// responder: set by the consumer inside `on_establish`). Lock:
     /// identity is written once during construction / handshake.
-    session_id: std::sync::RwLock<String>,
+    session_id: tokio::sync::RwLock<String>,
     /// Credentials issued by the responder (same lifecycle as `session_id`).
-    credentials: std::sync::RwLock<String>,
+    credentials: tokio::sync::RwLock<String>,
     /// Negotiated emit_events snapshot (initiator: backfilled by the peer
     /// after negotiation; responder: optional, consumer-injected). Empty
     /// disables event-name validation.
@@ -66,8 +74,8 @@ impl XacppSession {
     pub fn new(config: Option<TransferConfig>) -> Self {
         Self {
             transfer: TransferSession::new(config.unwrap_or_default()),
-            session_id: std::sync::RwLock::new(String::new()),
-            credentials: std::sync::RwLock::new(String::new()),
+            session_id: tokio::sync::RwLock::new(String::new()),
+            credentials: tokio::sync::RwLock::new(String::new()),
             emit_events: RwLock::new(Vec::new()),
             transport: RwLock::new(None),
         }
@@ -76,9 +84,9 @@ impl XacppSession {
     /// Sets the session identity (session_id + credentials). Used by the
     /// responder side inside `on_establish`, where the consumer generates
     /// both before wiring.
-    pub fn with_identity(self, session_id: String, credentials: String) -> Self {
-        *self.session_id.write().expect("poisoned session_id lock") = session_id;
-        *self.credentials.write().expect("poisoned credentials lock") = credentials;
+    pub async fn with_identity(self, session_id: String, credentials: String) -> Self {
+        *self.session_id.write().await = session_id;
+        *self.credentials.write().await = credentials;
         self
     }
 
@@ -93,7 +101,11 @@ impl XacppSession {
     /// Wires the session to a **live** transport for the connection's
     /// lifetime: the session's transfer clock starts (self-driven) and the
     /// transport routes inbound binary/control frames into this session;
-    /// the RESUME handshake for incomplete receives runs at wire time.
+    /// the recovery handshake (RESUME declaration / adjudication) runs at
+    /// wire time.
+    /// Surviving streams stalled by the previous disconnect return to their
+    /// flow state (Active/Paused) and the same objects keep
+    /// producing/consuming — docs/streams.md ("session 不死，流不灭").
     ///
     /// Any previous wiring (e.g. the dead connection's transport after a
     /// reconnect) is detached first: the mount is idempotent-replacing.
@@ -108,28 +120,61 @@ impl XacppSession {
     }
 
     /// Detaches the session from its transport (clock stopped, inbound
-    /// routing disabled). Transaction state stays with the session.
+    /// routing disabled, receive-side streams stalled — alive, not closed).
+    /// Transaction state stays with the session; streams cancel only when
+    /// the session itself is dropped.
     pub async fn unwire(&self) {
         self.transfer.unwire().await;
         *self.transport.write().await = None;
     }
 
+    /// Ensures the transfer mount is attached to the given transport
+    /// (idempotent no-op while attached). Used by the peer when an
+    /// establish re-binds this session — `connect` performs the initial
+    /// mount.
+    ///
+    /// The transfer mount (binary frames, control frames, the session
+    /// clock) is a separate concern from the envelope mount (the
+    /// command/event path): this touches the transfer side only, the
+    /// session's envelope identity and its transport field stay as they
+    /// are.
+    pub(crate) async fn attach_transfer(
+        &self,
+        transport: Arc<dyn XacppTransport>,
+    ) -> Result<(), XacppError> {
+        if self.transfer.is_wired().await {
+            return Ok(());
+        }
+        self.transfer.wire(transport).await
+    }
+
+    /// Detaches ONLY the transfer mount (clock stopped, single-slot
+    /// handler registration released): the envelope identity stays
+    /// wired — the envelope channel routes by `session_id`. Used by the
+    /// peer when an establish yields a different session identity on
+    /// this connection: an orphaned transfer clock would never see
+    /// inbound activity again and its silence timer would tear the
+    /// shared connection down.
+    pub(crate) async fn detach_transfer(&self) {
+        self.transfer.unwire().await;
+    }
+
+    /// Whether the transfer mount is currently attached to a transport.
+    #[doc(hidden)]
+    pub async fn transfer_wired(&self) -> bool {
+        self.transfer.is_wired().await
+    }
+
     /// Session identifier.
-    pub fn session_id(&self) -> String {
-        self.session_id
-            .read()
-            .expect("poisoned session_id lock")
-            .clone()
+    pub async fn session_id(&self) -> String {
+        self.session_id.read().await.clone()
     }
 
     /// Credentials issued by the responder.
     ///
     /// Caller can save them and pass them in during next `establish`.
-    pub fn credentials(&self) -> String {
-        self.credentials
-            .read()
-            .expect("poisoned credentials lock")
-            .clone()
+    pub async fn credentials(&self) -> String {
+        self.credentials.read().await.clone()
     }
 
     /// Sends a command and waits for a response.
@@ -139,7 +184,10 @@ impl XacppSession {
     ) -> Result<XacppResponse, XacppError> {
         let transport = self.transport().await?;
         transport
-            .send(Some(&self.session_id()), XacppRequest::Command(command))
+            .send(
+                Some(&self.session_id().await),
+                XacppRequest::Command(command),
+            )
             .await
     }
 
@@ -154,7 +202,7 @@ impl XacppSession {
         self.validate_event(&event).await?;
         let transport = self.transport().await?;
         transport
-            .send(Some(&self.session_id()), XacppRequest::Event(event))
+            .send(Some(&self.session_id().await), XacppRequest::Event(event))
             .await
     }
 
@@ -167,7 +215,7 @@ impl XacppSession {
         self.validate_event(&event).await?;
         let transport = self.transport().await?;
         transport
-            .send_faf(Some(&self.session_id()), XacppRequest::Event(event))
+            .send_faf(Some(&self.session_id().await), XacppRequest::Event(event))
             .await
     }
 
@@ -181,7 +229,8 @@ impl XacppSession {
     /// exactly once when the transaction reaches a terminal state, with a
     /// [`BinarySendResult`]: `confirmed: true` once the final ACK releases
     /// the copy, `confirmed: false` when the copy is released without
-    /// confirmation (RESUME rejected by the holder, or retention expiry).
+    /// confirmation (the receiver's resume verdict failed the transaction
+    /// after a reconnect, or caller abort).
     ///
     /// Backpressure (§5): when the unacknowledged-bytes cap is reached this
     /// returns `Err(XacppError::Application { code: "backpressure_stall",
@@ -193,21 +242,68 @@ impl XacppSession {
         on_complete: Option<CompletionCallback>,
     ) -> Result<[u8; 16], XacppError> {
         let transport = self.transport().await?;
-        crate::transport::transfer::send_binary(
-            &self.transfer,
-            transport.as_ref(),
-            payload,
-            on_complete,
-        )
-        .await
+        crate::transfer::send_binary(&self.transfer, transport.as_ref(), payload, on_complete).await
+    }
+
+    /// Opens a streaming send transaction (docs/streams.md): declare the
+    /// total length, then write chunks through the returned [`BinarySink`]
+    /// — writes park while the backpressure cap is reached (recovery is
+    /// automatic as ACKs release per-frame copies) and while the sink is
+    /// paused; `finish()` waits for the final ACK; `pause()`/`resume()`/
+    /// `abort()` map to the SPEC §5 transaction control frames.
+    ///
+    /// `txid`: `None` = library-generated. A caller-supplied id must be
+    /// unique among in-flight transactions and must not have been aborted
+    /// earlier (SPEC §8.2: the fetch responder passes the id it announced
+    /// in `fetch_ready`).
+    pub async fn open_binary_sink(
+        &self,
+        meta: BinaryMeta,
+        txid: Option<[u8; 16]>,
+    ) -> Result<BinarySink, XacppError> {
+        crate::transfer::open_binary_sink(&self.transfer, meta, txid).await
     }
 
     /// Register the delivery callback for fully reassembled binary
     /// transactions (single handler; a later registration replaces the
     /// earlier one). Transactions completed while no handler was registered
     /// are retained and delivered exactly once once a handler is present.
-    pub fn on_binary(&self, handler: BinaryHandler) {
-        self.transfer.on_binary(handler);
+    pub async fn on_binary(&self, handler: BinaryHandler) {
+        self.transfer.on_binary(handler).await;
+    }
+
+    /// Register the receive-side stream handler (docs/streams.md): the
+    /// first frame of each new transaction opens a
+    /// [`crate::transport::BinaryStream`]; chunks flow in `seq` order and
+    /// the stream ends on completion, holder abort (TRANSACTION_ABORT), or
+    /// connection death. Meta (`txid` / `total_len`) is readable on the
+    /// first frame — the fetch requester claims its stream by matching the
+    /// `fetch_ready` txid (SPEC §8).
+    ///
+    /// While a stream handler is registered, new transactions belong to the
+    /// stream surface; `on_binary` keeps receiving only transactions that
+    /// completed before registration (or sessions without stream
+    /// registration).
+    pub async fn on_binary_stream(&self, handler: StreamHandler) {
+        self.transfer.on_binary_stream(handler).await;
+    }
+
+    /// Fetch a resource's metadata from the peer (SPEC §8 kernel shell):
+    /// sends the `fetch` command and returns the `fetch_ready` metadata —
+    /// the bytes follow as a `DATA_BINARY` transaction the consumer claims
+    /// via `on_binary_stream` by matching the returned txid. The kernel
+    /// carries no bytes and keeps no state: buffering, integrity
+    /// verification, and progress are application-layer concerns (§8.6).
+    ///
+    /// Responder-side errors surface through the generic error channel
+    /// (e.g. `fetch_not_found` / `fetch_refused` / `fetch_unavailable`).
+    pub async fn fetch(&self, uri: &str) -> Result<FetchReadyMeta, XacppError> {
+        let response = self
+            .request_command(XacppCommand::Fetch {
+                uri: uri.to_string(),
+            })
+            .await?;
+        crate::wire::fetch::response_to_meta(response)
     }
 
     /// Subscribe to the underlying connection's close notification.
@@ -229,8 +325,7 @@ impl XacppSession {
             .ok_or(XacppError::NotConnected)
     }
 
-    /// Event-name validation against the negotiated emit_events snapshot
-    /// (empty snapshot disables validation).
+    /// Validates an outbound event name against the negotiated snapshot.
     async fn validate_event(&self, event: &XacppActivityEvent) -> Result<(), XacppError> {
         let emit_events = self.emit_events.read().await.clone();
         if !emit_events.is_empty() && !emit_events.contains(&event.event.name) {
@@ -250,8 +345,8 @@ impl XacppSession {
         credentials: String,
         emit_events: Vec<String>,
     ) {
-        *self.session_id.write().expect("poisoned session_id lock") = session_id;
-        *self.credentials.write().expect("poisoned credentials lock") = credentials;
+        *self.session_id.write().await = session_id;
+        *self.credentials.write().await = credentials;
         *self.emit_events.write().await = emit_events;
     }
 }

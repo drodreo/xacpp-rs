@@ -26,8 +26,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::events::content::ContentPart;
-use crate::events::payload::{ActivityInfo, ActivityMode};
+use crate::wire::events::content::ContentPart;
+use crate::wire::events::payload::{ActivityInfo, ActivityMode};
 
 // ---- Request payloads (command arguments) ----
 
@@ -142,9 +142,9 @@ pub struct AvailableActivities {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::XacppCommand;
-    use crate::events::content::TextPart;
-    use crate::events::payload::ToolResultEvent;
+    use crate::wire::commands::XacppCommand;
+    use crate::wire::events::content::TextPart;
+    use crate::wire::events::payload::ToolResultEvent;
 
     #[test]
     fn test_new_activity_payload_serialization() {
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn test_activity_not_found_response_anchor() {
-        let resp = crate::message::XacppResponse::activity_not_found();
+        let resp = crate::wire::message::XacppResponse::activity_not_found();
         let s = serde_json::to_string(&resp).unwrap();
         assert_eq!(
             s,
@@ -394,9 +394,9 @@ mod tests {
     #[test]
     fn test_activity_ready_response_roundtrip() {
         let wire = r#"{"kind":"generic","name":"activity_ready","data":{"activity":"act-1","agent":"main","title":"research"}}"#;
-        let resp: crate::message::XacppResponse = serde_json::from_str(wire).unwrap();
+        let resp: crate::wire::message::XacppResponse = serde_json::from_str(wire).unwrap();
         match resp {
-            crate::message::XacppResponse::Generic { name, data } => {
+            crate::wire::message::XacppResponse::Generic { name, data } => {
                 assert_eq!(name, "activity_ready");
                 let info: ActivityInfo = serde_json::from_value(data).unwrap();
                 assert_eq!(info.activity, "act-1");

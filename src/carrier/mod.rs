@@ -1,64 +1,15 @@
-//! XACPP Transport Abstraction.
-//!
-//! ## Scope of Responsibilities
-//!
-//! Transport unifies underlying communication channels (stdio / TCP / WebSocket) into `send` semantics:
-//!
-//! - **send**: Send request payload, wait for response payload. Caller can spawn to background if not interested in response.
-//! - **send_faf**: Send request payload fire-and-forget — returns as soon as the frame is queued, never waits for the response.
-//! - **accept**: Listen for peer requests, distribute via registered `on_request` callback,
-//!   callback receives session_id + payload, return value is automatically sent back as response.
-//!
-//! Transport internally handles:
-//!
-//! - **Ordered egress**: all outbound frames (requests, events, responses) go through a single
-//!   FIFO egress queue — one drain task per connection owns the write half and writes frames
-//!   in submission order (see `egress` module)
-//! - **Envelope assembly/disassembly**: Auto-assign request id, pack into envelope for sending, unpack envelope to return payload
-//! - **Request-response correlation**: Match incoming Response to pending send via id
-//! - **Encoding/decoding**: Serialize envelopes to JSON and carry them as
-//!   `DATA_JSON` binary frames (see [`encode_data_json_frame`] and the
-//!   `frame` module; SPEC §3/§4)
-//! - **Connection management**: Establish / disconnect underlying communication channel
-//! - **Wiring surface**: transports expose the narrow [`TransferWiring`]
-//!   surface (write control/data frames, register inbound hooks) to a wired
-//!   [`TransferSession`] (see `XacppSession::wire`) — the session
-//!   self-drives its clock, RESUME handshakes, and inbound routing
-//!
-//! ## Layer Boundary
-//!
-//! - **Transport upward**: Expose `send` / `send_faf` / `on_request`,
-//!   do not expose raw byte send/receive, envelope id, or encoding/decoding details
-//! - **Peer upward**: Expose typed `request_command` / `request_event` / `send_event`
-//!   and session routing mechanism
-//!
-//! ## accept Semantics
-//!
-//! Transport listens for peer input, delivers (session_id, payload) to registered callback.
-//! Handler returns `Ok(response payload)` or `Err(XacppError)`, Transport always constructs response envelope to send back.
-//!
-//! ## Error Semantics Convention
-//!
-//! **Connection-type `Err` = connection unavailable**. All fault tolerance logic is encapsulated within Transport implementation.
-//! Upper layer only needs one rule: connection-type `Err` from method means connection abnormal.
+//! Carrier layer: byte-pipe transport implementations (stdio / TCP socket)
+//! and the `XacppTransport` connection abstraction.
 
-pub(crate) mod egress;
 pub mod socket;
 pub mod stdio;
-pub mod transfer;
-
-pub use transfer::{
-    BinaryHandler, BinarySendResult, CompletionCallback, TransferActivityHandlers, TransferConfig,
-    TransferSession, TransferWiring,
-};
 
 use async_trait::async_trait;
 
-use crate::error::XacppError;
-use crate::message::{XacppRequest, XacppResponse};
-
-// Re-export: RequestHandler is defined in handler module, transport submodules reference via super::
-pub use crate::handler::RequestHandler;
+use crate::session::handler::RequestHandler;
+use crate::transfer::TransferWiring;
+use crate::wire::error::XacppError;
+use crate::wire::message::{XacppRequest, XacppResponse};
 
 /// Encode a serialized envelope payload as a single-frame `DATA_JSON`
 /// transaction on the binary wire (SPEC §3/§4).
@@ -74,8 +25,8 @@ pub use crate::handler::RequestHandler;
 /// multiple transactions by the message layer, which is out of scope until
 /// the transfer (multi-frame reassembly) batch.
 pub(crate) fn encode_data_json_frame(payload: &[u8]) -> Result<Vec<u8>, XacppError> {
-    let frame = crate::frame::Frame::new(
-        crate::frame::FrameType::DataJson,
+    let frame = crate::wire::frame::Frame::new(
+        crate::wire::frame::FrameType::DataJson,
         uuid::Uuid::new_v4().into_bytes(),
         // Cast is lossless: encode() below rejects anything over the 1 MiB
         // `DATA_JSON` limit, far below u32::MAX.

@@ -16,9 +16,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::capability::Capabilities;
-use crate::commands::XacppCommand;
-use crate::events::activity_event::XacppActivityEvent;
+use crate::wire::capability::Capabilities;
+use crate::wire::commands::XacppCommand;
+use crate::wire::events::activity_event::XacppActivityEvent;
 
 // ---- Payload Types ----
 
@@ -56,6 +56,16 @@ pub enum XacppResponse {
 
     /// Handshake rejected.
     EstablishReject { reason: String },
+
+    /// Fetch accepted: the resource bytes follow as a `DATA_BINARY`
+    /// transaction with this transaction id. `sha256`/`sizeBytes` are
+    /// computed by the responder from the bytes it sends (SPEC §8.2).
+    FetchReady {
+        txid: String,
+        sha256: String,
+        size_bytes: u64,
+        mime: String,
+    },
 
     // ---- Business response (SessionHandler layer) ----
     /// Generic business response.

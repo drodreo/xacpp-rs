@@ -21,10 +21,12 @@ use crc32fast::Hasher;
 /// Frame magic: ASCII `XACP`.
 pub const MAGIC: [u8; 4] = *b"XACP";
 
-/// Wire protocol major version. Mismatch ⇒ connection refused (SPEC §8).
+/// Wire protocol major version. Mismatch ⇒ connection refused (SPEC §9).
 pub const VERSION_MAJOR: u8 = 1;
-/// Wire protocol minor version (backward-compatible extensions).
-pub const VERSION_MINOR: u8 = 0;
+/// Wire protocol minor version (backward-compatible extensions). Advances
+/// with the library minor version (SPEC §9); fetch (1.1) is an envelope-level
+/// extension — frame format unchanged.
+pub const VERSION_MINOR: u8 = 1;
 
 /// Fixed header size in bytes (§3).
 pub const HEADER_LEN: usize = 36;
@@ -69,6 +71,19 @@ pub enum FrameType {
     Heartbeat,
     /// Protocol-level error.
     Error,
+    /// Holder → receiver: transmission of the named transaction is paused
+    /// (SPEC §5 pause/abort).
+    TransactionPause,
+    /// Holder → receiver: the named transaction is abandoned and its
+    /// retained copy released (SPEC §5 pause/abort).
+    TransactionAbort,
+    /// Holder → receiver: the named transaction is closed — every
+    /// declared byte has been sent. A receiver whose byte count still
+    /// falls short of the declared total ends the stream explicitly as
+    /// `Incomplete` instead of waiting for bytes that will never come.
+    /// Not mandatory: a receiver that sees the bytes add up completes the
+    /// transaction without this frame.
+    TransactionCompleted,
     /// Reserved for runtime session-security upgrade.
     SecurityUpgrade,
     /// Message-semantics layer JSON payload.
@@ -90,6 +105,9 @@ impl FrameType {
             Self::ResumeResponse => 0x0008,
             Self::Heartbeat => 0x0005,
             Self::Error => 0x0006,
+            Self::TransactionPause => 0x0009,
+            Self::TransactionAbort => 0x000A,
+            Self::TransactionCompleted => 0x000B,
             Self::SecurityUpgrade => 0x0007,
             Self::DataJson => 0x1001,
             Self::DataBinary => 0x1002,
@@ -98,7 +116,7 @@ impl FrameType {
     }
 
     /// Classify a wire u16 value; unrecognized values yield
-    /// [`FrameType::Unknown`] (tolerated and ignorable per SPEC §8).
+    /// [`FrameType::Unknown`] (tolerated and ignorable per SPEC §9).
     pub fn from_u16(v: u16) -> Self {
         match v {
             0x0001 => Self::Negotiate,
@@ -108,6 +126,9 @@ impl FrameType {
             0x0008 => Self::ResumeResponse,
             0x0005 => Self::Heartbeat,
             0x0006 => Self::Error,
+            0x0009 => Self::TransactionPause,
+            0x000A => Self::TransactionAbort,
+            0x000B => Self::TransactionCompleted,
             0x0007 => Self::SecurityUpgrade,
             0x1001 => Self::DataJson,
             0x1002 => Self::DataBinary,
@@ -127,6 +148,9 @@ impl FrameType {
             | Self::ResumeResponse
             | Self::Heartbeat
             | Self::Error
+            | Self::TransactionPause
+            | Self::TransactionAbort
+            | Self::TransactionCompleted
             | Self::SecurityUpgrade => Some(MAX_CONTROL_FRAME_LEN),
             Self::DataJson => Some(MAX_DATA_JSON_FRAME_LEN),
             Self::DataBinary => Some(MAX_DATA_BINARY_FRAME_LEN),
@@ -236,7 +260,7 @@ fn write_header(
 /// discarded together with the stream state.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FrameError {
-    /// Peer speaks an incompatible frame-format major (SPEC §8: refuse).
+    /// Peer speaks an incompatible frame-format major (SPEC §9: refuse).
     #[error("version major mismatch: got {got}, expected {expected}")]
     VersionMismatch { got: u8, expected: u8 },
     /// Frame size exceeds the per-type limit (§4 protocol error).
@@ -249,6 +273,9 @@ pub enum FrameError {
     /// CRC-32 mismatch over header + payload.
     #[error("crc mismatch: expected {expected:#010x}, got {actual:#010x}")]
     CrcMismatch { expected: u32, actual: u32 },
+    /// A header field could not be read at its declared width.
+    #[error("header field length mismatch: expected {expected} bytes, got {actual}")]
+    FieldLength { expected: usize, actual: usize },
 }
 
 /// Outcome of validating a fully buffered 36-byte header.
@@ -296,7 +323,10 @@ fn check_header(hdr: &[u8]) -> Result<HeaderInfo, FrameError> {
     }
     Ok(HeaderInfo {
         frame_type,
-        transaction_id: hdr[8..24].try_into().expect("16-byte slice"),
+        transaction_id: hdr[8..24].try_into().map_err(|_| FrameError::FieldLength {
+            expected: 16,
+            actual: hdr[8..24].len(),
+        })?,
         total_len: u32::from_be_bytes([hdr[24], hdr[25], hdr[26], hdr[27]]),
         seq: u32::from_be_bytes([hdr[28], hdr[29], hdr[30], hdr[31]]),
         frame_len,

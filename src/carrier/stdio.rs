@@ -1,12 +1,15 @@
-//! Socket Transport Implementation.
+//! Stdio Transport Implementation.
 //!
-//! Communicates via TCP connection using the binary frame wire protocol
-//! (SPEC §3): envelopes are carried as `DATA_JSON` frames.
-//! Key difference from StdioTransport: each inbound request spawns independent task for concurrent handling.
+//! Communicates via stdin/stdout pipe handles using the binary frame wire
+//! protocol (SPEC §3): envelopes are carried as `DATA_JSON` frames.
 //!
 //! All outbound frames (requests, events, responses) go through the single
 //! ordered egress queue (see `super::egress`): one drain task owns the write
 //! half and writes frames FIFO in submission order.
+//!
+//! Log-bypass note: the frame decoder's magic scan silently tolerates
+//! non-frame garbage bytes on this pipe; child process logs are expected
+//! on stderr, not on stdout.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -15,94 +18,70 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock, oneshot, watch};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 
-use super::egress::{self, Egress, PendingSlot};
-use super::transfer::TransferActivityHandlers;
-use super::{RequestHandler, TransferWiring, XacppTransport};
-use crate::error::XacppError;
-use crate::frame::{Frame, FrameDecoder, FrameType};
-use crate::message::{XacppEnvelope, XacppRequest, XacppResponse};
+use super::XacppTransport;
+use crate::session::egress::{self, Egress, PendingSlot};
+use crate::session::handler::RequestHandler;
+use crate::transfer::{TransferActivityHandlers, TransferWiring};
+use crate::wire::error::XacppError;
+use crate::wire::frame::{Frame, FrameDecoder, FrameType};
+use crate::wire::message::{XacppEnvelope, XacppRequest, XacppResponse};
 
-type BoxedWriter = Pin<Box<dyn AsyncWrite + Send>>;
-type BoxedReader = Pin<Box<dyn AsyncBufRead + Send>>;
-
-/// Shared state: accessed via Arc between reader task and inflight handler tasks.
+/// Shared state: accessed via Arc between accept loop and main task.
 struct SharedState {
     request_handler: RwLock<Option<RequestHandler>>,
     pending: egress::PendingMap,
     connected: Arc<AtomicBool>,
-    /// dispatch task handle (including reader_task), aborted on disconnect.
+    /// reader task handle, aborted on disconnect.
     reader_handle: Mutex<Option<JoinHandle<()>>>,
-    /// inflight handler tasks, all aborted on disconnect.
-    inflight: Mutex<JoinSet<()>>,
+    /// accept_loop task handle, aborted on disconnect.
+    accept_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// Socket Transport Implementation.
-pub struct SocketTransport {
-    /// Write half parked before connect (server mode: split at construction).
-    parked_writer: Mutex<Option<BoxedWriter>>,
-    reader: Mutex<Option<BoxedReader>>,
+/// Stdio Transport Implementation.
+pub struct StdioTransport {
+    /// Write half parked before connect.
+    parked_writer: Mutex<Option<Pin<Box<dyn AsyncWrite + Send>>>>,
+    reader: Mutex<Option<Pin<Box<dyn AsyncBufRead + Send>>>>,
     /// Ordered egress entry (present after connect). Plain std lock: the
     /// narrow wiring methods (`write_control_frame` / `write_data_frame`)
     /// are sync signatures, and the critical section is a clone.
-    egress: std::sync::Mutex<Option<Egress>>,
+    egress: tokio::sync::Mutex<Option<Egress>>,
     /// Connection-close broadcast (see `XacppTransport::closed`).
     closed_tx: watch::Sender<bool>,
     shared: Arc<SharedState>,
     next_id: Arc<AtomicU64>,
-    /// Remote address for client mode, used during connect.
-    addr: Option<String>,
     /// Inbound transfer hooks (registered by the wired transfer session
     /// through `TransferWiring::on_transfer_activity`; `None` = unwired —
     /// non-envelope frames are debug-ignored). Shared with the reader task
     /// so a late registration routes inbound frames immediately.
-    transfer_hooks: Arc<std::sync::RwLock<Option<TransferActivityHandlers>>>,
+    transfer_hooks: Arc<tokio::sync::RwLock<Option<TransferActivityHandlers>>>,
     /// Connection operation mutex, ensures connect / disconnect do not execute concurrently.
     connect_lock: Mutex<()>,
 }
 
-impl SocketTransport {
-    /// Create client Transport, initiates TCP connection to specified address on connect.
-    pub fn connect_to(addr: String) -> Self {
-        Self::new_impl(None, Some(addr))
-    }
-
-    /// Create server Transport, using already accepted TcpStream.
-    ///
-    /// On connect, directly uses this stream without initiating TCP connection.
-    pub fn new(stream: TcpStream) -> Self {
-        let (read_half, write_half) = tokio::io::split(stream);
-        let parked = (
-            Box::pin(write_half) as BoxedWriter,
-            Box::pin(tokio::io::BufReader::new(read_half)) as BoxedReader,
-        );
-        Self::new_impl(Some(parked), None)
-    }
-
-    fn new_impl(parked: Option<(BoxedWriter, BoxedReader)>, addr: Option<String>) -> Self {
-        let (parked_writer, reader) = match parked {
-            Some((w, r)) => (Some(w), Some(r)),
-            None => (None, None),
-        };
+impl StdioTransport {
+    pub fn new(
+        writer: Pin<Box<dyn AsyncWrite + Send>>,
+        reader: Pin<Box<dyn AsyncBufRead + Send>>,
+    ) -> Self {
         let (closed_tx, _) = watch::channel(false);
         Self {
-            parked_writer: Mutex::new(parked_writer),
-            reader: Mutex::new(reader),
-            egress: std::sync::Mutex::new(None),
+            parked_writer: Mutex::new(Some(writer)),
+            reader: Mutex::new(Some(reader)),
+            egress: tokio::sync::Mutex::new(None),
             closed_tx,
             shared: Arc::new(SharedState {
                 request_handler: RwLock::new(None),
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 connected: Arc::new(AtomicBool::new(false)),
                 reader_handle: Mutex::new(None),
-                inflight: Mutex::new(JoinSet::new()),
+                accept_handle: Mutex::new(None),
             }),
             next_id: Arc::new(AtomicU64::new(1)),
-            addr,
-            transfer_hooks: Arc::new(std::sync::RwLock::new(None)),
+            transfer_hooks: Arc::new(tokio::sync::RwLock::new(None)),
             connect_lock: Mutex::new(()),
         }
     }
@@ -120,16 +99,19 @@ impl SocketTransport {
     }
 
     /// Clone the ordered egress entry (`Err(NotConnected)` before connect).
-    fn egress(&self) -> Result<Egress, XacppError> {
+    async fn egress(&self) -> Result<Egress, XacppError> {
         self.egress
             .lock()
-            .expect("poisoned egress lock")
+            .await
             .clone()
             .ok_or(XacppError::NotConnected)
     }
 
-    /// Reader task: read frames from TCP connection, parse, dispatch.
-    async fn reader_task(
+    /// Accept loop: read from frame channel, parse, dispatch.
+    ///
+    /// On exit: mark disconnected (subsequent sends fail fast), clear pending,
+    /// shut the egress down.
+    async fn accept_loop(
         mut frame_rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
         egress: Egress,
         shared: Arc<SharedState>,
@@ -144,12 +126,12 @@ impl SocketTransport {
                 Ok(msg) => msg,
                 // Only reachable for a `DATA_JSON` frame whose payload is not
                 // a valid envelope (garbage bytes never get this far — the
-                // frame decoder's magic scan drops them). Peer-side bug: skip.
-                Err(e) => {
+                // frame decoder's magic scan drops them). Peer-side bug:
+                // skip. Child logs belong on stderr.
+                Err(_) => {
                     let text = String::from_utf8_lossy(&data);
-                    log::warn!(
-                        "reader: failed to parse envelope ({} bytes): {e}\n  raw: {text}",
-                        data.len()
+                    log::debug!(
+                        "[xacpp::stdio] skipping DATA_JSON payload with invalid envelope: {text}"
                     );
                     continue;
                 }
@@ -162,58 +144,41 @@ impl SocketTransport {
                     payload,
                 } => {
                     let sid_for_response = session_id.clone();
-                    // Release read lock immediately after cloning Arc
+                    // Release read lock immediately after cloning Arc, avoid holding lock across await
                     let handler = shared.request_handler.read().await.clone();
-                    if let Some(h) = handler {
-                        let egress = egress.clone();
-                        let mut inflight = shared.inflight.lock().await;
-                        inflight.spawn(async move {
-                            let handler_result = h(session_id, payload).await;
-                            let response_payload = match handler_result {
-                                Ok(payload) => payload,
-                                Err(e) => {
-                                    log::error!("handler: error for request {id}: {e}");
-                                    XacppResponse::Error {
-                                        code: e.code().to_owned(),
-                                        message: e.to_string(),
-                                    }
-                                }
-                            };
-                            let response = XacppEnvelope::Response {
-                                id,
-                                session_id: sid_for_response,
-                                payload: response_payload,
-                            };
-                            match Self::serialize_envelope(&response) {
-                                Ok(frame) => {
-                                    if let Err(e) = egress.send_acked(frame).await {
-                                        log::warn!("handler: failed to send response: {e}");
-                                    }
-                                }
-                                Err(e) => {
-                                    log::warn!("handler: failed to serialize response: {e}");
-                                }
-                            }
-                        });
+                    let handler_result: Result<XacppResponse, XacppError> = if let Some(h) = handler
+                    {
+                        h(session_id, payload).await
                     } else {
-                        // No handler, return error response
-                        let response = XacppEnvelope::Response {
-                            id,
-                            session_id: sid_for_response,
-                            payload: XacppResponse::Error {
-                                code: "no_handler".into(),
-                                message: "no handler registered".into(),
-                            },
-                        };
-                        match Self::serialize_envelope(&response) {
-                            Ok(frame) => {
-                                if let Err(e) = egress.send_acked(frame).await {
-                                    log::warn!("reader: failed to send no_handler response: {e}");
-                                }
+                        Err(XacppError::NoHandler)
+                    };
+
+                    let response_payload = match handler_result {
+                        Ok(payload) => payload,
+                        Err(e) => {
+                            log::error!("accept: handler error for request {id}: {e}");
+                            XacppResponse::Error {
+                                code: e.code().to_owned(),
+                                message: e.to_string(),
                             }
-                            Err(e) => {
-                                log::warn!("reader: failed to serialize no_handler response: {e}");
+                        }
+                    };
+
+                    let response = XacppEnvelope::Response {
+                        id: id.clone(),
+                        session_id: sid_for_response,
+                        payload: response_payload,
+                    };
+                    match Self::serialize_envelope(&response) {
+                        Ok(frame) => {
+                            if let Err(e) = egress.send_acked(frame).await {
+                                log::warn!("accept: failed to send response for request {id}: {e}");
                             }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "accept: failed to serialize response for request {id}: {e}"
+                            );
                         }
                     }
                 }
@@ -226,16 +191,16 @@ impl SocketTransport {
                         // Fire-and-forget ack: silently consumed.
                         Some(PendingSlot::Drop) => {}
                         None => {
-                            log::warn!("reader: received response for unknown request {id}");
+                            log::warn!("accept: received response for unknown request {id}");
                         }
                     }
                 }
             }
         }
 
-        // Cleanup on exit: connection dead — fail fast subsequent sends,
-        // drop pending waiters, shut the egress down.
-        log::info!("reader: task exited, cleaning up");
+        // On exit: connection dead — fail fast subsequent sends, drop pending
+        // waiters, shut the egress down.
+        log::info!("accept: loop exited, cleaning up");
         shared.connected.store(false, Ordering::Release);
         shared.pending.lock().await.clear();
         egress.close();
@@ -243,7 +208,7 @@ impl SocketTransport {
 }
 
 #[async_trait]
-impl XacppTransport for SocketTransport {
+impl XacppTransport for StdioTransport {
     async fn connect(&self) -> Result<(), XacppError> {
         let _guard = self.connect_lock.lock().await;
 
@@ -251,32 +216,18 @@ impl XacppTransport for SocketTransport {
             return Err(XacppError::AlreadyConnected);
         }
 
-        // Get reader + writer: client mode establishes TCP first;
-        // server mode uses the halves parked at construction.
-        let (writer, mut reader) = if let Some(ref addr) = self.addr {
-            let stream = TcpStream::connect(addr)
-                .await
-                .map_err(|e| XacppError::Internal(format!("connect to {addr}: {e}")))?;
-            let (read_half, write_half) = tokio::io::split(stream);
-            (
-                Box::pin(write_half) as BoxedWriter,
-                Box::pin(tokio::io::BufReader::new(read_half)) as BoxedReader,
-            )
-        } else {
-            let w = self
-                .parked_writer
-                .lock()
-                .await
-                .take()
-                .ok_or(XacppError::AlreadyConnected)?;
-            let r = self
-                .reader
-                .lock()
-                .await
-                .take()
-                .ok_or(XacppError::AlreadyConnected)?;
-            (w, r)
-        };
+        let writer = self
+            .parked_writer
+            .lock()
+            .await
+            .take()
+            .ok_or(XacppError::AlreadyConnected)?;
+        let mut reader = self
+            .reader
+            .lock()
+            .await
+            .take()
+            .ok_or(XacppError::AlreadyConnected)?;
 
         // Ordered egress: drain task owns the write half.
         let (egress, _egress_handle) = egress::spawn_egress(
@@ -285,18 +236,17 @@ impl XacppTransport for SocketTransport {
             Arc::clone(&self.shared.pending),
             self.closed_tx.clone(),
         );
-        *self.egress.lock().expect("poisoned egress lock") = Some(egress.clone());
+        *self.egress.lock().await = Some(egress.clone());
 
         let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(256);
-        // Frame read task: no separate tracking needed, automatically stops when dispatch task drops frame_rx.
-        // Binary wire: chunk-read the stream into the frame decoder.
-        // `DATA_JSON` payloads forward to the dispatch task (envelope
-        // channel). Every other frame routes into the registered transfer
-        // hooks (control dispatch + `DATA_BINARY` reassembly). The hooks
-        // are re-read per frame so a late registration (responder side,
-        // after connect) routes immediately.
         let reader_hooks = Arc::clone(&self.transfer_hooks);
-        tokio::spawn(async move {
+        let reader_handle = tokio::spawn(async move {
+            // Binary wire: chunk-read the stream into the frame decoder.
+            // `DATA_JSON` payloads forward to the accept loop (envelope
+            // channel). Every other frame routes into the registered
+            // transfer hooks (control dispatch + `DATA_BINARY` reassembly).
+            // The hooks are re-read per frame so a late registration
+            // (responder side, after connect) routes immediately.
             let mut decoder = FrameDecoder::new();
             let mut buf = [0u8; 8192];
             'read: loop {
@@ -325,8 +275,7 @@ impl XacppTransport for SocketTransport {
                                     // reader refreshes here — an envelope-only
                                     // connection must not look like a silent
                                     // peer to the clock.
-                                    let hooks =
-                                        reader_hooks.read().expect("poisoned hooks lock").clone();
+                                    let hooks = reader_hooks.read().await.clone();
                                     if let Some(hooks) = hooks {
                                         (hooks.on_activity)().await;
                                     }
@@ -335,8 +284,7 @@ impl XacppTransport for SocketTransport {
                                     }
                                 }
                                 other => {
-                                    let hooks =
-                                        reader_hooks.read().expect("poisoned hooks lock").clone();
+                                    let hooks = reader_hooks.read().await.clone();
                                     if let Some(hooks) = hooks {
                                         (hooks.on_frame)(frame).await;
                                     } else {
@@ -357,14 +305,15 @@ impl XacppTransport for SocketTransport {
         });
 
         let shared = Arc::clone(&self.shared);
-        let dispatch_handle = tokio::spawn(async move {
-            Self::reader_task(frame_rx, egress, shared).await;
+        let accept_handle = tokio::spawn(async move {
+            Self::accept_loop(frame_rx, egress, shared).await;
         });
 
         self.shared.connected.store(true, Ordering::Release);
-        *self.shared.reader_handle.lock().await = Some(dispatch_handle);
+        *self.shared.reader_handle.lock().await = Some(reader_handle);
+        *self.shared.accept_handle.lock().await = Some(accept_handle);
 
-        log::debug!("connect: socket transport connected");
+        log::debug!("connect: transport connected");
         Ok(())
     }
 
@@ -374,25 +323,21 @@ impl XacppTransport for SocketTransport {
         // Stop accepting new outbound traffic, then shut the egress down
         // (queued frames flush FIFO before the writer closes).
         self.shared.connected.store(false, Ordering::Release);
-        if let Some(egress) = self.egress.lock().expect("poisoned egress lock").take() {
+        if let Some(egress) = self.egress.lock().await.take() {
             egress.close();
         }
 
-        // Abort reader task
+        // Abort both tasks
         if let Some(handle) = self.shared.reader_handle.lock().await.take() {
             handle.abort();
         }
-
-        // Abort all inflight handler tasks
-        {
-            let mut inflight = self.shared.inflight.lock().await;
-            inflight.abort_all();
-            while inflight.join_next().await.is_some() {}
+        if let Some(handle) = self.shared.accept_handle.lock().await.take() {
+            handle.abort();
         }
 
         self.shared.pending.lock().await.clear();
 
-        log::debug!("disconnect: socket transport disconnected");
+        log::debug!("disconnect: transport disconnected");
         Ok(())
     }
 
@@ -415,7 +360,7 @@ impl XacppTransport for SocketTransport {
             pending.insert(id.clone(), PendingSlot::Respond(tx));
         }
 
-        let egress = self.egress()?;
+        let egress = self.egress().await?;
         if let Err(e) = egress.send_acked(frame).await {
             self.shared.pending.lock().await.remove(&id);
             return Err(e);
@@ -450,7 +395,7 @@ impl XacppTransport for SocketTransport {
             .await
             .insert(id.clone(), PendingSlot::Drop);
 
-        let egress = self.egress()?;
+        let egress = self.egress().await?;
         if let Err(e) = egress.send_faf(frame) {
             self.shared.pending.lock().await.remove(&id);
             return Err(e);
@@ -462,11 +407,11 @@ impl XacppTransport for SocketTransport {
         if self.shared.connected.load(Ordering::Acquire) {
             return Err(XacppError::AlreadyConnected);
         }
-        let mut guard = self
-            .shared
-            .request_handler
-            .try_write()
-            .expect("on_request: lock contention before connect");
+        let mut guard = self.shared.request_handler.try_write().map_err(|_| {
+            XacppError::InvalidState(
+                "on_request: request handler lock contention before connect".into(),
+            )
+        })?;
         *guard = Some(handler);
         Ok(())
     }
@@ -476,21 +421,22 @@ impl XacppTransport for SocketTransport {
     }
 }
 
-impl TransferWiring for SocketTransport {
-    fn write_control_frame(&self, bytes: Vec<u8>) -> Result<(), XacppError> {
-        let egress = self.egress()?;
+#[async_trait::async_trait]
+impl TransferWiring for StdioTransport {
+    async fn write_control_frame(&self, bytes: Vec<u8>) -> Result<(), XacppError> {
+        let egress = self.egress().await?;
         egress.send_control(bytes)
     }
 
-    fn write_data_frame(&self, frame: Frame) -> Result<(), XacppError> {
-        let egress = self.egress()?;
+    async fn write_data_frame(&self, frame: Frame) -> Result<(), XacppError> {
+        let egress = self.egress().await?;
         let wire = frame
             .encode()
             .map_err(|e| XacppError::Internal(e.to_string()))?;
         egress.send_faf(wire)
     }
 
-    fn on_transfer_activity(&self, handlers: Option<TransferActivityHandlers>) {
-        *self.transfer_hooks.write().expect("poisoned hooks lock") = handlers;
+    async fn on_transfer_activity(&self, handlers: Option<TransferActivityHandlers>) {
+        *self.transfer_hooks.write().await = handlers;
     }
 }

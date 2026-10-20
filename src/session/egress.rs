@@ -15,8 +15,8 @@
 //! relative order of data frames is a FIFO guarantee; control frames may
 //! jump ahead of queued data frames. Outbound control frames originate
 //! exclusively from local low-frequency paths (ACK batches, NACK feedback,
-//! RESUME answers, heartbeats, protocol errors), so priority draining
-//! cannot starve data traffic from our own side.
+//! RESUME declarations/verdicts, heartbeats, protocol errors), so priority
+//! draining cannot starve data traffic from our own side.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -27,8 +27,8 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::error::XacppError;
-use crate::message::XacppResponse;
+use crate::wire::error::XacppError;
+use crate::wire::message::XacppResponse;
 
 /// Pending slot for request/response correlation.
 pub(crate) enum PendingSlot {
