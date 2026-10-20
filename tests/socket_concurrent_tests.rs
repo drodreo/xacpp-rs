@@ -12,11 +12,11 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 
-use xacpp::commands::XacppCommand;
-use xacpp::error::XacppError;
-use xacpp::message::{XacppRequest, XacppResponse};
-use xacpp::transport::XacppTransport;
-use xacpp::transport::socket::SocketTransport;
+use xacpp::carrier::XacppTransport;
+use xacpp::carrier::socket::SocketTransport;
+use xacpp::wire::commands::XacppCommand;
+use xacpp::wire::error::XacppError;
+use xacpp::wire::message::{XacppRequest, XacppResponse};
 
 /// Creates a pair of SocketTransport connected via TCP (client + server).
 ///
@@ -248,19 +248,18 @@ async fn test_disconnect_aborts_inflight_no_deadlock() {
 
 // ---- Test: Ordered egress (single FIFO exit for all outbound frames) ----
 
-use xacpp::events::{XacppActivityEvent, XacppEvent};
+use xacpp::wire::events::{XacppActivityEvent, XacppEvent};
 
 /// faf events sent sequentially arrive at the peer in submission order.
 #[tokio::test]
 async fn test_faf_events_arrive_in_submission_order() {
-    let arrivals = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
-    let arrivals_handler = Arc::clone(&arrivals);
+    let (arrivals_tx, mut arrivals_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
     let server_handler = Arc::new(move |_session_id, payload| {
-        let arrivals = Arc::clone(&arrivals_handler);
+        let arrivals_tx = arrivals_tx.clone();
         Box::pin(async move {
             if let XacppRequest::Event(event) = payload {
                 let seq = event.event.data["seq"].as_u64().unwrap();
-                arrivals.lock().unwrap().push(seq);
+                let _ = arrivals_tx.send(seq);
             }
             Ok(XacppResponse::acknowledge())
         }) as _
@@ -289,8 +288,12 @@ async fn test_faf_events_arrive_in_submission_order() {
         .await
         .unwrap();
 
+    let mut observed: Vec<u64> = Vec::new();
+    while let Ok(seq) = arrivals_rx.try_recv() {
+        observed.push(seq);
+    }
     assert_eq!(
-        *arrivals.lock().unwrap(),
+        observed,
         (0..N).collect::<Vec<u64>>(),
         "faf events must arrive in submission order"
     );
@@ -300,10 +303,9 @@ async fn test_faf_events_arrive_in_submission_order() {
 /// the single egress preserves the relative order of events and commands.
 #[tokio::test]
 async fn test_command_does_not_overtake_queued_events() {
-    let arrivals = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let arrivals_handler = Arc::clone(&arrivals);
+    let (arrivals_tx, mut arrivals_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let server_handler = Arc::new(move |_session_id, payload| {
-        let arrivals = Arc::clone(&arrivals_handler);
+        let arrivals_tx = arrivals_tx.clone();
         Box::pin(async move {
             let label = match payload {
                 XacppRequest::Event(event) => {
@@ -312,7 +314,7 @@ async fn test_command_does_not_overtake_queued_events() {
                 XacppRequest::Command(XacppCommand::Generic { name, .. }) => format!("cmd:{name}"),
                 _ => "other".to_string(),
             };
-            arrivals.lock().unwrap().push(label);
+            let _ = arrivals_tx.send(label);
             Ok(XacppResponse::acknowledge())
         }) as _
     });
@@ -349,8 +351,12 @@ async fn test_command_does_not_overtake_queued_events() {
         .await
         .unwrap();
 
+    let mut observed: Vec<String> = Vec::new();
+    while let Ok(label) = arrivals_rx.try_recv() {
+        observed.push(label);
+    }
     assert_eq!(
-        *arrivals.lock().unwrap(),
+        observed,
         vec!["ev0", "cmd:probe", "ev1", "cmd:sync"],
         "commands must not overtake previously queued events"
     );

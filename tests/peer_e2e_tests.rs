@@ -14,25 +14,27 @@ use serde_json::json;
 use tokio::io::BufReader;
 use tokio::sync::mpsc;
 
-use xacpp::activity_ref::ActivityRef;
-use xacpp::capability::{Capabilities, EffectiveCapabilities};
-use xacpp::commands::XacppCommand;
-use xacpp::error::XacppError;
-use xacpp::events::content::{ContentPart, TextPart};
-use xacpp::events::interaction::{
+use xacpp::carrier::XacppTransport;
+use xacpp::carrier::stdio::StdioTransport;
+use xacpp::session::XacppSession;
+use xacpp::session::handler::{
+    EstablishDecision, EstablishHandler, NegotiateHandler, XacppSessionHandler,
+};
+use xacpp::session::peer::{PeerState, XacppPeer};
+use xacpp::wire::activity_ref::ActivityRef;
+use xacpp::wire::capability::{Capabilities, EffectiveCapabilities};
+use xacpp::wire::commands::XacppCommand;
+use xacpp::wire::error::XacppError;
+use xacpp::wire::events::content::{ContentPart, TextPart};
+use xacpp::wire::events::interaction::{
     ActionRequestPayload, ActionResponse, QuestionPayload, QuestionResponse, SensitiveInfoItem,
     SensitiveInfoOperation, SensitiveInfoOperationPayload, SensitiveInfoOperationResponse,
     SensitiveInfoResult, SensitiveInfoType, action_request_command, question_command,
     sensitive_info_command,
 };
-use xacpp::events::payload::AlertLevel;
-use xacpp::events::{XacppActivityEvent, XacppEvent};
-use xacpp::handler::{EstablishDecision, EstablishHandler, NegotiateHandler, XacppSessionHandler};
-use xacpp::message::{XacppRequest, XacppResponse};
-use xacpp::peer::{PeerState, XacppPeer};
-use xacpp::session::XacppSession;
-use xacpp::transport::XacppTransport;
-use xacpp::transport::stdio::StdioTransport;
+use xacpp::wire::events::payload::AlertLevel;
+use xacpp::wire::events::{XacppActivityEvent, XacppEvent};
+use xacpp::wire::message::{XacppRequest, XacppResponse};
 
 // ---- Test Handler Implementations ----
 
@@ -52,25 +54,25 @@ impl XacppSessionHandler for TestSessionHandler {
 
 /// Accepts any negotiation (records effective capabilities).
 struct AcceptNegotiateHandler {
-    received: std::sync::Mutex<Option<EffectiveCapabilities>>,
+    received: tokio::sync::Mutex<Option<EffectiveCapabilities>>,
 }
 
 impl AcceptNegotiateHandler {
     fn new() -> Self {
         Self {
-            received: std::sync::Mutex::new(None),
+            received: tokio::sync::Mutex::new(None),
         }
     }
 
-    fn get_received(&self) -> Option<EffectiveCapabilities> {
-        self.received.lock().unwrap().clone()
+    async fn get_received(&self) -> Option<EffectiveCapabilities> {
+        self.received.lock().await.clone()
     }
 }
 
 #[async_trait::async_trait]
 impl NegotiateHandler for AcceptNegotiateHandler {
     async fn on_negotiate(&self, effective: EffectiveCapabilities) -> Result<(), XacppError> {
-        *self.received.lock().unwrap() = Some(effective);
+        *self.received.lock().await = Some(effective);
         Ok(())
     }
 }
@@ -509,8 +511,8 @@ async fn test_peer_establish() {
         .await
         .unwrap();
 
-    assert!(!session.session_id().is_empty());
-    assert_eq!(session.credentials(), "auto-creds");
+    assert!(!session.session_id().await.is_empty());
+    assert_eq!(session.credentials().await, "auto-creds");
 }
 
 #[tokio::test]
@@ -592,7 +594,7 @@ async fn test_negotiate_full_flow() {
     assert!(remote_caps_a.produce_events.is_empty());
 
     // Responder's handler received initiator's effective capabilities
-    let received_by_b = negotiate_b_clone.get_received().unwrap();
+    let received_by_b = negotiate_b_clone.get_received().await.unwrap();
     assert_eq!(received_by_b.remote_commands.len(), 2);
     assert_eq!(received_by_b.remote_commands[0]["name"], "new_activity");
     assert_eq!(received_by_b.remote_commands[1]["name"], "switch_activity");
@@ -600,7 +602,7 @@ async fn test_negotiate_full_flow() {
     assert!(received_by_b.emit_events.is_empty());
 
     // Initiator's handler received responder's effective capabilities (empty bot)
-    let received_by_a = negotiate_a_clone.get_received().unwrap();
+    let received_by_a = negotiate_a_clone.get_received().await.unwrap();
     assert!(received_by_a.remote_commands.is_empty());
     assert!(received_by_a.emit_events.is_empty());
 
@@ -608,7 +610,7 @@ async fn test_negotiate_full_flow() {
     let session = timeout(peer_a.establish(None, Arc::new(TestSessionHandler), |_| Ok(())))
         .await
         .unwrap();
-    assert!(!session.session_id().is_empty());
+    assert!(!session.session_id().await.is_empty());
 }
 
 #[tokio::test]
@@ -814,12 +816,12 @@ async fn test_emit_events_intersection() {
     timeout(peer_a.negotiate()).await.unwrap();
 
     // peer_a receives b's effective capabilities (intersection)
-    let received_by_a = negotiate_a_clone.get_received().unwrap();
+    let received_by_a = negotiate_a_clone.get_received().await.unwrap();
     assert_eq!(received_by_a.emit_events, vec!["content_delta"]);
     // think was filtered out: not in caps_b.accept_events
 
     // peer_b receives a's effective capabilities (intersection)
-    let received_by_b = negotiate_b_clone.get_received().unwrap();
+    let received_by_b = negotiate_b_clone.get_received().await.unwrap();
     assert_eq!(received_by_b.emit_events, Vec::<String>::new());
     // caps_b produces nothing, so emit_events is empty
 }
@@ -995,6 +997,13 @@ async fn test_concurrent_requests_id_matching() {
                         "establish_confirm".into()
                     }
                     XacppRequest::Command(XacppCommand::Negotiate { .. }) => "negotiate".into(),
+                    XacppRequest::Command(XacppCommand::Fetch { .. }) => "fetch".into(),
+                    XacppRequest::Command(XacppCommand::FetchBegin { .. }) => "fetch_begin".into(),
+                    XacppRequest::Command(XacppCommand::FetchPause { .. }) => "fetch_pause".into(),
+                    XacppRequest::Command(XacppCommand::FetchResume { .. }) => {
+                        "fetch_resume".into()
+                    }
+                    XacppRequest::Command(XacppCommand::FetchAbort { .. }) => "fetch_abort".into(),
                     XacppRequest::Command(XacppCommand::Generic { name, .. }) => name,
                     XacppRequest::Event(_) => "event".into(),
                 };
@@ -1140,20 +1149,21 @@ async fn test_multi_session_routing_isolation() {
     peer_a.negotiate().await.unwrap();
 
     // A initiator: establish two sessions (responder registers an ID'd
-    // handler per session). The initiator peer owns a single logical
-    // session: the second establish backfills its identity to sid_2, while
-    // the responder's routing table keeps both handlers isolated.
+    // handler per session). The responder's answers name two DIFFERENT
+    // identities, so the second establish binds a new logical session (the
+    // first one keeps its own identity and its envelope path), while the
+    // responder's routing table keeps both handlers isolated.
     let handler_a: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
     let first = timeout(peer_a.establish(None, Arc::clone(&handler_a), |_| Ok(())))
         .await
         .unwrap();
-    let sid_1_prev = first.session_id().to_owned();
+    let sid_1_prev = first.session_id().await.to_owned();
     let session_2 = timeout(peer_a.establish(None, Arc::clone(&handler_a), |_| Ok(())))
         .await
         .unwrap();
 
-    // The initiator session now carries the second identity.
-    let sid_2 = session_2.session_id().to_owned();
+    // The second establish bound a new session carrying the second identity.
+    let sid_2 = session_2.session_id().await.to_owned();
     assert!(
         !sid_2.is_empty(),
         "second establish must backfill the initiator session identity"
@@ -1175,8 +1185,7 @@ async fn test_multi_session_routing_isolation() {
 
     // Cross-validation: the responder still routes the FIRST session id to
     // handler-1 (routing-table isolation across sessions on one connection).
-    // Direct transport send under the first session id (the initiator's
-    // single session object now carries sid_2).
+    // Direct transport send under the first session id.
     let resp_1_again = timeout(raw_transport_a.send(
         Some(&sid_1_prev),
         XacppRequest::Command(XacppCommand::generic(
@@ -1193,6 +1202,122 @@ async fn test_multi_session_routing_isolation() {
                 data["id"], "handler-1",
                 "first session id must still route to handler-1"
             );
+        }
+        other => panic!("expected handler_id, got: {other:?}"),
+    }
+}
+
+// ============================================================================
+// Establish: answer-driven session reuse (ts symmetry)
+// ============================================================================
+
+/// The responder's answer is the ruling on identity continuity: an answer
+/// naming the held session's bound identity reuses that session — the
+/// transfer mount is re-attached idempotently and the session's
+/// transaction state survives the re-establish.
+#[tokio::test]
+async fn test_establish_same_identity_reuses_held_session() {
+    // The responder always answers with the same identity ("auto-sid").
+    let (peer_a, _peer_b) = negotiated_peers().await;
+
+    let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
+    let first = timeout(peer_a.establish(None, Arc::clone(&handler), |_| Ok(())))
+        .await
+        .unwrap();
+    let second = timeout(peer_a.establish(None, Arc::clone(&handler), |_| Ok(())))
+        .await
+        .unwrap();
+
+    assert_eq!(first.session_id().await, "auto-sid");
+    assert_eq!(second.session_id().await, "auto-sid");
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "an answer naming the held identity must reuse the held session"
+    );
+    assert!(
+        first.transfer_wired().await,
+        "the reused session keeps its transfer mount"
+    );
+}
+
+/// An answer naming a DIFFERENT identity births a new logical session: the
+/// held session's transfer mount is released (its clock would never see
+/// inbound activity again and would tear the shared connection down), while
+/// its envelope identity stays routed under its own id.
+#[tokio::test]
+async fn test_establish_different_identity_binds_new_session() {
+    let (transport_a, transport_b) = duplex_pair();
+    let peer_a = XacppPeer::new(
+        Capabilities {
+            commands: Vec::new(),
+            produce_events: Vec::new(),
+            accept_events: Vec::new(),
+        },
+        transport_a,
+        Some(Arc::new(XacppSession::new(None))),
+        Arc::new(AcceptNegotiateHandler::new()),
+        Arc::new(AutoApproveEstablishHandler),
+    );
+    // The responder hands out a fresh identity per establish.
+    let peer_b = XacppPeer::new(
+        Capabilities {
+            commands: Vec::new(),
+            produce_events: Vec::new(),
+            accept_events: Vec::new(),
+        },
+        transport_b,
+        None,
+        Arc::new(AcceptNegotiateHandler::new()),
+        Arc::new(SequencedEstablishHandler::new()),
+    );
+    peer_a.connect().await.unwrap();
+    peer_b.connect().await.unwrap();
+    peer_a.negotiate().await.unwrap();
+
+    let handler: Arc<dyn XacppSessionHandler> = Arc::new(TestSessionHandler);
+    let first = timeout(peer_a.establish(None, Arc::clone(&handler), |_| Ok(())))
+        .await
+        .unwrap();
+    let second = timeout(peer_a.establish(None, Arc::clone(&handler), |_| Ok(())))
+        .await
+        .unwrap();
+
+    assert_eq!(first.session_id().await, "handler-1");
+    assert_eq!(second.session_id().await, "handler-2");
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "a different identity must bind a new session"
+    );
+    assert!(
+        !first.transfer_wired().await,
+        "the held session's transfer mount must be released"
+    );
+    assert!(
+        second.transfer_wired().await,
+        "the new session holds the transfer mount"
+    );
+
+    // The held session's envelope path is untouched: it still routes under
+    // its own identity.
+    let resp_1 = timeout(first.request_command(XacppCommand::generic("new_activity", json!({}))))
+        .await
+        .unwrap();
+    match resp_1 {
+        XacppResponse::Generic { name, data } => {
+            assert_eq!(name, "handler_id");
+            assert_eq!(data["id"], "handler-1");
+        }
+        other => panic!("expected handler_id, got: {other:?}"),
+    }
+
+    // The new session routes under the new identity.
+    let resp_2 = timeout(second.request_command(XacppCommand::generic("new_activity", json!({}))))
+        .await
+        .unwrap();
+    match resp_2 {
+        XacppResponse::Generic { name, data } => {
+            assert_eq!(name, "handler_id");
+            assert_eq!(data["id"], "handler-2");
         }
         other => panic!("expected handler_id, got: {other:?}"),
     }
@@ -1240,7 +1365,7 @@ async fn test_peer_establish_challenge_flow() {
     .unwrap();
 
     assert!(challenge_received, "verify_challenge must be called");
-    assert_eq!(session.session_id(), "challenge-sid");
+    assert_eq!(session.session_id().await, "challenge-sid");
 }
 
 #[tokio::test]
@@ -1280,8 +1405,8 @@ async fn test_peer_establish_challenge_issues_credentials() {
     .await
     .unwrap();
 
-    assert_eq!(session.session_id(), "challenge-sid");
-    assert_eq!(session.credentials(), "issued-creds");
+    assert_eq!(session.session_id().await, "challenge-sid");
+    assert_eq!(session.credentials().await, "issued-creds");
 }
 
 #[tokio::test]

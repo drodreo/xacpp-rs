@@ -6,18 +6,18 @@
 
 use serde_json::json;
 
-use xacpp::activity_ref::ActivityRef;
-use xacpp::commands::XacppCommand;
-use xacpp::events::content::FileRef;
-use xacpp::events::interaction::{
+use xacpp::wire::activity_ref::ActivityRef;
+use xacpp::wire::commands::XacppCommand;
+use xacpp::wire::events::content::FileRef;
+use xacpp::wire::events::interaction::{
     ActionRequestPayload, ActionResponse, QuestionPayload, QuestionResponse, SensitiveInfoItem,
     SensitiveInfoOperation, SensitiveInfoOperationPayload, SensitiveInfoOperationResponse,
     SensitiveInfoResult, SensitiveInfoType, action_request_command, question_command,
     sensitive_info_command,
 };
-use xacpp::events::payload::{AlertLevel, TraceableEvent};
-use xacpp::events::{XacppActivityEvent, XacppEvent};
-use xacpp::message::{XacppEnvelope, XacppRequest, XacppResponse};
+use xacpp::wire::events::payload::{AlertLevel, TraceableEvent};
+use xacpp::wire::events::{XacppActivityEvent, XacppEvent};
+use xacpp::wire::message::{XacppEnvelope, XacppRequest, XacppResponse};
 
 // =========================================================================
 // XacppEvent round-trip (generic { name, data } structure)
@@ -163,7 +163,7 @@ fn test_command_establish_with_credentials_roundtrip() {
 #[test]
 fn test_command_negotiate_roundtrip() {
     let cmd = XacppCommand::Negotiate {
-        capabilities: xacpp::capability::Capabilities {
+        capabilities: xacpp::wire::capability::Capabilities {
             commands: vec![json!({ "name": "new_activity" })],
             produce_events: vec![json!({ "name": "content_delta" })],
             accept_events: Vec::new(),
@@ -279,7 +279,7 @@ fn test_response_established_roundtrip() {
 #[test]
 fn test_response_negotiated_roundtrip() {
     let resp = XacppResponse::Negotiated {
-        capabilities: xacpp::capability::Capabilities {
+        capabilities: xacpp::wire::capability::Capabilities {
             commands: vec![json!({ "name": "new_activity" })],
             produce_events: vec![],
             accept_events: Vec::new(),
@@ -1050,4 +1050,89 @@ fn test_fileref_deserialize_legacy_format() {
     assert_eq!(de.require_organized, false);
     assert_eq!(de.size_bytes, 512);
     assert_eq!(de.sha256, "");
+}
+
+// =========================================================================
+// Fetch channel wire shapes (SPEC §8 stateless kernel)
+// =========================================================================
+
+#[test]
+fn test_fetch_command_wire() {
+    let cmd = XacppCommand::Fetch {
+        uri: "file:///tmp/a.png".into(),
+    };
+    let s = serde_json::to_string(&cmd).unwrap();
+    assert_eq!(s, r#"{"fetch":{"uri":"file:///tmp/a.png"}}"#);
+    let de: XacppCommand = serde_json::from_str(&s).unwrap();
+    match de {
+        XacppCommand::Fetch { uri } => assert_eq!(uri, "file:///tmp/a.png"),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn test_fetch_companion_commands_wire() {
+    // SPEC §8.3 — companion commands are protocol contract; the wire forms
+    // are pinned (identical across rs/ts).
+    let begin = XacppCommand::FetchBegin {
+        txid: "0191f3c2a8b44e7c9d2e1f0a5b6c7d8e".into(),
+    };
+    assert_eq!(
+        serde_json::to_string(&begin).unwrap(),
+        r#"{"fetch_begin":{"txid":"0191f3c2a8b44e7c9d2e1f0a5b6c7d8e"}}"#
+    );
+    let abort = XacppCommand::FetchAbort {
+        txid: "0191f3c2a8b44e7c9d2e1f0a5b6c7d8e".into(),
+    };
+    assert_eq!(
+        serde_json::to_string(&abort).unwrap(),
+        r#"{"fetch_abort":{"txid":"0191f3c2a8b44e7c9d2e1f0a5b6c7d8e"}}"#
+    );
+    let pause = XacppCommand::FetchPause {
+        txid: "0191f3c2a8b44e7c9d2e1f0a5b6c7d8e".into(),
+    };
+    assert_eq!(
+        serde_json::to_string(&pause).unwrap(),
+        r#"{"fetch_pause":{"txid":"0191f3c2a8b44e7c9d2e1f0a5b6c7d8e"}}"#
+    );
+    let resume = XacppCommand::FetchResume {
+        txid: "0191f3c2a8b44e7c9d2e1f0a5b6c7d8e".into(),
+    };
+    assert_eq!(
+        serde_json::to_string(&resume).unwrap(),
+        r#"{"fetch_resume":{"txid":"0191f3c2a8b44e7c9d2e1f0a5b6c7d8e"}}"#
+    );
+    // Roundtrip.
+    let de: XacppCommand = serde_json::from_str(r#"{"fetch_resume":{"txid":"abc"}}"#).unwrap();
+    assert!(matches!(de, XacppCommand::FetchResume { .. }));
+}
+
+#[test]
+fn test_fetch_ready_response_wire() {
+    let resp = XacppResponse::FetchReady {
+        txid: "0191f3c2a8b44e7c9d2e1f0a5b6c7d8e".into(),
+        sha256: "cafe".into(),
+        size_bytes: 42,
+        mime: "image/png".into(),
+    };
+    let s = serde_json::to_string(&resp).unwrap();
+    assert_eq!(
+        s,
+        r#"{"kind":"fetch_ready","txid":"0191f3c2a8b44e7c9d2e1f0a5b6c7d8e","sha256":"cafe","sizeBytes":42,"mime":"image/png"}"#
+    );
+    let de: XacppResponse = serde_json::from_str(&s).unwrap();
+    match de {
+        XacppResponse::FetchReady {
+            txid,
+            sha256,
+            size_bytes,
+            mime,
+        } => {
+            assert_eq!(txid, "0191f3c2a8b44e7c9d2e1f0a5b6c7d8e");
+            assert_eq!(sha256, "cafe");
+            assert_eq!(size_bytes, 42);
+            assert_eq!(mime, "image/png");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
 }

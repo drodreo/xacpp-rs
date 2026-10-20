@@ -6,7 +6,7 @@
 //! payloads, decode-cap protocol errors), per-type size limits (encode +
 //! decode), CRC tampering detection, and decoder reuse across feeds.
 
-use xacpp::frame::{
+use xacpp::wire::frame::{
     CRC_LEN, Frame, FrameDecoder, FrameError, FrameType, HEADER_LEN, MAGIC, MAX_CONTROL_FRAME_LEN,
     MAX_DATA_BINARY_FRAME_LEN, MAX_DATA_JSON_FRAME_LEN, MAX_DECODE_TOTAL_CAP, VERSION_MAJOR,
     VERSION_MINOR, crc32,
@@ -115,7 +115,7 @@ fn test_roundtrip_data_frame_types() {
 }
 
 /// Unknown types (from a newer minor version) survive the codec untouched;
-/// ignoring them is the upper layer's job (SPEC §8).
+/// ignoring them is the upper layer's job (SPEC §9).
 #[test]
 fn test_roundtrip_unknown_frame_type() {
     let frame = sample_frame(FrameType::Unknown(0x7FFF), b"opaque".to_vec());
@@ -166,7 +166,7 @@ fn test_empty_payload_frame() {
 
 // ---- Version handling ----
 
-/// major mismatch is fatal (SPEC §8: connection refused).
+/// major mismatch is fatal (SPEC §9: connection refused).
 #[test]
 fn test_version_major_mismatch_rejected() {
     let mut bytes = sample_frame(FrameType::Ack, b"{}".to_vec())

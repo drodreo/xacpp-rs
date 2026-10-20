@@ -38,13 +38,14 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, watch};
 
-use xacpp::events::{XacppActivityEvent, XacppEvent};
-use xacpp::frame::{Frame, FrameDecoder, FrameType};
-use xacpp::message::{XacppEnvelope, XacppRequest, XacppResponse};
+use xacpp::carrier::XacppTransport;
+use xacpp::carrier::socket::SocketTransport;
+use xacpp::reliability::transaction::SenderConfig;
 use xacpp::session::XacppSession;
-use xacpp::transaction::SenderConfig;
-use xacpp::transport::socket::SocketTransport;
-use xacpp::transport::{TransferConfig, XacppTransport};
+use xacpp::transfer::TransferConfig;
+use xacpp::wire::events::{XacppActivityEvent, XacppEvent};
+use xacpp::wire::frame::{Frame, FrameDecoder, FrameType};
+use xacpp::wire::message::{XacppEnvelope, XacppRequest, XacppResponse};
 
 /// Envelope content padding for the small tier (total JSON lands near 200 B).
 const SMALL_PAD: usize = 110;
@@ -346,10 +347,12 @@ async fn binary_group() {
     })
     .await;
     let (delivered_tx, mut delivered_rx) = watch::channel(0usize);
-    server_session.on_binary(Arc::new(move |_txid, payload| {
-        assert_eq!(payload.len(), expect_len, "delivered payload length");
-        let _ = delivered_tx.send(payload.len());
-    }));
+    server_session
+        .on_binary(Arc::new(move |_txid, payload| {
+            assert_eq!(payload.len(), expect_len, "delivered payload length");
+            let _ = delivered_tx.send(payload.len());
+        }))
+        .await;
 
     let payload = make_binary_payload(expect_len);
     let frames = expect_len.div_ceil(WORKING_FRAME);
@@ -360,7 +363,7 @@ async fn binary_group() {
     client_session
         .send_binary(
             payload,
-            Some(Arc::new(move |_result| {
+            Some(Box::new(move |_result| {
                 completed2.fetch_add(1, Ordering::Relaxed);
             })),
         )
@@ -404,10 +407,12 @@ async fn binary_group() {
     .await;
     let delivered = Arc::new(AtomicUsize::new(0));
     let d2 = delivered.clone();
-    server_session.on_binary(Arc::new(move |_txid, payload| {
-        assert_eq!(payload.len(), expect, "delivered payload length");
-        d2.fetch_add(1, Ordering::Relaxed);
-    }));
+    server_session
+        .on_binary(Arc::new(move |_txid, payload| {
+            assert_eq!(payload.len(), expect, "delivered payload length");
+            d2.fetch_add(1, Ordering::Relaxed);
+        }))
+        .await;
     let completed = Arc::new(AtomicUsize::new(0));
     let payloads: Vec<Vec<u8>> = (0..txns).map(|_| make_binary_payload(expect)).collect();
     let mut handles = Vec::with_capacity(txns);
@@ -418,7 +423,7 @@ async fn binary_group() {
         handles.push(tokio::spawn(async move {
             c.send_binary(
                 p,
-                Some(Arc::new(move |_result| {
+                Some(Box::new(move |_result| {
                     comp.fetch_add(1, Ordering::Relaxed);
                 })),
             )

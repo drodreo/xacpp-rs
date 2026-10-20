@@ -22,11 +22,11 @@ use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 
-use xacpp::events::{XacppActivityEvent, XacppEvent};
-use xacpp::frame::{FRAME_OVERHEAD, FrameDecoder, FrameType};
-use xacpp::message::{XacppRequest, XacppResponse};
-use xacpp::transport::XacppTransport;
-use xacpp::transport::socket::SocketTransport;
+use xacpp::carrier::XacppTransport;
+use xacpp::carrier::socket::SocketTransport;
+use xacpp::wire::events::{XacppActivityEvent, XacppEvent};
+use xacpp::wire::frame::{FRAME_OVERHEAD, FrameDecoder, FrameType};
+use xacpp::wire::message::{XacppRequest, XacppResponse};
 
 /// Typical stream length captured in high-latency scenarios (batch-1 baseline).
 const DEFAULT_N: u64 = 40_000;

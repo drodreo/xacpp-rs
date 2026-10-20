@@ -28,37 +28,40 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-use xacpp::activity_ref::ActivityRef;
-use xacpp::capability::{Capabilities, EffectiveCapabilities};
-use xacpp::commands::XacppCommand;
-use xacpp::commands::lifecycle::{
+use xacpp::carrier::XacppTransport;
+use xacpp::carrier::stdio::StdioTransport;
+use xacpp::reliability::transaction::SenderConfig;
+use xacpp::session::XacppSession;
+use xacpp::session::handler::RequestHandler;
+use xacpp::session::handler::{
+    EstablishDecision, EstablishHandler, NegotiateHandler, XacppSessionHandler,
+};
+use xacpp::session::peer::XacppPeer;
+use xacpp::transfer::BinaryHandler;
+use xacpp::transfer::TransferConfig;
+use xacpp::wire::activity_ref::ActivityRef;
+use xacpp::wire::capability::{Capabilities, EffectiveCapabilities};
+use xacpp::wire::commands::XacppCommand;
+use xacpp::wire::commands::lifecycle::{
     InvokeActivityPayload, ListActivityPayload, NewActivityPayload, SetActivityModePayload,
 };
-use xacpp::error::XacppError;
-use xacpp::events::content::{
+use xacpp::wire::error::XacppError;
+use xacpp::wire::events::content::{
     AudioPart, ContentPart, FilePart, FileRef, ImagePart, TextPart, VideoPart,
 };
-use xacpp::events::interaction::NotifyPayload;
-use xacpp::events::payload::{
+use xacpp::wire::events::interaction::NotifyPayload;
+use xacpp::wire::events::payload::{
     ActivityInfo, ActivityMode, ActivityStartEvent, AlertLevel, ContentDeltaEvent,
     ContentPartEvent, SecurityAlertEvent, ToolResultEvent, ToolUseEvent, TraceableEvent,
 };
-use xacpp::events::upload::{TokenUsage, UploadEvent};
-use xacpp::events::{XacppActivityEvent, XacppEvent};
-use xacpp::frame::{
+use xacpp::wire::events::upload::{TokenUsage, UploadEvent};
+use xacpp::wire::events::{XacppActivityEvent, XacppEvent};
+use xacpp::wire::frame::{
     CRC_LEN, FRAME_OVERHEAD, Frame, FrameDecoder, FrameError, FrameType, HEADER_LEN, MAGIC,
     MAX_CONTROL_FRAME_LEN, MAX_DATA_BINARY_FRAME_LEN, MAX_DATA_JSON_FRAME_LEN,
     MAX_DECODE_TOTAL_CAP, crc32,
 };
-use xacpp::handler::{EstablishDecision, EstablishHandler, NegotiateHandler, XacppSessionHandler};
-use xacpp::message::{XacppEnvelope, XacppRequest, XacppResponse};
-use xacpp::peer::XacppPeer;
-use xacpp::reassemble::ReassemblerConfig;
-use xacpp::session::XacppSession;
-use xacpp::transaction::SenderConfig;
-use xacpp::transport::stdio::StdioTransport;
-use xacpp::transport::transfer::BinaryHandler;
-use xacpp::transport::{RequestHandler, TransferConfig, XacppTransport};
+use xacpp::wire::message::{XacppEnvelope, XacppRequest, XacppResponse};
 
 // =====================================================================================
 // Shared helpers
@@ -95,13 +98,9 @@ fn test_cfg() -> TransferConfig {
     TransferConfig {
         sender: SenderConfig {
             frame_size: 1024,
-            copy_retention_ms: 30_000,
             rto_initial_ms: 200,
             rto_max_ms: 800,
             backpressure_cap_bytes: 64 * 1024 * 1024,
-        },
-        reassembler: ReassemblerConfig {
-            stale_retention_ms: 30_000,
         },
         heartbeat_interval_ms: 30_000,
         silent_timeout_ms: 60_000,
@@ -170,13 +169,13 @@ async fn reliable_pair(
 }
 
 /// Register a binary delivery capture on `session`.
-fn capture_binary(session: &XacppSession) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+async fn capture_binary(session: &XacppSession) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let tx = Arc::new(tx);
     let handler: BinaryHandler = Arc::new(move |_txid, payload| {
         let _ = tx.send(payload);
     });
-    session.on_binary(handler);
+    session.on_binary(handler).await;
     rx
 }
 
@@ -354,6 +353,7 @@ fn echo_handler() -> RequestHandler {
 // ---- Frame-dropping writer (lossy-link emulator, batch-3 test lineage) ----
 
 const FRAME_TYPE_DATA_BINARY: u16 = 0x1002;
+const FRAME_TYPE_TRANSACTION_COMPLETED: u16 = 0x000b;
 
 /// Writer wrapper that scans the outbound byte stream at frame boundaries
 /// and silently drops the **first** `DATA_BINARY` frame with `target_seq`
@@ -365,6 +365,7 @@ struct FrameDropper<W> {
     out: Vec<u8>,
     target_seq: u32,
     drop_armed: bool,
+    drop_completed: bool,
 }
 
 impl<W: AsyncWrite + Unpin> FrameDropper<W> {
@@ -375,6 +376,7 @@ impl<W: AsyncWrite + Unpin> FrameDropper<W> {
             out: Vec::new(),
             target_seq,
             drop_armed: true,
+            drop_completed: false,
         }
     }
 
@@ -402,6 +404,14 @@ impl<W: AsyncWrite + Unpin> FrameDropper<W> {
             let seq = u32::from_be_bytes([frame[28], frame[29], frame[30], frame[31]]);
             if self.drop_armed && ftype == FRAME_TYPE_DATA_BINARY && seq == self.target_seq {
                 self.drop_armed = false;
+                // The loss window swallows the completion announcement too:
+                // the completed frame rides the data FIFO right behind the
+                // transaction's frames, and a link that drops frames drops
+                // it like any other — the peer then completes on the byte
+                // count (the announcement is not mandatory).
+                self.drop_completed = true;
+            } else if self.drop_completed && ftype == FRAME_TYPE_TRANSACTION_COMPLETED {
+                self.drop_completed = false;
             } else {
                 self.out.extend_from_slice(&frame);
             }
@@ -459,18 +469,18 @@ impl<W: AsyncWrite + Unpin + Send> AsyncWrite for FrameDropper<W> {
 
 /// Session handler capturing every event, replying `acknowledge`.
 struct EventCaptureHandler {
-    events: std::sync::Mutex<Vec<XacppActivityEvent>>,
+    events: tokio::sync::Mutex<Vec<XacppActivityEvent>>,
 }
 
 impl EventCaptureHandler {
     fn new() -> Self {
         Self {
-            events: std::sync::Mutex::new(Vec::new()),
+            events: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
-    fn snapshot(&self) -> Vec<XacppActivityEvent> {
-        self.events.lock().unwrap().clone()
+    async fn snapshot(&self) -> Vec<XacppActivityEvent> {
+        self.events.lock().await.clone()
     }
 }
 
@@ -481,7 +491,7 @@ impl XacppSessionHandler for EventCaptureHandler {
     }
 
     async fn on_event(&self, event: XacppActivityEvent) -> Result<XacppResponse, XacppError> {
-        self.events.lock().unwrap().push(event);
+        self.events.lock().await.push(event);
         Ok(XacppResponse::acknowledge())
     }
 }
@@ -501,11 +511,11 @@ impl XacppSessionHandler for NoopSessionHandler {
 }
 
 /// Negotiate handler capturing the effective capabilities.
-struct NegotiateCapture(Arc<std::sync::Mutex<Option<EffectiveCapabilities>>>);
+struct NegotiateCapture(Arc<tokio::sync::Mutex<Option<EffectiveCapabilities>>>);
 
 impl NegotiateCapture {
-    fn new() -> (Self, Arc<std::sync::Mutex<Option<EffectiveCapabilities>>>) {
-        let slot = Arc::new(std::sync::Mutex::new(None));
+    fn new() -> (Self, Arc<tokio::sync::Mutex<Option<EffectiveCapabilities>>>) {
+        let slot = Arc::new(tokio::sync::Mutex::new(None));
         (Self(Arc::clone(&slot)), slot)
     }
 }
@@ -513,7 +523,7 @@ impl NegotiateCapture {
 #[async_trait::async_trait]
 impl NegotiateHandler for NegotiateCapture {
     async fn on_negotiate(&self, effective: EffectiveCapabilities) -> Result<(), XacppError> {
-        *self.0.lock().unwrap() = Some(effective);
+        *self.0.lock().await = Some(effective);
         Ok(())
     }
 }
@@ -643,14 +653,13 @@ async fn event_peer_pair() -> (XacppPeer, Arc<XacppSession>, Arc<EventCaptureHan
 async fn a_command_variants_wire_roundtrip() {
     let (ta, tb) = duplex_pair();
 
-    let received: Arc<std::sync::Mutex<Vec<XacppCommand>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let received = Arc::new(tokio::sync::Mutex::new(Vec::<XacppCommand>::new()));
     let received_for_handler = Arc::clone(&received);
     tb.on_request(Arc::new(move |_session_id, payload| {
         let received = Arc::clone(&received_for_handler);
         Box::pin(async move {
             if let XacppRequest::Command(cmd) = payload {
-                received.lock().unwrap().push(cmd);
+                received.lock().await.push(cmd);
             }
             Ok(XacppResponse::acknowledge())
         })
@@ -793,7 +802,7 @@ async fn a_command_variants_wire_roundtrip() {
         .await
         .unwrap();
 
-    let got = received.lock().unwrap();
+    let got = received.lock().await;
     assert_eq!(got.len(), 8, "every command arrived exactly once");
     let value_of = |c: &XacppCommand| serde_json::to_value(c).unwrap();
     assert_eq!(
@@ -865,7 +874,7 @@ async fn a_negotiate_capabilities_wire_fields() {
     // own produce_events ∩ peer's accept_events. The initiator produces
     // everything the responder accepts (17 names); the responder produces
     // nothing, so its side of the intersection is empty.
-    let effective_b = slot_b.lock().unwrap().clone().expect("negotiate observed");
+    let effective_b = slot_b.lock().await.clone().expect("negotiate observed");
     assert!(
         effective_b.emit_events.is_empty(),
         "responder produces nothing: its emit list is empty"
@@ -1152,7 +1161,7 @@ async fn a_event_vocabulary_request_event_wire() {
         }
     }
 
-    let got = capture.snapshot();
+    let got = capture.snapshot().await;
     assert_eq!(got.len(), sent.len(), "every event delivered exactly once");
     for (want, have) in sent.iter().zip(got.iter()) {
         assert_eq!(
@@ -1174,10 +1183,10 @@ async fn a_event_send_event_faf_wire() {
     session.send_event(event.clone()).await.expect("queued");
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    while capture.snapshot().is_empty() && Instant::now() < deadline {
+    while capture.snapshot().await.is_empty() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let got = capture.snapshot();
+    let got = capture.snapshot().await;
     assert_eq!(got.len(), 1, "faf event delivered exactly once");
     assert_eq!(
         serde_json::to_value(&got[0]).unwrap(),
@@ -1190,7 +1199,7 @@ async fn a_event_send_event_faf_wire() {
 #[tokio::test]
 async fn a_binary_matrix_size_tiers_wire() {
     let (_a, sa, _b, sb) = reliable_pair(test_cfg(), test_cfg()).await;
-    let mut delivered = capture_binary(&sb);
+    let mut delivered = capture_binary(&sb).await;
 
     for size in [100 * 1024, 1024 * 1024, 5 * 1024 * 1024] {
         let payload = pattern(size);
@@ -1211,7 +1220,7 @@ async fn a_binary_matrix_size_tiers_wire() {
 #[tokio::test]
 async fn a_binary_16mib_exact_ceiling_wire() {
     let (_a, sa, _b, sb) = reliable_pair(test_cfg(), test_cfg()).await;
-    let mut delivered = capture_binary(&sb);
+    let mut delivered = capture_binary(&sb).await;
 
     let size = MAX_DATA_BINARY_FRAME_LEN;
     let payload = pattern(size);
@@ -1231,7 +1240,7 @@ async fn a_binary_16mib_exact_ceiling_wire() {
 #[tokio::test]
 async fn a_binary_tail_frame_boundary_wire() {
     let (_a, sa, _b, sb) = reliable_pair(test_cfg(), test_cfg()).await;
-    let mut delivered = capture_binary(&sb);
+    let mut delivered = capture_binary(&sb).await;
 
     let size = 2 * 1024 * 1024 + 1; // frames: 1 MiB + 1 MiB + 1 byte tail
     let payload = pattern(size);
@@ -1310,7 +1319,7 @@ async fn b_dirty_stream_garbage_prefix_recovers_wire() {
 #[tokio::test]
 async fn b_dirty_stream_pseudo_magic_payload_inert_wire() {
     let (_a, sa, _b, sb) = reliable_pair(test_cfg(), test_cfg()).await;
-    let mut delivered = capture_binary(&sb);
+    let mut delivered = capture_binary(&sb).await;
 
     // Payload containing pseudo-frame fragments (magic + plausible header
     // bytes + junk): if the receiver ever scanned inside a frame body these
@@ -1584,7 +1593,7 @@ async fn b_backpressure_pause_control_exempt_and_recovery() {
     b.connect().await.unwrap();
     let b_closed = b.closed();
 
-    let mut delivered = capture_binary(&session_b);
+    let mut delivered = capture_binary(&session_b).await;
     session_a
         .send_binary(pattern(4096), None)
         .await
@@ -1628,7 +1637,7 @@ async fn b_backpressure_pause_control_exempt_and_recovery() {
 // =====================================================================================
 
 /// C.1 (tolerated) — an unknown frame type with a valid CRC is ignored per
-/// SPEC §8 (minor-version tolerance); the connection keeps working
+/// SPEC §9 (minor-version tolerance); the connection keeps working
 /// bidirectionally afterwards.
 #[tokio::test]
 async fn c_unknown_frame_type_crc_valid_ignored_wire() {
@@ -1662,7 +1671,7 @@ async fn c_unknown_frame_type_crc_valid_ignored_wire() {
 }
 
 /// C.2 (tolerated) — a higher minor version on a perfectly valid frame is
-/// tolerated: the frame is processed normally (SPEC §8).
+/// tolerated: the frame is processed normally (SPEC §9).
 #[tokio::test]
 async fn c_higher_minor_version_tolerated_wire() {
     let mut rig = Injector::new(b"").await;
@@ -1690,17 +1699,18 @@ async fn c_higher_minor_version_tolerated_wire() {
 }
 
 /// C.3 (tolerated) — duplicate `DATA_BINARY` frames are idempotent on the
-/// receive side: retransmission copies injected raw on the wire never
-/// produce a second delivery, and the connection survives with the
-/// transaction completing exactly once.
+/// receive side while the transaction is incomplete: retransmission copies
+/// injected raw on the wire never produce an early or second delivery.
+/// (The completed-transaction replay guard lives at the fetch extension
+/// layer: `ext10_completed_replay_not_redelivered`.)
 #[tokio::test]
-async fn c_duplicate_binary_frames_delivered_once_wire() {
+async fn c_duplicate_binary_frames_idempotent_incomplete_wire() {
     let session = Arc::new(XacppSession::new(Some(quiet_cfg())));
     let mut rig = Injector::new(b"").await;
     rig.wire_peer(&session).await;
     rig.connect_peer().await;
 
-    let mut delivered = capture_binary(&session);
+    let mut delivered = capture_binary(&session).await;
 
     // Hand-craft a 2-frame transaction directly onto the wire and inject
     // duplicates of seq 0 before the completing frame.
@@ -1740,25 +1750,6 @@ async fn c_duplicate_binary_frames_delivered_once_wire() {
         .expect("delivery within timeout")
         .expect("channel open");
     assert!(got == body, "completed bytes identical");
-
-    // Semantic boundary (component layer): duplicate absorption covers the
-    // incomplete window. A full replay of a *completed* transaction is
-    // indistinguishable from a fresh transfer sharing the txid and
-    // reassembles again — the second delivery surfaces, the connection
-    // survives, and no phantom partial delivery appears first.
-    rig.inject(&seq0).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        delivered.try_recv().is_err(),
-        "replayed seq0 alone must not deliver early"
-    );
-    rig.inject(&seq1).await;
-    let replayed = tokio::time::timeout(Duration::from_secs(5), delivered.recv())
-        .await
-        .expect("replay delivery within timeout")
-        .expect("channel open");
-    assert!(replayed == body, "replay reassembles byte-identical");
-    assert!(!rig.peer_closed(), "replay must not kill the connection");
 }
 
 /// C.4 (tolerated) — a `DATA_JSON` frame whose payload is not a valid
