@@ -1,4 +1,4 @@
-# XACPP Binary Wire Protocol — Specification v1.0
+# XACPP Binary Wire Protocol — Specification v1.1
 
 ## 1. Overview
 
@@ -76,10 +76,19 @@ Control class:
   negotiation.
 - `ACK` — receipt confirmation.
 - `NACK` — missing-frame report (gap list).
-- `RESUME` — reconnection progress handshake (receiver → holder).
-- `RESUME_RESPONSE` — reconnection progress answer (holder → receiver).
+- `RESUME` — reconnection declaration (holder → receiver): the pending
+  sends the holder still holds.
+- `RESUME_RESPONSE` — reconnection verdict (receiver → holder):
+  per-entry adjudication; `resumed` is the resume instruction.
 - `HEARTBEAT` — connection liveness.
 - `ERROR` — protocol-level error.
+- `TRANSACTION_PAUSE` (`0x0009`) — holder → receiver: transmission of
+  the named transaction is paused.
+- `TRANSACTION_ABORT` (`0x000A`) — holder → receiver: the named
+  transaction is abandoned and its retained copy released.
+- `TRANSACTION_COMPLETED` (`0x000B`) — holder → receiver: the holder
+  declares the named transaction's data plane finished — every declared
+  byte has been sent.
 - `SECURITY_UPGRADE` — reserved for runtime session-security upgrade.
 
 Data class:
@@ -103,11 +112,18 @@ transactions; control frames reference it.
 
 ## 5. Reliability
 
+The API-level shape of a binary transaction is a stream object whose
+lifecycle contract (session-bound lifetime, terminal states) is pinned in
+[docs/streams.md](streams.md); this section pins the wire machinery.
+
 - Senders retain unacknowledged transaction copies and retransmit on timeout.
 - Receivers reassemble per transaction and return `ACK` (receipt) / `NACK`
   (gap list) feedback.
-- Reconnection resume: a new connection carries `transaction_id` plus received
-  progress (`RESUME` handshake); the transfer continues from the breakpoint.
+- Reconnection resume: on a new connection the holder declares its pending
+  sends (`RESUME`) and holds their retransmission until the receiver's
+  per-entry verdicts arrive (`RESUME_RESPONSE`); a `resumed` verdict lifts
+  the gate and the transfer continues from the breakpoint (the holder's
+  own ACK bookkeeping is the watermark — no offset rides the verdict).
 - `HEARTBEAT` maintains liveness detection.
 - Application-layer backpressure: unacknowledged transaction bytes are capped
   (RECOMMENDED default 64 MiB, configurable). Senders pause sending pending
@@ -143,30 +159,50 @@ per entry:
   u32[]  missing_seqs             (missing_count entries)
 ```
 
-**RESUME / RESUME_RESPONSE** — reconnection progress handshake. The
-receiver of an incomplete transaction declares progress (`RESUME`); the
-holder of the copy answers per entry (`RESUME_RESPONSE`) and retransmits
-the missing frames. Distinct frame types — no payload-shape guessing.
+**RESUME / RESUME_RESPONSE** — reconnection recovery handshake. On
+wire-up the holder declares every pending send (`RESUME`) and gates those
+copies against retransmission; the receiver answers one verdict per entry
+(`RESUME_RESPONSE`). A `resumed` verdict is the resume instruction — the
+sole retransmission trigger across a reconnect (blind retransmission of
+retained copies over a fresh connection is retired): the holder lifts the
+gate and retransmits every unconfirmed frame. An `unknown`/`rejected`
+verdict fails the transfer as a whole: the holder releases the copy and
+its completion waiters end unconfirmed (completion remains
+final-ACK-only). Distinct frame types — no payload-shape guessing.
 
 ```text
-RESUME (receiver → holder):
-  u8   count                  (0..=255 entries; 0 = nothing to resume)
-  per entry: ACK entry shape (transaction_id, highest_contiguous_seq, received_frames)
+RESUME (holder → receiver):
+  u8   count                  (0..=255 entries; a holder with nothing
+                               pending sends no frame at all)
+  per entry: ACK entry shape (transaction_id + holder-side written
+             progress — informational only; adjudication is by
+             transaction_id alone, and the receiver's own ACK stream is
+             the watermark, which is why no offset rides the verdict)
 ```
 
 ```text
-RESUME_RESPONSE (holder → receiver):
-  u8   count                  (0..=255 entries)
+RESUME_RESPONSE (receiver → holder):
+  u8   count                  (one verdict per declaration entry — every
+                               declaration is answered exactly once)
   per entry:
     u8[16] transaction_id
-    u8     status             (0x01 resumed — retransmission follows;
-                               0x02 rejected — copy no longer held, receiver discards;
-                               0x03 unknown)
+    u8     status             (0x01 resumed — the transaction is still open
+                                 inbound; the holder resumes transmission;
+                               0x03 unknown — not recognized; fail the
+                                 transfer;
+                               0x02 rejected — wire-compatibility value,
+                                 same effect as unknown)
 ```
 
-A transaction whose received frames have no contiguous prefix from
-frame 0 exports no RESUME entry either (same u32 expressiveness limit
-as ACK); the holder's retransmission timeout covers it.
+Receiver adjudication: a declared transaction the receiver still holds
+open (incomplete) answers `resumed`; anything else answers `unknown` —
+with no terminal trace kept, a consumed-and-delivered transaction and a
+never-seen one are indistinguishable. Mirror cross-check: an inbound
+transaction still open that the declaration does NOT cover can never
+complete (the holder released or aborted its copy while disconnected) —
+the receiver cancels its stream and drops the slot. Completed-but-
+undelivered slots are excluded from the cross-check: they need nothing
+more from the holder.
 
 **HEARTBEAT** — unidirectional liveness probe (each side sends its own;
 no echo):
@@ -174,6 +210,28 @@ no echo):
 ```text
 u32  monotonic_seq
 u64  sender_epoch_ms
+```
+
+**TRANSACTION_PAUSE** — the holder has paused transmission of the named
+transaction (new frames and retransmission of it both suspended):
+
+```text
+u8[16] transaction_id
+```
+
+**TRANSACTION_ABORT** — the holder has abandoned the named transaction
+and released its retained copy; the receiver discards all received frames
+of it:
+
+```text
+u8[16] transaction_id
+```
+
+**TRANSACTION_COMPLETED** — the holder declares the named transaction's
+data plane finished (every declared byte has been sent):
+
+```text
+u8[16] transaction_id
 ```
 
 **ERROR** — protocol-level error:
@@ -200,10 +258,15 @@ receivers parse it structurally.
   delivery: completed payloads are retained on the receiver until the
   application handler consumes them (or the session ends); a handler
   registered after completion still receives the payload exactly once.
-- Senders release transaction copies on final ACK, or on RESUME
-  rejection by the peer. RECOMMENDED copy retention after connection
-  loss: 120 s (configurable) — expired copies answer future RESUME
-  requests with `rejected`.
+- Senders release transaction copies on final ACK or on abort. A copy
+  lives exactly as long as its transaction: no retention deadline, no
+  expiry sweep — a paused transaction or a broken connection never
+  invalidates a copy on its own, and resumption is available whenever
+  the connection returns. The holder keeps no terminal trace: after a
+  reconnect, a declared transaction the receiver no longer holds open
+  (completed and consumed, or never seen) adjudicates `unknown` and the
+  transfer fails as a whole; `rejected` remains a wire value for
+  tolerance with the same effect.
 - Retransmission: RECOMMENDED initial timeout 2 s, exponential backoff
   ×2 up to 30 s (both configurable). A NACK triggers immediate
   retransmission of the listed frames.
@@ -213,13 +276,51 @@ receivers parse it structurally.
   an immediate retryable error from the send API or as internal queuing
   with automatic flush once ACKs release copies — both forms are
   conformant (wire behaviour is identical).
+- Pause/abort/completion: a holder may pause an in-flight transaction
+  (suspending both new frames and retransmissions of it), abort it
+  (releasing the retained copy), or finish it. After each action the
+  holder MUST emit the matching control frame (`TRANSACTION_PAUSE` /
+  `TRANSACTION_ABORT` / `TRANSACTION_COMPLETED`) so the receiver can
+  capture the state; a finish whose written bytes fall short of the
+  declared total is not a completion at all — the holder emits
+  `TRANSACTION_ABORT` instead (a short write is an abnormal end, never
+  a silent one). A paused transaction is distinct from a stalled peer —
+  liveness detection is connection-level (HEARTBEAT) and unaffected.
+  Resumption after pause is implicit: the next data frame of the
+  transaction arrives. On abort the receiver discards the
+  transaction's partial reassembly.
+- Completion announcement semantics: `TRANSACTION_COMPLETED` is sent
+  after the transaction's tail data frame. On the receive side, if the
+  named transaction is live: bytes complete ⇒ the transaction completes
+  (the byte-count path owns the verdict; a still-open stream is closed
+  as complete, and a late announcement is ignored); bytes missing ⇒
+  the stream ends explicitly as *incomplete* with the byte gap — the
+  receiver never waits for bytes that will not come. A transaction with
+  no live slot ignores the frame. The frame is NOT mandatory: a
+  transaction whose bytes add up completes without it, so peers that
+  never send it stay compatible. The incomplete verdict rests on the
+  carrier being ordered and lossless (§7: TCP / stdio) — the
+  announcement overtaking a data frame, or a data frame dying in
+  transit, are both outside that premise.
+- Transaction control frame scheduling: the three transaction control
+  frames (`TRANSACTION_PAUSE` / `TRANSACTION_ABORT` /
+  `TRANSACTION_COMPLETED`) travel in wire order behind the
+  transaction's own queued data frames (an abort that overtook the
+  first data frame would be ignored by a receiver that never saw the
+  stream, leaving the late frame to open a stream that never
+  terminates; a completion that overtook the tail would fake a byte
+  shortfall). A sender MAY expedite one only when nothing of that
+  transaction is queued ahead of it.
 - Liveness: peers exchange HEARTBEAT frames; any inbound frame refreshes
   the peer-activity clock. RECOMMENDED heartbeat interval 30 s, silent
   timeout 90 s (both configurable); silence past the timeout declares the
   connection dead (teardown, resume on reconnect).
-- On reconnection, a receiver sends RESUME requests for each incomplete
-  transaction before accepting new data flows on that logical channel;
-  the holder answers per entry, then retransmits.
+- On reconnection, the holder declares its pending sends (`RESUME`) on
+  wire-up and holds their retransmission until the receiver's verdicts
+  arrive (`RESUME_RESPONSE`); `resumed` lifts the gate and retransmits
+  the unconfirmed frames, `unknown`/`rejected` fails the transfer.
+  Connection-level traffic (HEARTBEAT/ACK/NACK) is not gated, and
+  transactions opened on the new connection flow normally.
 - Reliability feature negotiation travels in the envelope Negotiate
   command (message-semantics layer); the `NEGOTIATE` frame type stays
   reserved in v1.0.
@@ -231,8 +332,11 @@ receivers parse it structurally.
 2. Transactions deliver independently; no cross-transaction head-of-line
    blocking.
 3. Streaming small messages are not batched, or only with a very short window.
-4. Control frames take scheduling priority and may interleave between data
-   frames of in-flight transactions.
+4. Connection-level control frames take scheduling priority and may
+   interleave between data frames of in-flight transactions; the three
+   transaction control frames instead travel in wire order behind their
+   transaction's data frames (see §5, completion announcement
+   semantics).
 
 ## 6. Session Security (Optional)
 
@@ -272,7 +376,127 @@ implementing library; both satisfy the requirements above.
 | TCP via relay (future) | Required | Defense in depth |
 | stdio | Not applicable (local pipe; no threat model) | Primary integrity defense |
 
-## 8. Versioning
+## 8. Resource Fetch (fetch)
+
+Fetch is a symmetric, stateless pull convention: one peer names a resource,
+the other answers with metadata and then streams the bytes over the binary
+channel. Roles are interchangeable; frame and command semantics are
+identical in both directions. The kernel composes two existing primitives —
+one command round-trip and one binary transaction — and introduces no new
+frame types and no fetch-specific protocol state.
+
+Fetch is business-neutral: the protocol pins only *how* a resource is
+pulled. Which resources are fetchable, and when, is the consumer's business
+decision and never appears at the protocol layer.
+
+### 8.1 Sequence
+
+1. **a → b: `fetch` command** — names the resource by `uri`. Multiple
+   fetches may be in flight concurrently; fetch commands interleave freely
+   with other traffic.
+2. **b → a: `fetch_ready` response, or an error** — on success, b commits
+   to streaming the resource and declares its metadata.
+3. **a → b: `fetch_begin` command** — a confirms readiness to receive;
+   b MUST NOT emit any frame of the transaction before receiving it.
+4. **b → a: binary transaction** — b streams the resource via the binary
+   channel (§5); the transaction id correlates the stream to the response.
+5. **a: dispatch** — the transaction is delivered through the binary
+   receive path carrying its transaction id. Everything afterwards —
+   buffering, persistence, integrity verification, progress accounting —
+   is an application-layer concern.
+
+The stream ends when the binary transaction completes under §5 semantics.
+There is no fetch-specific completion handshake, disconnect semantics, or
+retry obligation: interruption and resume are inherited from §5 unchanged.
+
+### 8.2 Wire format
+
+Request (message-semantics command):
+
+```json
+{ "fetch": { "uri": "<string>" } }
+```
+
+Response — success:
+
+```json
+{ "kind": "fetch_ready", "txid": "<32 lowercase hex chars>",
+  "sha256": "<64 lowercase hex chars>", "sizeBytes": 0, "mime": "<string>" }
+```
+
+Failure uses the generic error response with a registered code:
+
+| code | semantics |
+|---|---|
+| `fetch_not_found` | uri unknown or resource gone |
+| `fetch_refused` | uri outside the servable scope, or pause/resume not implemented |
+| `fetch_unavailable` | fetch unsupported on this end (no fetch responder loaded) |
+
+- `uri` is opaque to the protocol; its structure is an application-layer
+  convention between the two ends.
+- `txid` is generated by the responder (b) and MUST be unique among
+  in-flight transactions on the connection; it IS the binary transaction
+  id of step 4.
+- The responder computes `sha256`/`sizeBytes` from the bytes it sends
+  (self-computed at response time; never application-declared).
+
+### 8.3 Companion commands
+
+The fetch command set as a whole is protocol contract; *who* implements
+these commands and *how* is the extension layer's business (§8.6). All
+three are message-semantics commands addressed to the transaction holder:
+
+```json
+{ "fetch_begin":  { "txid": "<32 lowercase hex chars>" } }
+{ "fetch_pause":  { "txid": "<32 lowercase hex chars>" } }
+{ "fetch_resume": { "txid": "<32 lowercase hex chars>" } }
+{ "fetch_abort":  { "txid": "<32 lowercase hex chars>" } }
+```
+
+- `fetch_begin` — stream-start authorization: the requester confirms
+  readiness to receive the named transaction; the holder MUST NOT emit
+  any frame of it before receiving this command. Idempotent: a repeated
+  `fetch_begin` for an in-flight transaction answers success; an unknown
+  or terminal txid answers `fetch_refused`.
+- `fetch_pause` / `fetch_resume` — flow-control requests: the holder
+  suspends / continues transmission of the named transaction.
+- `fetch_abort` — stop and release: the holder ceases transmission of
+  the named transaction and releases its resources. Idempotent: aborting
+  a completed or unknown txid answers success.
+- Generic `ok` / error responses apply; a holder that does not implement
+  pause/resume answers `fetch_refused`.
+
+Holder-side state notifications travel on the transport control plane,
+not as commands: `TRANSACTION_PAUSE` / `TRANSACTION_ABORT` /
+`TRANSACTION_COMPLETED` (§5) let the receiver capture the holder's
+pause/abort/completion actions per transaction.
+
+### 8.4 Ordering
+
+The holder MUST NOT start the binary transaction before receiving
+`fetch_begin`, and the requester issues `fetch_begin` only after
+observing `fetch_ready`. This causality chain — not any channel-ordering
+assumption — guarantees the requester observes the metadata before any
+byte of that transaction. An
+inbound binary transaction whose id matches no announced fetch is not a
+fetch delivery; how it is handled is the consumer's business — the fetch
+kernel imposes no buffering obligation.
+
+### 8.5 Out of scope (contract firewall)
+
+The kernel promises a binary stream, not a file delivery.
+Request/stream correlation beyond txid carriage, buffering, disk writes,
+sha256 verification, completion aggregation, and pause/resume/cancel
+bookkeeping are application-layer concerns. A library may ship optional
+extension modules for these conveniences; extensions MUST NOT change,
+weaken, or add to any obligation in this section. Where an extension
+does verify integrity: a transfer that ends short of the announced bytes
+is *truncated* (§5, incomplete terminal), not corrupted — the consumer
+must see that truncation explicitly (never a hang, never misreported as
+a digest mismatch), and the retry-or-otherwise decision belongs to the
+application.
+
+## 9. Versioning
 
 - Library 1.x releases carry protocol major 1; the frame header version and
   the library version advance together.
@@ -280,7 +504,7 @@ implementing library; both satisfy the requirements above.
 - `version_minor`: a lower implementation tolerates a higher peer by ignoring
   unknown frame types and unrecognized fields.
 
-## 9. Terminology
+## 10. Terminology
 
 - **round** — unique identifier of one engine run (turn-level identity).
   Event payload field; unrelated to connection or security.

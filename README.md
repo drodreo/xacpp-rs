@@ -35,7 +35,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-xacpp = "1.0"
+xacpp = "1.1"
 ```
 
 ### Establish a session (initiator side)
