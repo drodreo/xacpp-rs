@@ -363,15 +363,21 @@ impl TransferSession {
             .await;
         // 3. Store the wiring: write surface + silent-timeout disconnect.
         *self.core.wiring.write().await = Some(transport);
-        // 4. Recovery declaration (recovery discipline): the holder
-        //    announces its pending send transactions to the receiver and
-        //    arms the reconnect gate on them — they send nothing until
-        //    the receiver's per-transaction verdict arrives (Resumed =
-        //    continue, Unknown = fail out). Blind retransmission across a
-        //    reconnect is retired.
-        let transport = self.core.wiring.read().await.clone();
-        if let Some(transport) = transport {
-            send_resume_declaration(self, transport.as_ref()).await;
+        // 4. Recovery discipline: arm the reconnect gate on every pending
+        //    send — they retransmit nothing until the receiver's per-
+        //    transaction verdict arrives (Resumed = continue, Unknown =
+        //    fail out). The RESUME declaration frame itself is NOT sent
+        //    here: at wire-up the peer's transfer plane may not exist yet
+        //    (the initiator wires at connect, BEFORE the responder builds
+        //    its session inside on_establish), and a dropped declaration
+        //    deadlocks the holder awaiting a verdict that never arrives.
+        //    Sending happens in `declare_pending_sends`, fired by the peer
+        //    once the establish handshake completes (or by a consumer-
+        //    driven `XacppSession::wire`, which by contract runs when the
+        //    peer is already wired — the responder's on_establish case).
+        {
+            let mut st = self.core.state.lock().await;
+            st.sender.declare_pending();
         }
         // 5. Re-wire recovery (docs/streams.md): clear the flow stall on
         //    every surviving stream (back to its Active/Paused state — the
@@ -386,6 +392,19 @@ impl TransferSession {
         }
         self.wake_writers();
         Ok(())
+    }
+
+    /// Recovery discipline: send the RESUME declaration for every pending
+    /// send (declare_pending is idempotent — re-declaring re-arms the same
+    /// gate). Fired by the peer when the establish handshake completes (the
+    /// only moment BOTH transfer planes are live on an establish topology),
+    /// or by a consumer-driven `XacppSession::wire` — which by contract
+    /// happens when the peer is already wired (responder's on_establish).
+    pub(crate) async fn declare_pending_sends(&self) {
+        let transport = self.core.wiring.read().await.clone();
+        if let Some(transport) = transport {
+            send_resume_declaration(self, transport.as_ref()).await;
+        }
     }
 
     /// Detach from the current connection: hooks unregistered, clock

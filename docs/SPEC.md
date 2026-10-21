@@ -119,8 +119,9 @@ lifecycle contract (session-bound lifetime, terminal states) is pinned in
 - Senders retain unacknowledged transaction copies and retransmit on timeout.
 - Receivers reassemble per transaction and return `ACK` (receipt) / `NACK`
   (gap list) feedback.
-- Reconnection resume: on a new connection the holder declares its pending
-  sends (`RESUME`) and holds their retransmission until the receiver's
+- Reconnection resume: on a new connection the holder gates its pending
+  sends against retransmission and declares them (`RESUME`) once both
+  transfer planes are wired, holding retransmission until the receiver's
   per-entry verdicts arrive (`RESUME_RESPONSE`); a `resumed` verdict lifts
   the gate and the transfer continues from the breakpoint (the holder's
   own ACK bookkeeping is the watermark — no offset rides the verdict).
@@ -159,9 +160,16 @@ per entry:
   u32[]  missing_seqs             (missing_count entries)
 ```
 
-**RESUME / RESUME_RESPONSE** — reconnection recovery handshake. On
-wire-up the holder declares every pending send (`RESUME`) and gates those
-copies against retransmission; the receiver answers one verdict per entry
+**RESUME / RESUME_RESPONSE** — reconnection recovery handshake. At
+wire-up the holder arms the reconnect gate on every pending send
+(retransmission stays silent until the verdict). The holder sends the
+declaration (`RESUME`) only once BOTH transfer planes are wired — a
+declaration dropped by a not-yet-wired peer would deadlock the holder
+awaiting a verdict that never arrives. On an establish topology this
+means: the responder declares from its `on_establish` wire (the
+initiator wired at connect), and the initiator declares when the
+handshake completes (the responder wired inside `on_establish`). The
+receiver answers one verdict per entry
 (`RESUME_RESPONSE`). A `resumed` verdict is the resume instruction — the
 sole retransmission trigger across a reconnect (blind retransmission of
 retained copies over a fresh connection is retired): the holder lifts the

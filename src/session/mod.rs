@@ -116,7 +116,37 @@ impl XacppSession {
         *self.transport.write().await = None;
         self.transfer.wire(Arc::clone(&transport)).await?;
         *self.transport.write().await = Some(transport);
+        // Recovery discipline: a consumer-driven wire (the responder side
+        // inside on_establish) runs when the peer's transfer plane is
+        // already live — declare pending sends now. The peer's own
+        // initiator-side path wires at connect via `wire_without_declaration`
+        // and declares only after the establish handshake completes.
+        self.transfer.declare_pending_sends().await;
         Ok(())
+    }
+
+    /// Wire WITHOUT the recovery declaration: used by the peer at connect
+    /// time on the initiator side — the responder's session does not exist
+    /// until the upcoming establish, so a declaration now would be dropped
+    /// by the not-yet-wired peer, deadlocking the holder. The peer fires
+    /// `declare_pending_sends` once establish completes.
+    pub(crate) async fn wire_without_declaration(
+        &self,
+        transport: Arc<dyn XacppTransport>,
+    ) -> Result<(), XacppError> {
+        self.transfer.unwire().await;
+        *self.transport.write().await = None;
+        self.transfer.wire(Arc::clone(&transport)).await?;
+        *self.transport.write().await = Some(transport);
+        Ok(())
+    }
+
+    /// Recovery discipline trigger for the peer: send the RESUME
+    /// declaration for every pending send. Fired when the establish
+    /// handshake completes — the only moment both transfer planes are
+    /// wired on an establish topology. Idempotent.
+    pub(crate) async fn declare_pending_sends(&self) {
+        self.transfer.declare_pending_sends().await;
     }
 
     /// Detaches the session from its transport (clock stopped, inbound

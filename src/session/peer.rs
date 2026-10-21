@@ -292,12 +292,17 @@ impl XacppPeer {
         self.transport.connect().await?;
 
         // Wire the initiator-side session now that the connection is live:
-        // the session's transfer clock starts (self-driven) and the RESUME
-        // handshake runs through the write surface (attach-to-a-live-
-        // connection semantics). Idempotent: a retry after a failed
-        // `connect` attempt replaces the stale wiring.
+        // the session's transfer clock starts (self-driven) and inbound
+        // routing attaches. The recovery DECLARATION is deliberately not
+        // sent yet — the responder builds and wires its session only inside
+        // the upcoming establish, so a declaration at connect would be
+        // dropped by the not-yet-wired peer and deadlock the holder; the
+        // peer fires it when establish completes. Idempotent: a retry after
+        // a failed `connect` attempt replaces the stale wiring.
         if let Some(session) = &self.session {
-            session.wire(Arc::clone(&self.transport)).await?;
+            session
+                .wire_without_declaration(Arc::clone(&self.transport))
+                .await?;
         }
 
         let mut inner = self.inner.lock().await;
@@ -381,6 +386,11 @@ impl XacppPeer {
                         self.inner.lock().await.emit_events.clone(),
                     )
                     .await;
+                // Recovery discipline: the handshake is complete and the
+                // responder wired its transfer plane inside on_establish —
+                // declare pending sends now (the declaration at connect
+                // would have been dropped by the not-yet-wired peer).
+                session.declare_pending_sends().await;
                 Ok(session)
             }
             XacppResponse::EstablishPrepare { challenge } => {
@@ -420,6 +430,10 @@ impl XacppPeer {
                                 self.inner.lock().await.emit_events.clone(),
                             )
                             .await;
+                        // Recovery discipline: handshake complete (challenge
+                        // path) — declare pending sends now that both
+                        // transfer planes are wired.
+                        session.declare_pending_sends().await;
                         Ok(session)
                     }
                     XacppResponse::EstablishReject { reason } => {

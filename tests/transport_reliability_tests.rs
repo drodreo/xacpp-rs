@@ -1559,3 +1559,345 @@ async fn bidirectional_resume_reconciles_both_directions() {
         "b→a bytes equal after reconciliation"
     );
 }
+
+// ---- Recovery over the real establish handshake (SPEC §5) ----
+//
+// Pin the RESUME declaration timing against the establish topology: the
+// declaration must land only after BOTH peers' transfer planes are wired.
+// The bug these anchor: the declaration fired at wire-up, which on the
+// initiator side precedes the responder's on_establish wire — the RESUME
+// frame was dropped by the not-yet-wired receiver and the holder
+// deadlocked awaiting a verdict that could never arrive.
+//
+// RED anchor discipline: both cases must fail by timeout before the fix
+// and pass deterministically after it (loopback resume is milliseconds;
+// the cap only distinguishes deadlock from success).
+
+mod establish_topo {
+    use super::*;
+    use xacpp::session::handler::{
+        EstablishDecision, EstablishHandler, NegotiateHandler, XacppSessionHandler,
+    };
+    use xacpp::session::peer::XacppPeer;
+    use xacpp::wire::capability::{Capabilities, EffectiveCapabilities};
+    use xacpp::wire::events::XacppActivityEvent;
+    use xacpp::wire::message::XacppResponse;
+
+    const RESUME_CAP: Duration = Duration::from_secs(5);
+
+    fn caps() -> Capabilities {
+        Capabilities {
+            commands: vec![],
+            produce_events: vec![],
+            accept_events: vec![],
+        }
+    }
+
+    struct AcceptAllNegotiate;
+
+    #[async_trait::async_trait]
+    impl NegotiateHandler for AcceptAllNegotiate {
+        async fn on_negotiate(&self, _effective: EffectiveCapabilities) -> Result<(), XacppError> {
+            Ok(())
+        }
+    }
+
+    struct AckSessionHandler;
+
+    #[async_trait::async_trait]
+    impl XacppSessionHandler for AckSessionHandler {
+        async fn on_command(&self, _command: XacppCommand) -> Result<XacppResponse, XacppError> {
+            Ok(XacppResponse::acknowledge())
+        }
+
+        async fn on_event(&self, _event: XacppActivityEvent) -> Result<XacppResponse, XacppError> {
+            Ok(XacppResponse::acknowledge())
+        }
+    }
+
+    /// Never used on the initiator side (its establish handler is only
+    /// consulted by the responder role), but XacppPeer::new requires one.
+    struct NeverEstablish;
+
+    #[async_trait::async_trait]
+    impl EstablishHandler for NeverEstablish {
+        async fn on_establish(
+            &self,
+            _transport: Arc<dyn XacppTransport>,
+            _credentials: Option<String>,
+        ) -> Result<EstablishDecision, XacppError> {
+            Err(XacppError::Internal("never an initiator".into()))
+        }
+
+        async fn on_establish_confirm(
+            &self,
+            _transport: Arc<dyn XacppTransport>,
+        ) -> Result<(String, Arc<dyn XacppSessionHandler>, String), XacppError> {
+            Err(XacppError::Internal("never an initiator".into()))
+        }
+    }
+
+    /// Responder-side fixture following the documented consumer pattern:
+    /// the session is built on first establish and REUSED by identity on
+    /// reconnect, wired to the live transport inside on_establish.
+    /// Inbound binaries are collected through the stream surface (a
+    /// transaction claimed by a stream never reaches on_binary); the first
+    /// chunk read flips the claim watch so tests can wait for an OPEN
+    /// inbound slot before inducing the outage.
+    struct ResponderFixture {
+        session: tokio::sync::Mutex<Option<Arc<XacppSession>>>,
+        received: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        claimed: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl ResponderFixture {
+        fn new() -> (Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (claimed, _rx) = tokio::sync::watch::channel(false);
+            (
+                Arc::new(Self {
+                    session: tokio::sync::Mutex::new(None),
+                    received: tx,
+                    claimed,
+                }),
+                rx,
+            )
+        }
+
+        /// Resolves once the inbound stream has been claimed (first chunk read).
+        async fn wait_stream_claimed(&self) {
+            let mut rx = self.claimed.subscribe();
+            rx.wait_for(|c| *c).await.expect("claim watch open");
+        }
+
+        async fn session(&self) -> Arc<XacppSession> {
+            let slot = self.session.lock().await;
+            slot.as_ref().expect("session built at establish").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EstablishHandler for ResponderFixture {
+        async fn on_establish(
+            &self,
+            transport: Arc<dyn XacppTransport>,
+            _credentials: Option<String>,
+        ) -> Result<EstablishDecision, XacppError> {
+            let session = {
+                let mut slot = self.session.lock().await;
+                match &*slot {
+                    Some(s) => Arc::clone(s),
+                    None => {
+                        let received = self.received.clone();
+                        let claimed = self.claimed.clone();
+                        let s = Arc::new(
+                            XacppSession::new(None)
+                                .with_identity(
+                                    "responder-sid".to_string(),
+                                    "responder-creds".to_string(),
+                                )
+                                .await,
+                        );
+                        // Stream surface only: a transaction claimed by a
+                        // stream never reaches on_binary — accumulate per
+                        // stream and emit the full payload at stream end
+                        // for the byte-exactness check. The first chunk
+                        // read flips the claim watch (OPEN slot signal).
+                        s.on_binary_stream(Arc::new(move |stream| {
+                            let received = received.clone();
+                            let claimed = claimed.clone();
+                            tokio::spawn(async move {
+                                let mut acc: Vec<u8> = Vec::new();
+                                while let Some(chunk) = stream.read().await {
+                                    acc.extend_from_slice(&chunk.bytes);
+                                    claimed.send_replace(true);
+                                }
+                                let _ = received.send(acc);
+                            });
+                        }))
+                        .await;
+                        *slot = Some(Arc::clone(&s));
+                        s
+                    }
+                }
+            };
+            // The peer's transfer plane on the initiator side was wired at
+            // connect — wiring (and declaring) here is safe.
+            session.wire(transport).await?;
+            Ok(EstablishDecision::Established {
+                session_id: session.session_id().await,
+                handler: Arc::new(AckSessionHandler),
+                credentials: "responder-creds".to_string(),
+            })
+        }
+
+        async fn on_establish_confirm(
+            &self,
+            _transport: Arc<dyn XacppTransport>,
+        ) -> Result<(String, Arc<dyn XacppSessionHandler>, String), XacppError> {
+            Err(XacppError::Internal("no challenge in this fixture".into()))
+        }
+    }
+
+    /// One establish round over a fresh duplex; returns the peers and the
+    /// initiator-side session.
+    async fn establish_round(
+        session_a: Arc<XacppSession>,
+        responder: Arc<ResponderFixture>,
+    ) -> (XacppPeer, XacppPeer) {
+        let (ta, tb) = duplex_pair();
+        let peer_a = XacppPeer::new(
+            caps(),
+            Arc::new(ta),
+            Some(session_a),
+            Arc::new(AcceptAllNegotiate),
+            Arc::new(NeverEstablish),
+        );
+        let peer_b = XacppPeer::new(
+            caps(),
+            Arc::new(tb),
+            None,
+            Arc::new(AcceptAllNegotiate),
+            responder,
+        );
+        peer_a.connect().await.unwrap();
+        peer_b.connect().await.unwrap();
+        peer_a.negotiate().await.unwrap();
+        peer_a
+            .establish(None, Arc::new(AckSessionHandler), |_| Ok(()))
+            .await
+            .unwrap();
+        (peer_a, peer_b)
+    }
+
+    /// Inflight transfer resumes across a reconnect over the REAL establish
+    /// handshake — holder = initiator side.
+    #[tokio::test]
+    async fn establish_topo_inflight_resume_holder_initiator() {
+        let session_a = Arc::new(XacppSession::new(None));
+        let (responder, mut received_rx) = ResponderFixture::new();
+        let (peer_a1, peer_b1) = establish_round(Arc::clone(&session_a), responder.clone()).await;
+
+        // 16 MiB inflight. Wait until the receiver holds an OPEN inbound
+        // slot (first chunk read), then tear down mid-flight — a
+        // zero-progress receive is indistinguishable from "never seen"
+        // after a reconnect and is correctly adjudicated Unknown
+        // (no-tombstone cost).
+        let payload = pattern(16 * 1024 * 1024);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        session_a
+            .send_binary(
+                payload.clone(),
+                Some(Box::new(move |result| {
+                    let _ = done_tx.send(result);
+                })),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(RESUME_CAP, responder.wait_stream_claimed())
+            .await
+            .expect("receiver must claim the inbound stream before the outage");
+        peer_a1.disconnect().await.unwrap();
+        peer_b1.disconnect().await.unwrap();
+
+        // Round 2: same initiator session (pending copies retained); the
+        // responder reuses its session by identity.
+        let (peer_a2, peer_b2) = establish_round(Arc::clone(&session_a), responder).await;
+
+        let result = tokio::time::timeout(RESUME_CAP, done_rx)
+            .await
+            .expect("RESUME resume chain deadlocked (declaration lost before the peer was wired)")
+            .expect("completion channel must not close");
+        assert!(
+            result.confirmed,
+            "resumed transfer must complete confirmed, got: {result:?}"
+        );
+        let got = tokio::time::timeout(RESUME_CAP, received_rx.recv())
+            .await
+            .expect("receiver must complete the reassembled payload")
+            .expect("receiver channel open");
+        assert!(got == payload, "receiver bytes bit-exact after resume");
+
+        peer_a2.disconnect().await.unwrap();
+        peer_b2.disconnect().await.unwrap();
+    }
+
+    /// Same scenario with the roles flipped — holder = responder side (the
+    /// session the consumer builds and wires inside on_establish).
+    #[tokio::test]
+    async fn establish_topo_inflight_resume_holder_responder() {
+        let session_a = Arc::new(XacppSession::new(None));
+        let (responder, _received_rx) = ResponderFixture::new();
+        let (peer_a1, peer_b1) = establish_round(Arc::clone(&session_a), responder.clone()).await;
+
+        // Holder = responder's session; receiver = the initiator side.
+        // The receiver must hold an OPEN inbound slot before the outage —
+        // a zero-progress receive is indistinguishable from "never seen"
+        // after a reconnect and is correctly adjudicated Unknown
+        // (no-tombstone cost). Wait for the stream claim (= first frame
+        // reassembled, slot open) before tearing down.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel::<()>();
+        let (got_tx, mut got_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let claimed_tx = Arc::new(tokio::sync::Mutex::new(Some(claimed_tx)));
+        session_a
+            .on_binary_stream(Arc::new(move |stream| {
+                let claimed_tx = Arc::clone(&claimed_tx);
+                let got_tx = got_tx.clone();
+                tokio::spawn(async move {
+                    let mut acc: Vec<u8> = Vec::new();
+                    let mut claimed = false;
+                    while let Some(chunk) = stream.read().await {
+                        acc.extend_from_slice(&chunk.bytes);
+                        if !claimed {
+                            claimed = true;
+                            if let Some(tx) = claimed_tx.lock().await.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                    }
+                    let _ = got_tx.send(acc);
+                });
+            }))
+            .await;
+
+        let payload = pattern(16 * 1024 * 1024);
+        let session_r = responder.session().await;
+        session_r
+            .send_binary(
+                payload.clone(),
+                Some(Box::new(move |result| {
+                    let _ = done_tx.send(result);
+                })),
+            )
+            .await
+            .unwrap();
+        // Wait until the receiver has an OPEN slot (first chunk read),
+        // then tear down mid-flight.
+        tokio::time::timeout(RESUME_CAP, claimed_rx)
+            .await
+            .expect("receiver must claim the inbound stream before the outage")
+            .expect("claim channel open");
+        peer_b1.disconnect().await.unwrap();
+        peer_a1.disconnect().await.unwrap();
+
+        let (peer_a2, peer_b2) = establish_round(Arc::clone(&session_a), responder).await;
+
+        let result = tokio::time::timeout(RESUME_CAP, done_rx)
+            .await
+            .expect("RESUME resume chain deadlocked (declaration lost before the peer was wired)")
+            .expect("completion channel must not close");
+        assert!(
+            result.confirmed,
+            "resumed transfer must complete confirmed, got: {result:?}"
+        );
+        let got = tokio::time::timeout(RESUME_CAP, got_rx.recv())
+            .await
+            .expect("initiator side must complete the reassembled payload")
+            .expect("receiver channel open");
+        assert!(got == payload, "initiator bytes bit-exact after resume");
+
+        peer_a2.disconnect().await.unwrap();
+        peer_b2.disconnect().await.unwrap();
+    }
+}
