@@ -266,6 +266,7 @@ fn tuned(sender: fn(&mut xacpp::reliability::transaction::SenderConfig)) -> Tran
     let mut c = TransferConfig {
         ack_batch_interval_ms: 50,
         nack_feedback_interval_ms: 50,
+        resume_verdict_timeout_ms: 300,
         tick_interval_ms: 20,
         ..TransferConfig::default()
     };

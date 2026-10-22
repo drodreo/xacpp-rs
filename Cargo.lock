@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "xacpp"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "async-trait",
  "crc32fast",

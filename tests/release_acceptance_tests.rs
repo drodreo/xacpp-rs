@@ -107,6 +107,7 @@ fn test_cfg() -> TransferConfig {
         ack_batch_frames: 64,
         ack_batch_interval_ms: 100,
         nack_feedback_interval_ms: 100,
+        resume_verdict_timeout_ms: 300,
         tick_interval_ms: 20,
     }
 }
@@ -119,6 +120,7 @@ fn quiet_cfg() -> TransferConfig {
         silent_timeout_ms: 60_000,
         ack_batch_interval_ms: u64::MAX,
         nack_feedback_interval_ms: u64::MAX,
+        resume_verdict_timeout_ms: 300,
         ..test_cfg()
     }
 }

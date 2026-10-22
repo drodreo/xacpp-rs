@@ -46,6 +46,7 @@ fn lifecycle_config() -> TransferConfig {
         ack_batch_frames: 64,
         ack_batch_interval_ms: 50,
         nack_feedback_interval_ms: 50,
+        resume_verdict_timeout_ms: 300,
         tick_interval_ms: 20,
     }
 }
@@ -183,12 +184,11 @@ async fn capture_stream(b: &Arc<XacppSession>) -> StreamCapture {
 const FIVE_FRAMES: usize = 5 * 1000;
 
 // ---- L1: disconnect → stream survives → same object completes after
-// rewire. RED on purpose: kernel-layer resurrection window — after rewire,
-// a holder-side retransmission for an already-completed transaction
-// resurrects a second stream object (the receiver released the slot at
-// completion). The fix belongs to the recovery discipline (blind
-// retransmission retirement), not the extension layer; the extension-layer
-// sibling of this semantic is ext9_disconnect_resume. ----
+// rewire. Locks the single-stream-object invariant: the kernel-layer
+// second-stream window (a tail-only retransmission after rewire once
+// re-created a second stream object) is closed by the SPEC §3/§5 slotless
+// rule — only `seq == 0` opens a slot, so a late tail frame can never
+// re-create a stream. ----
 
 #[tokio::test]
 async fn l1_disconnect_stream_survives_same_object_completes_after_rewire() {

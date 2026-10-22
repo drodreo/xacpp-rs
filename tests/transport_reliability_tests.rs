@@ -41,6 +41,7 @@ fn test_config() -> TransferConfig {
         ack_batch_frames: 64,
         ack_batch_interval_ms: 100,
         nack_feedback_interval_ms: 100,
+        resume_verdict_timeout_ms: 300,
         tick_interval_ms: 20,
     }
 }
@@ -837,11 +838,14 @@ fn quiet_config() -> TransferConfig {
     cfg
 }
 
-/// RESUME rejected: the holder reports its copy gone, so our pending send
-/// completion must fire exactly once as unconfirmed and the entry must
-/// leave the completions map (a replay never fires again).
+/// RESUME rejected (wire-compatibility value, adjudicated like unknown):
+/// the holder's transaction is fully sent (tail frame plus the completion
+/// announcement went out), so the holder-side adjudication (SPEC §5)
+/// closes it **confirmed** — the completion fires exactly once as
+/// confirmed and the entry leaves the completions map (a replay never
+/// fires again).
 #[tokio::test]
-async fn send_completion_fires_unconfirmed_on_resume_rejected() {
+async fn send_completion_fires_confirmed_on_resume_rejected() {
     let (session, mut peer_write) = single_ended_session(quiet_config()).await;
 
     let (results_tx, mut results_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -876,8 +880,8 @@ async fn send_completion_fires_unconfirmed_on_resume_rejected() {
         .expect("callback fired");
     assert_eq!(result.transaction_id, txid);
     assert!(
-        !result.confirmed,
-        "RESUME rejected must release the completion unconfirmed"
+        result.confirmed,
+        "a fully-sent transaction closes confirmed by holder-side adjudication"
     );
 
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1297,11 +1301,15 @@ async fn resume_declaration_sent_only_when_pending() {
     );
 }
 
-/// A pending send the receiver does NOT recognize fails as a whole on
-/// reconnect: the (fresh) receiver answers `Unknown` and the completion
-/// fires exactly once as unconfirmed — never as confirmed.
+/// A pending send the receiver does NOT recognize closes by the
+/// holder-side adjudication (SPEC §5): the fresh receiver answers
+/// `Unknown` (zero progress — no frame ever arrived) and the holder, whose
+/// transaction is fully sent (tail frame plus the completion announcement
+/// went out), closes it **confirmed**. The zero-progress resume deadlock
+/// (Resumed → complete slot swallows the retransmission) is retired: the
+/// completion fires exactly once, in bounded time.
 #[tokio::test]
-async fn resume_unknown_verdict_releases_completion_unconfirmed() {
+async fn resume_unknown_verdict_confirms_a_fully_sent_transfer() {
     let mut cfg_a = test_config();
     cfg_a.sender.rto_initial_ms = u64::MAX; // conn 1: never retransmit
     cfg_a.sender.rto_max_ms = u64::MAX;
@@ -1373,8 +1381,8 @@ async fn resume_unknown_verdict_releases_completion_unconfirmed() {
         .expect("callback fired");
     assert_eq!(result.transaction_id, txid);
     assert!(
-        !result.confirmed,
-        "an unrecognized pending send fails unconfirmed on reconnect"
+        result.confirmed,
+        "a fully-sent transaction closes confirmed by holder-side adjudication"
     );
 }
 
@@ -1455,6 +1463,82 @@ async fn repeated_resume_declaration_is_idempotent() {
     expected.extend_from_slice(&[1u8; 4]);
     expected.extend_from_slice(&[2u8; 4]);
     assert_eq!(got.1, expected);
+}
+
+/// Receiver adjudication, disambiguated (SPEC §5 v1.1.1): an open
+/// INCOMPLETE slot answers `Resumed` (the continuation instruction); a
+/// completed-but-undelivered slot answers `Unknown` — it awaits local
+/// consumption and needs nothing more from the holder, and with no
+/// terminal trace kept a consumed-and-delivered transaction and a
+/// never-seen one are indistinguishable (the holder closes those by its
+/// own adjudication). One declaration covering both shapes is answered
+/// with exactly one verdict per entry.
+#[tokio::test]
+async fn resume_adjudicates_incomplete_as_resumed_and_completed_undelivered_as_unknown() {
+    let (_session, mut peer_read, mut peer_write) = readable_peer_rig(quiet_config()).await;
+
+    // NO on_binary handler: the completed slot stays retained
+    // (completed-but-undelivered) instead of being consumed.
+    // - txid_open: 1 of 2 frames — open incomplete.
+    // - txid_done: both frames — completed but undelivered.
+    let txid_open = [6u8; 16];
+    let txid_done = [7u8; 16];
+    inject_frame(
+        &mut peer_write,
+        Frame::new(FrameType::DataBinary, txid_open, 8, 0, vec![1u8; 4]),
+    )
+    .await;
+    for seq in 0..2u32 {
+        inject_frame(
+            &mut peer_write,
+            Frame::new(FrameType::DataBinary, txid_done, 8, seq, vec![2u8; 4]),
+        )
+        .await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // One declaration covering both shapes.
+    let declare = Frame::new(
+        FrameType::Resume,
+        [0u8; 16],
+        0,
+        0,
+        ResumeRequestPayload {
+            entries: vec![
+                AckEntry {
+                    transaction_id: txid_open,
+                    highest_contiguous_seq: 1,
+                    received_frames: 2,
+                },
+                AckEntry {
+                    transaction_id: txid_done,
+                    highest_contiguous_seq: 1,
+                    received_frames: 2,
+                },
+            ],
+        }
+        .encode()
+        .unwrap(),
+    );
+    inject_frame(&mut peer_write, declare).await;
+
+    let frames = collect_frames(&mut peer_read, Duration::from_millis(300)).await;
+    let resp = frames
+        .iter()
+        .find(|f| f.frame_type == FrameType::ResumeResponse)
+        .expect("every declaration is answered with one verdict frame");
+    let payload = ResumeResponsePayload::decode(&resp.payload).unwrap();
+    assert_eq!(payload.entries.len(), 2, "one verdict per declared entry");
+    for entry in &payload.entries {
+        let expected = if entry.transaction_id == txid_open {
+            ResumeStatus::Resumed
+        } else if entry.transaction_id == txid_done {
+            ResumeStatus::Unknown
+        } else {
+            panic!("unexpected verdict entry: {entry:?}");
+        };
+        assert_eq!(entry.status, expected);
+    }
 }
 
 /// Both directions reconcile independently across the same reconnect:

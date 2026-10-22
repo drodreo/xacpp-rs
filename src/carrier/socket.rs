@@ -300,9 +300,25 @@ impl XacppTransport for SocketTransport {
         tokio::spawn(async move {
             let mut decoder = FrameDecoder::new();
             let mut buf = [0u8; 8192];
+            // SPEC §5 disconnect discipline: when the reader observes the
+            // connection's death (EOF / read error / fatal decode), it
+            // detaches the transfer hooks BEFORE exiting — the earliest
+            // point this end can know the connection is gone. Frames that
+            // keep arriving afterwards (a dead connection's egress may
+            // flush for a while) find no mount and are dropped, never
+            // routed into session state; the RESUME handshake on the
+            // next wire-up is their only lawful re-entry.
+            async fn detach_hooks(
+                hooks: &Arc<tokio::sync::RwLock<Option<TransferActivityHandlers>>>,
+            ) {
+                *hooks.write().await = None;
+            }
             'read: loop {
                 match reader.read(&mut buf).await {
-                    Ok(0) => break, // EOF
+                    Ok(0) => {
+                        detach_hooks(&reader_hooks).await;
+                        break;
+                    } // EOF
                     Ok(n) => {
                         let frames = match decoder.feed(&buf[..n]) {
                             Ok(frames) => frames,
@@ -314,6 +330,7 @@ impl XacppTransport for SocketTransport {
                                 let io_err =
                                     std::io::Error::new(std::io::ErrorKind::InvalidData, e);
                                 let _ = frame_tx.send(Err(io_err)).await;
+                                detach_hooks(&reader_hooks).await;
                                 break;
                             }
                         };
@@ -349,6 +366,7 @@ impl XacppTransport for SocketTransport {
                     }
                     Err(e) => {
                         let _ = frame_tx.send(Err(e)).await;
+                        detach_hooks(&reader_hooks).await;
                         break;
                     }
                 }
@@ -369,6 +387,13 @@ impl XacppTransport for SocketTransport {
 
     async fn disconnect(&self) -> Result<(), XacppError> {
         let _guard = self.connect_lock.lock().await;
+
+        // SPEC §5 disconnect discipline: the transfer mount detaches from
+        // the dead transport immediately — frames still queued in this
+        // connection's egress may keep arriving at the peer's reader, and
+        // anything the peer flushes back over the dead link finds no hooks
+        // here and is dropped, never routed into session state.
+        *self.transfer_hooks.write().await = None;
 
         // Stop accepting new outbound traffic, then shut the egress down
         // (queued frames flush FIFO before the writer closes).

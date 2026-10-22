@@ -95,6 +95,9 @@ impl TransferSession {
             //    (connection dying right now) the frames are already in the
             //    state machine — the retransmission clock re-sends them once
             //    the session is wired again. The chunk is accepted.
+            //    (The gate check above shares this lock critical section, so
+            //    a chunk appended here is by definition not gated — nothing
+            //    appended can overtake the RESUME handshake.)
             for frame in frames {
                 if let Err(e) = wiring.write_data_frame(frame).await {
                     log::warn!("transfer: sink write raced a dead connection: {e}");
@@ -161,10 +164,26 @@ impl TransferSession {
         //    retransmission clock carries them over after re-wiring.
         //    Subscribe before the wiring check so a concurrent wire-up's
         //    wake cannot slip between check and wait.
+        //    Recovery discipline (SPEC §5): a transaction gated awaiting
+        //    the receiver's resume verdict SENDS NOTHING — the tail rides
+        //    with the verdict-driven retransmission instead. Flushing it
+        //    here (with the completion announcement behind it) would let
+        //    both overtake the RESUME handshake on the new connection: the
+        //    receiver would see a byte shortfall, end the stream as
+        //    incomplete and drop the slot — and the verdict-driven
+        //    retransmission would then land slotless.
+        let gated = self.core.state.lock().await.sender.is_awaiting_resume(txid);
         let mut wake = self.core.backpressure_watch.subscribe();
         let mut waited_unwired = false;
         let mut tail_flushed = false;
         loop {
+            if gated {
+                // Gated: nothing goes out — the tail and the completion
+                // announcement stay in the state machine until the verdict
+                // arrives (`Resumed` retransmits them; `Unknown`/`Rejected`
+                // closes by holder-side adjudication below).
+                break;
+            }
             let wiring = self.core.wiring.read().await.clone();
             match wiring {
                 Some(wiring) => {

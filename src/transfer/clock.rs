@@ -24,11 +24,18 @@ pub(crate) async fn send_resume_declaration(
 ) {
     let entries: Vec<AckEntry> = {
         let mut st = session.core.state.lock().await;
-        st.sender.declare_pending()
+        st.sender.declare_pending(now_ms())
     };
     if entries.is_empty() {
         return;
     }
+    send_resume_frame(wiring, entries).await;
+}
+
+/// Encode and write one RESUME declaration frame (control-priority
+/// channel). Shared by the wire-up declaration and the verdict-timeout
+/// retransmission.
+async fn send_resume_frame(wiring: &dyn TransferWiring, entries: Vec<AckEntry>) {
     let bytes = ResumeRequestPayload { entries }.encode();
     if let Ok(bytes) = bytes {
         match control_frame(FrameType::Resume, bytes) {
@@ -192,6 +199,23 @@ async fn clock_tick(session: &TransferSession, wiring: &dyn TransferWiring, now:
             log::warn!("transfer: failed to send retransmission: {e}");
             return true;
         }
+    }
+
+    // 3b. RESUME declaration retransmission (§5 recovery discipline): a
+    //     declaration that stays unanswered past the verdict timeout is
+    //     retransmitted — the handshake is the sole recovery entry, so its
+    //     own reliability is mandatory. Only still-gated transactions are
+    //     re-declared (adjudicated ones are out of the pending set or out
+    //     of the gate); each retransmission re-anchors its verdict clock.
+    let redeclare = st
+        .sender
+        .timed_out_declarations(now, cfg.resume_verdict_timeout_ms);
+    if !redeclare.is_empty() {
+        log::debug!(
+            "transfer: retransmitting RESUME declaration for {} unanswered transaction(s)",
+            redeclare.len()
+        );
+        send_resume_frame(wiring, redeclare).await;
     }
 
     // 4. Heartbeat (§5 liveness; `u64::MAX` interval disables).

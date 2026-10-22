@@ -65,6 +65,12 @@ pub enum ReceiveOutcome {
     /// Same-`seq` frame already stored — duplicate (retransmission);
     /// ignored, counts and bytes unchanged.
     Duplicate,
+    /// A data frame for a slotless transaction id with `seq > 0` (SPEC
+    /// §3/§5: a late retransmission of a settled transaction, or an
+    /// unannounced stream). Not reassembled — no slot is opened, nothing
+    /// is answered: the holder's closure signal is the RESUME verdict,
+    /// never a data-frame reply. Only `seq == 0` opens a slot.
+    SlotlessDropped,
 }
 
 /// Per-transaction slot state.
@@ -109,12 +115,13 @@ impl Slot {
 ///
 /// No terminal trace is kept (SPEC §5 v1.1 stateless kernel — no
 /// tombstones): once a slot is released (completion delivery or explicit
-/// `discard`) the txid simply has no slot. An inbound frame for a slotless
-/// id OPENS a fresh slot — late retransmissions of an already-finished
-/// transaction are absorbed idempotently this way (never delivered twice:
-/// delivery consumes the slot). If the holder no longer holds the
-/// transaction, the resurrected slot can never complete and is cancelled
-/// by the recovery cross-check (SPEC §5) on the holder's next declaration.
+/// `discard`) the txid simply has no slot. A txid reaches the receiver
+/// only through the peer's explicit announcement (SPEC §8 causality
+/// chain): a data frame for a slotless id (`seq > 0`) is NOT reassembled
+/// — it is reported as [`ReceiveOutcome::SlotlessDropped`] and the caller
+/// answers nothing (no ACK, no slot). The holder's closure signal is the
+/// RESUME verdict, never a data-frame reply (SPEC §3/§5). Only `seq == 0`
+/// (a transaction's first frame) opens a slot.
 #[derive(Debug)]
 pub struct TransactionReassembler {
     slots: HashMap<[u8; 16], Slot>,
@@ -139,6 +146,9 @@ impl TransactionReassembler {
     ///
     /// `frame_len` is validated against `payload.len()` (defence against
     /// caller bugs; the wire-level check lives in the frame decoder).
+    ///
+    /// A slotless id with `seq > 0` is dropped ([`ReceiveOutcome::
+    /// SlotlessDropped`], SPEC §3/§5) — only `seq == 0` opens a slot.
     ///
     /// `emit`: when `true`, the returned [`ReceiveOutcome::Accepted`]
     /// carries the frames newly covered by the contiguous prefix (streaming
@@ -166,6 +176,15 @@ impl TransactionReassembler {
             // A zero-byte transaction cannot exist on the wire; checked
             // before the slot is opened so no garbage slot is created.
             return Err(ReassemblyError::EmptyTotalLen);
+        }
+        // SPEC §3/§5: a txid reaches the receiver only through the peer's
+        // explicit announcement (§8 causality chain) — by the time `seq == 0`
+        // arrives. A data frame for a slotless id (`seq > 0`) is a late
+        // retransmission of a settled transaction or an unannounced stream:
+        // not reassembled, no slot opened, nothing answered (the holder's
+        // closure signal is the RESUME verdict, never a data-frame reply).
+        if seq > 0 && !self.slots.contains_key(&transaction_id) {
+            return Ok(ReceiveOutcome::SlotlessDropped);
         }
         let previous_prefix_end = self
             .slots
@@ -353,6 +372,7 @@ mod tests {
             match outcome {
                 ReceiveOutcome::Accepted { complete, .. } => completed |= complete,
                 ReceiveOutcome::Duplicate => {}
+                ReceiveOutcome::SlotlessDropped => {}
             }
         }
         assert!(completed, "transaction never completed");
@@ -371,9 +391,51 @@ mod tests {
     }
 
     #[test]
+    fn slotless_tail_frames_dropped_no_slot_no_answer() {
+        let mut r = TransactionReassembler::default();
+        let id = txid(7);
+        let p = vec![3u8; 4];
+        // SPEC §3/§5: a txid reaches the receiver only through the peer's
+        // explicit announcement (§8 causality chain). Tail frames for a
+        // slotless id are late retransmissions of a settled transaction or
+        // an unannounced stream: dropped — no slot, no ACK entry, nothing
+        // reassembled, nothing answered (the holder's closure signal is
+        // the RESUME verdict, never a data-frame reply).
+        for seq in [1u32, 2, 3] {
+            assert_eq!(
+                r.receive_frame(id, seq, 16, 4, &p, 100, false).unwrap(),
+                ReceiveOutcome::SlotlessDropped,
+                "slotless tail frame must be dropped"
+            );
+        }
+        // Slotless rule: nothing opened a slot behind the drops.
+        assert!(!r.contains_transaction(id));
+        assert_eq!(r.ack_entry(id), None);
+        assert!(r.open_transactions().next().is_none());
+        // The frame that MAY open a slot is `seq == 0` — the announced
+        // first frame; from there the transaction assembles normally.
+        assert_eq!(
+            r.receive_frame(id, 0, 16, 4, &p, 200, false).unwrap(),
+            ReceiveOutcome::Accepted {
+                complete: false,
+                emitted: vec![]
+            }
+        );
+        assert!(r.contains_transaction(id));
+        // The earlier tail frames were NOT silently stored: byte counts
+        // reflect only frame 0.
+        let entry = r.ack_entry(id).unwrap();
+        assert_eq!(entry.received_frames, 1);
+        assert_eq!(entry.highest_contiguous_seq, 0);
+    }
+
+    #[test]
     fn out_of_order_all_permutations_of_three() {
         let payload: Vec<u8> = (0..12u8).collect();
         let frames = chunked(&payload, 4);
+        // SPEC §3/§5: only `seq == 0` opens a slot. Tail frames arriving
+        // before frame 0 are dropped slotless (the slotless rule: no slot,
+        // no reassembly); from frame 0 on, the tail assembles in any order.
         let orders: [&[usize]; 6] = [
             &[0, 1, 2],
             &[0, 2, 1],
@@ -384,7 +446,26 @@ mod tests {
         ];
         for order in orders {
             let mut r = TransactionReassembler::default();
-            feed_order_and_deliver(&mut r, txid(2), 12, &frames, order, &payload);
+            let id = txid(2);
+            let mut idx = 0;
+            while order[idx] != 0 {
+                let (seq, len, frame_payload) = &frames[order[idx]];
+                assert_eq!(
+                    r.receive_frame(id, *seq, 12, *len, frame_payload, 1_000, false)
+                        .unwrap(),
+                    ReceiveOutcome::SlotlessDropped
+                );
+                assert!(
+                    !r.contains_transaction(id),
+                    "a slotless tail frame must not open a slot"
+                );
+                idx += 1;
+            }
+            // Frame 0 opens the slot; the earlier-dropped tail frames are
+            // late retransmissions now — replayed, they assemble in order.
+            let mut replayed = order[idx..].to_vec();
+            replayed.extend_from_slice(&order[..idx]);
+            feed_order_and_deliver(&mut r, id, 12, &frames, &replayed, &payload);
         }
     }
 
@@ -393,7 +474,17 @@ mod tests {
         let payload: Vec<u8> = (0..40u8).collect();
         let frames = chunked(&payload, 10);
         let mut r = TransactionReassembler::default();
-        feed_order_and_deliver(&mut r, txid(3), 40, &frames, &[2, 0, 3, 1], &payload);
+        let id = txid(3);
+        // Frame 2 arriving before frame 0: slotless, dropped (SPEC §3/§5).
+        let (seq, len, frame_payload) = &frames[2];
+        assert_eq!(
+            r.receive_frame(id, *seq, 40, *len, frame_payload, 1_000, false)
+                .unwrap(),
+            ReceiveOutcome::SlotlessDropped
+        );
+        // Frame 0 opens the slot; 3 and 1 interleave, and the dropped
+        // frame 2 arrives as a late retransmission to complete the set.
+        feed_order_and_deliver(&mut r, id, 40, &frames, &[0, 3, 1, 2], &payload);
     }
 
     #[test]
@@ -492,14 +583,25 @@ mod tests {
         let mut r = TransactionReassembler::default();
         let id = txid(8);
         let p = vec![7u8; 4];
-        // Frame 0 lost; 1 and 2 arrived — no contiguous prefix, so the
-        // transaction exports no ACK entry (SPEC §5 clarification:
-        // h=0 would falsely claim frame 0 received); the gap surfaces
-        // through NACK instead.
-        r.receive_frame(id, 1, 12, 4, &p, 100, false).unwrap();
-        r.receive_frame(id, 2, 12, 4, &p, 100, false).unwrap();
+        // Frame 0 never arrived: slotless tail frames are dropped (SPEC
+        // §3/§5) — no slot, so no contiguous prefix and no ACK entry (a
+        // cumulative `highest_contiguous_seq` cannot express "no prefix";
+        // h=0 would falsely claim frame 0 received). Nothing is
+        // reassembled and nothing is answered.
+        assert_eq!(
+            r.receive_frame(id, 1, 12, 4, &p, 100, false).unwrap(),
+            ReceiveOutcome::SlotlessDropped
+        );
+        assert_eq!(
+            r.receive_frame(id, 2, 12, 4, &p, 100, false).unwrap(),
+            ReceiveOutcome::SlotlessDropped
+        );
+        assert!(!r.contains_transaction(id));
         assert_eq!(r.ack_entry(id), None);
-        assert_eq!(r.missing_seqs(id, MAX_NACK_MISSING_ENTRIES), vec![0]);
+        assert_eq!(
+            r.missing_seqs(id, MAX_NACK_MISSING_ENTRIES),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]
@@ -507,14 +609,20 @@ mod tests {
         let mut r = TransactionReassembler::default();
         let id = txid(10);
         let p = vec![7u8; 4];
-        // Tail frames first (16 B = 4 frames): no prefix → no entry.
-        r.receive_frame(id, 1, 16, 4, &p, 100, false).unwrap();
-        r.receive_frame(id, 2, 16, 4, &p, 100, false).unwrap();
-        assert_eq!(r.ack_entry(id), None);
-        // Frame 0 arrives → prefix spans 0..=2 → entry exported with the
-        // true progress; the known gap list is empty (seq 3 is an
-        // unknowable tail, not reported).
-        r.receive_frame(id, 0, 16, 4, &p, 200, false).unwrap();
+        // Frame 0 opens the slot: the prefix spans 0 → entry exported
+        // immediately with the true progress (h=0); the known gap list is
+        // empty (seq 3 is an unknowable tail, not reported).
+        r.receive_frame(id, 0, 16, 4, &p, 100, false).unwrap();
+        let entry = r.ack_entry(id).unwrap();
+        assert_eq!(entry.highest_contiguous_seq, 0);
+        assert_eq!(entry.received_frames, 1);
+        // Out-of-order tail frames fill holes without advancing the prefix
+        // until the gap closes.
+        r.receive_frame(id, 2, 16, 4, &p, 150, false).unwrap();
+        assert_eq!(r.ack_entry(id).unwrap().highest_contiguous_seq, 0);
+        // Frame 1 arrives → prefix spans 0..=2 → entry exported with the
+        // advanced progress.
+        r.receive_frame(id, 1, 16, 4, &p, 200, false).unwrap();
         let entry = r.ack_entry(id).unwrap();
         assert_eq!(entry.highest_contiguous_seq, 2);
         assert_eq!(entry.received_frames, 3);
@@ -548,14 +656,18 @@ mod tests {
         let b = txid(2);
         let pa = vec![1u8; 4];
         let pb = vec![2u8; 4];
+        // Both slots open with their own seq-0 frame; transactions stay
+        // isolated (byte counts, prefixes, completion per id).
         r.receive_frame(a, 0, 8, 4, &pa, 100, false).unwrap();
-        r.receive_frame(b, 1, 8, 4, &pb, 100, false).unwrap();
+        r.receive_frame(b, 0, 8, 4, &pb, 100, false).unwrap();
         assert_eq!(r.open_transactions().count(), 2);
         r.receive_frame(a, 1, 8, 4, &pa, 150, false).unwrap();
         assert_eq!(r.take_completed(a).unwrap(), [pa.clone(), pa].concat());
         assert_eq!(r.open_transactions().count(), 1);
-        // b holds only seq 1 — no contiguous prefix, no ACK entry.
-        assert_eq!(r.ack_entry(b), None);
+        // b completes independently — a's completion never touched it.
+        r.receive_frame(b, 1, 8, 4, &pb, 150, false).unwrap();
+        assert_eq!(r.take_completed(b).unwrap(), [pb.clone(), pb].concat());
+        assert!(r.open_transactions().next().is_none());
     }
 
     #[test]
@@ -605,7 +717,7 @@ mod tests {
         r.receive_frame(id, 1, 8, 4, &p4, 100, false).unwrap();
         let err = r.receive_frame(id, 2, 8, 4, &p4, 100, false).unwrap_err();
         assert_eq!(err, ReassemblyError::TotalLenExceeded { total: 8 });
-        // A single oversized frame on a fresh slot is rejected too.
+        // A single oversized frame on a newly opened slot is rejected too.
         let err = r
             .receive_frame(txid(2), 0, 4, 5, &[0; 5], 100, false)
             .unwrap_err();
@@ -670,8 +782,10 @@ mod tests {
         let frames = chunked(&payload, 8192);
         let mut r = TransactionReassembler::default();
         let id = txid(1);
-        // Reverse order — worst case for contiguity bookkeeping.
-        let order: Vec<usize> = (0..frames.len()).rev().collect();
+        // Frame 0 opens the slot (SPEC §3/§5); every other frame arrives
+        // in reverse order — worst case for contiguity bookkeeping.
+        let mut order: Vec<usize> = (1..frames.len()).rev().collect();
+        order.insert(0, 0);
         feed_order_and_deliver(&mut r, id, payload.len() as u32, &frames, &order, &payload);
     }
 }

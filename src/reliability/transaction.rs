@@ -140,10 +140,15 @@ struct PendingTxn {
     /// Reconnect gate (recovery discipline): set when the holder declares
     /// its pending sends at wire-up; the transaction sends and retransmits
     /// nothing until the receiver's verdict arrives (`Resumed` lifts the
-    /// gate, `Unknown`/`Rejected` fails the transaction out). Blind
-    /// retransmission of retained copies is retired — the receiver's
+    /// gate, `Unknown`/`Rejected` closes by holder-side adjudication).
+    /// Blind retransmission of retained copies is retired — the receiver's
     /// verdict is the only lawful trigger.
     awaiting_resume: bool,
+    /// Instant the RESUME declaration was last sent for this transaction
+    /// (`Some` while gated). A declaration unanswered past the verdict
+    /// timeout is retransmitted (SPEC §5: the handshake is the sole
+    /// recovery entry, so its own reliability is mandatory).
+    declared_ms: Option<u64>,
     /// Highest contiguous progress reported by the peer (`0..=seq` all
     /// received); clamped to `frame_count - 1`.
     acked_contiguous: Option<u32>,
@@ -162,13 +167,21 @@ impl PendingTxn {
         self.frames.len() as u32
     }
 
-    /// Complete per §5: every declared byte is framed (written covers
+    /// Fully sent per §5: every declared byte is framed (`written` covers
     /// `total_len`, nothing held in the partial buffer — no more frames
-    /// can exist) AND the peer's contiguous progress covers the final
-    /// frame with no sparse residue. Tombstones (empty frames) never read
-    /// complete.
+    /// can exist). This is the holder-side completeness adjudication for
+    /// an `unknown`/`rejected` resume verdict: fully sent (tail frame plus
+    /// the completion announcement went out) ⇒ confirmed; frames still
+    /// owed ⇒ failed.
+    fn is_fully_sent(&self) -> bool {
+        self.written == self.total_len as u64 && self.partial.is_empty()
+    }
+
+    /// Complete per §5: fully sent AND the peer's contiguous progress
+    /// covers the final frame with no sparse residue. Tombstones (empty
+    /// frames) never read complete.
     fn is_fully_acked(&self) -> bool {
-        if self.written != self.total_len as u64 || !self.partial.is_empty() {
+        if !self.is_fully_sent() {
             return false;
         }
         let last = self.frame_count().checked_sub(1);
@@ -184,9 +197,20 @@ pub struct ResumeVerdicts {
     /// Frames to retransmit (every unconfirmed frame of each `Resumed`
     /// transaction; the holder's own ACK bookkeeping is the watermark).
     pub retransmit: Vec<Frame>,
-    /// Transactions the receiver did not recognize (completed and
-    /// released, aborted, or never seen — no tombstone exists): the
-    /// transfer fails as a whole; the holder released their copies.
+    /// Transactions closed **confirmed** by holder-side adjudication
+    /// (SPEC §5): the receiver did not recognize them (`unknown`/`rejected`
+    /// — no tombstone exists), and the holder's own knowledge says every
+    /// frame was already sent (tail frame plus the completion
+    /// announcement). The copy is released; waiters fire with a
+    /// confirmation terminal. The holder keeps no terminal trace, so the
+    /// receiver's `unknown` covers both "completed and consumed" and
+    /// "never seen" — for a fully-sent transaction both mean the same
+    /// closure.
+    pub confirmed: Vec<[u8; 16]>,
+    /// Transactions closed **failed** by holder-side adjudication: the
+    /// receiver did not recognize them and frames are still owed (the
+    /// transfer cannot complete). The copy is released; waiters fire with
+    /// a failure terminal.
     pub failed: Vec<[u8; 16]>,
 }
 
@@ -289,6 +313,7 @@ impl TransactionSender {
                 bytes: 0,
                 paused: false,
                 awaiting_resume: false,
+                declared_ms: None,
                 acked_contiguous: None,
                 acked_received: 0,
                 last_progress_ms: now_ms,
@@ -515,7 +540,7 @@ impl TransactionSender {
                 continue; // out-of-range seq: ignore
             };
             if state.confirmed {
-                continue; // peer self-corrected; do not resurrect
+                continue; // peer self-corrected; confirmed stays confirmed
             }
             state.last_sent_ms = now_ms;
             // An unconfirmed frame keeps its copy (confirmed frames are
@@ -583,12 +608,14 @@ impl TransactionSender {
     /// The AckEntry progress fields carry the holder's written progress
     /// (informational; the receiver adjudicates on the txid alone — its
     /// own ACK stream is the watermark, which is why the resume
-    /// instruction carries no offset).
-    pub fn declare_pending(&mut self) -> Vec<AckEntry> {
+    /// instruction carries no offset). `now_ms` anchors the verdict
+    /// timeout (an unanswered declaration is retransmitted — SPEC §5).
+    pub fn declare_pending(&mut self, now_ms: u64) -> Vec<AckEntry> {
         self.pending
             .iter_mut()
             .map(|(id, txn)| {
                 txn.awaiting_resume = true;
+                txn.declared_ms = Some(now_ms);
                 AckEntry {
                     transaction_id: *id,
                     highest_contiguous_seq: txn.frame_count().saturating_sub(1),
@@ -596,6 +623,36 @@ impl TransactionSender {
                 }
             })
             .collect()
+    }
+
+    /// Re-arm the reconnect gate and declare ONLY the transactions whose
+    /// declaration has stayed unanswered past `timeout_ms` (SPEC §5: a
+    /// declaration that stays unanswered past the verdict timeout is
+    /// retransmitted — the handshake is the sole recovery entry, so its
+    /// own reliability is mandatory). Each returned entry's declaration
+    /// clock is re-anchored at `now_ms`. Transactions already adjudicated
+    /// (`Resumed` lifted the gate, `Unknown`/`Rejected` removed the copy)
+    /// are never re-declared.
+    pub fn timed_out_declarations(&mut self, now_ms: u64, timeout_ms: u64) -> Vec<AckEntry> {
+        let mut out = Vec::new();
+        for (id, txn) in self.pending.iter_mut() {
+            if !txn.awaiting_resume {
+                continue;
+            }
+            let Some(declared) = txn.declared_ms else {
+                continue;
+            };
+            if now_ms.saturating_sub(declared) < timeout_ms {
+                continue;
+            }
+            txn.declared_ms = Some(now_ms);
+            out.push(AckEntry {
+                transaction_id: *id,
+                highest_contiguous_seq: txn.frame_count().saturating_sub(1),
+                received_frames: txn.frame_count(),
+            });
+        }
+        out
     }
 
     /// Whether the transaction is gated awaiting the receiver's resume
@@ -615,10 +672,15 @@ impl TransactionSender {
     ///   intent dominates; unpausing rearms the clock and
     ///   `due_retransmissions` covers the gap).
     /// - `Unknown` / `Rejected` — the receiver does not recognize the
-    ///   transaction: the transfer fails as a whole. The copy is released
-    ///   and the id lands in `failed` so the caller can release its
-    ///   waiters with a failure terminal — NOT a confirmation; completion
-    ///   remains final-ACK-only.
+    ///   transaction (no tombstone exists: consumed-and-delivered and
+    ///   never-seen are indistinguishable to it). The transfer closes by
+    ///   **holder-side adjudication** from the holder's own knowledge
+    ///   (SPEC §5): every frame already sent (tail frame plus the
+    ///   completion announcement — `is_fully_sent`) ⇒ the transaction
+    ///   ends **confirmed**; frames still owed ⇒ it ends **failed**. In
+    ///   both branches the copy is released and the id lands in the
+    ///   matching verdict list so the caller can release its waiters with
+    ///   the matching terminal.
     pub fn apply_resume_verdicts(
         &mut self,
         entries: &[ResumeStatusEntry],
@@ -632,6 +694,7 @@ impl TransactionSender {
                         continue;
                     };
                     txn.awaiting_resume = false;
+                    txn.declared_ms = None;
                     txn.last_progress_ms = now_ms;
                     if txn.paused {
                         continue;
@@ -649,8 +712,15 @@ impl TransactionSender {
                     }
                 }
                 ResumeStatus::Unknown | ResumeStatus::Rejected => {
-                    if self.pending.remove(&entry.transaction_id).is_some() {
-                        out.failed.push(entry.transaction_id);
+                    // Holder-side adjudication (SPEC §5): closure comes
+                    // from the holder's own knowledge, not from the
+                    // receiver's.
+                    if let Some(txn) = self.pending.remove(&entry.transaction_id) {
+                        if txn.is_fully_sent() {
+                            out.confirmed.push(entry.transaction_id);
+                        } else {
+                            out.failed.push(entry.transaction_id);
+                        }
                     }
                 }
             }
@@ -891,7 +961,7 @@ mod tests {
         // Single frame, fully confirmed.
         sender.begin_transaction(id, &[1, 2, 3, 4], 0).unwrap();
         assert!(sender.handle_ack(&ack(id, 0, 1), 100));
-        // Confirmed seq, out-of-range seqs — nothing resurrected.
+        // Confirmed seq, out-of-range seqs — nothing re-transmitted.
         assert!(sender.handle_nack(id, &[0, 4, 99], 200).is_empty());
     }
 
@@ -944,7 +1014,7 @@ mod tests {
         // Ungated before the declaration.
         assert!(!sender.is_awaiting_resume(id));
         assert!(!sender.due_retransmissions(130_000).is_empty());
-        let entries = sender.declare_pending();
+        let entries = sender.declare_pending(500);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].transaction_id, id);
         // Gated: the retransmission clock skips it now.
@@ -955,7 +1025,7 @@ mod tests {
         sender.begin_transaction(id2, &[9, 9], 0).unwrap();
         assert!(!sender.is_awaiting_resume(id2));
         // A repeated declaration re-arms the gate and re-lists the set.
-        let entries = sender.declare_pending();
+        let entries = sender.declare_pending(500);
         assert_eq!(entries.len(), 2);
         assert!(sender.is_awaiting_resume(id));
         assert!(sender.is_awaiting_resume(id2));
@@ -973,7 +1043,7 @@ mod tests {
         // (handle_ack returns whether the transaction completed — a partial
         // ACK returns false.)
         sender.handle_ack(&ack(id, 0, 1), 100);
-        sender.declare_pending();
+        sender.declare_pending(500);
         let verdicts = sender.apply_resume_verdicts(
             &[ResumeStatusEntry {
                 transaction_id: id,
@@ -992,11 +1062,13 @@ mod tests {
     }
 
     #[test]
-    fn verdict_unknown_fails_the_transfer_and_releases_the_copy() {
+    fn verdict_unknown_fails_an_unfinished_transfer_and_releases_the_copy() {
         let mut sender = TransactionSender::new(small_config());
         let id = txid(1);
-        sender.begin_transaction(id, &[1, 2], 0).unwrap();
-        sender.declare_pending();
+        // Unfinished: frames still owed (declared total not yet written).
+        sender.open_transaction(id, 16, 0).unwrap();
+        sender.append_chunk(id, &[1, 2, 3, 4], 0).unwrap();
+        sender.declare_pending(500);
         let verdicts = sender.apply_resume_verdicts(
             &[ResumeStatusEntry {
                 transaction_id: id,
@@ -1004,18 +1076,45 @@ mod tests {
             }],
             1_000,
         );
+        // Holder-side adjudication (SPEC §5): frames still owed ⇒ failed.
         assert_eq!(verdicts.failed, vec![id]);
+        assert!(verdicts.confirmed.is_empty());
         assert!(verdicts.retransmit.is_empty());
         assert_eq!(sender.unacked_bytes(), 0);
         assert!(!sender.contains_transaction(id));
     }
 
     #[test]
-    fn verdict_rejected_behaves_like_unknown() {
+    fn verdict_unknown_confirms_a_fully_sent_transfer() {
+        let mut sender = TransactionSender::new(small_config());
+        let id = txid(1);
+        // Fully sent: tail frame plus the completion announcement went out
+        // (begin_transaction = open + append + finish).
+        sender.begin_transaction(id, &[1, 2], 0).unwrap();
+        sender.declare_pending(500);
+        let verdicts = sender.apply_resume_verdicts(
+            &[ResumeStatusEntry {
+                transaction_id: id,
+                status: ResumeStatus::Unknown,
+            }],
+            1_000,
+        );
+        // All frames sent ⇒ confirmed from the holder's own knowledge
+        // (SPEC §5 holder-side adjudication — the receiver's unknown
+        // covers consumed-and-delivered and never-seen alike).
+        assert_eq!(verdicts.confirmed, vec![id]);
+        assert!(verdicts.failed.is_empty());
+        assert!(verdicts.retransmit.is_empty());
+        assert_eq!(sender.unacked_bytes(), 0);
+        assert!(!sender.contains_transaction(id));
+    }
+
+    #[test]
+    fn verdict_rejected_adjudicates_like_unknown() {
         let mut sender = TransactionSender::new(small_config());
         let id = txid(1);
         sender.begin_transaction(id, &[1, 2], 0).unwrap();
-        sender.declare_pending();
+        sender.declare_pending(500);
         let verdicts = sender.apply_resume_verdicts(
             &[ResumeStatusEntry {
                 transaction_id: id,
@@ -1023,7 +1122,10 @@ mod tests {
             }],
             1_000,
         );
-        assert_eq!(verdicts.failed, vec![id]);
+        // Wire-compatibility value: same adjudication as unknown —
+        // fully sent ⇒ confirmed.
+        assert_eq!(verdicts.confirmed, vec![id]);
+        assert!(verdicts.failed.is_empty());
         assert!(!sender.contains_transaction(id));
     }
 
@@ -1033,7 +1135,7 @@ mod tests {
         let id = txid(1);
         sender.begin_transaction(id, &[1, 2, 3, 4], 0).unwrap();
         assert!(sender.set_paused(id, true, 0));
-        sender.declare_pending();
+        sender.declare_pending(500);
         let verdicts = sender.apply_resume_verdicts(
             &[ResumeStatusEntry {
                 transaction_id: id,

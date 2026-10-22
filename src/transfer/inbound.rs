@@ -229,8 +229,13 @@ async fn on_data_frame(
     now: u64,
 ) -> Option<Arc<crate::reliability::stream::StreamInner>> {
     // First frame of a transaction with a stream handler registered → the
-    // transaction becomes a stream (checked before the slot opens).
-    let opens_stream = stream_present && !st.reassembler.contains_transaction(frame.transaction_id);
+    // transaction becomes a stream (checked before the slot opens). Only
+    // `seq == 0` can open: a slotless id with `seq > 0` is dropped by the
+    // reassembler (SPEC §3/§5) and must not open a stream that would never
+    // terminate.
+    let opens_stream = stream_present
+        && frame.seq == 0
+        && !st.reassembler.contains_transaction(frame.transaction_id);
     let mut opened: Option<Arc<crate::reliability::stream::StreamInner>> = None;
     match st.reassembler.receive_frame(
         frame.transaction_id,
@@ -296,6 +301,17 @@ async fn on_data_frame(
         }
         // Retransmission already stored: idempotent.
         Ok(ReceiveOutcome::Duplicate) => {}
+        // Slotless id with `seq > 0` (SPEC §3/§5): a late retransmission
+        // of a settled transaction or an unannounced stream. Dropped — no
+        // slot, no ACK, no NACK, no reply: the holder's closure signal is
+        // the RESUME verdict, never a data-frame reply.
+        Ok(ReceiveOutcome::SlotlessDropped) => {
+            log::debug!(
+                "transfer: dropped slotless DATA_BINARY frame (tx {:?} seq {}) — not reassembled",
+                uuid::Uuid::from_bytes(frame.transaction_id),
+                frame.seq,
+            );
+        }
         Err(e) => {
             log::warn!(
                 "transfer: rejected DATA_BINARY frame (tx {:?} seq {}): {}",
@@ -392,15 +408,19 @@ async fn on_nack_frame(
 /// RESUME (`0x0004`, holder → receiver, recovery discipline): the holder
 /// declares its pending send transactions after a reconnect. We
 /// adjudicate each declared txid against our own open inbound table (no
-/// tombstones — a completed, aborted, or never-seen transaction is
-/// indistinguishable and unrecognized) and answer with ONE RESUME_RESPONSE
-/// carrying exactly one verdict per declared entry:
+/// tombstones — with no terminal trace kept, a consumed-and-delivered
+/// transaction and a never-seen one are indistinguishable) and answer
+/// with ONE RESUME_RESPONSE carrying exactly one verdict per declared
+/// entry:
 ///
-/// - `Resumed` — the transaction is still open here: the continuation
-///   instruction; the holder lifts its gate and retransmits the
-///   unconfirmed frames (its own ACK bookkeeping is the watermark).
-/// - `Unknown` — unrecognized: the transfer fails as a whole at the
-///   holder (copies released, waiters released with a failure terminal).
+/// - `Resumed` — the transaction has an **open incomplete slot** here:
+///   the continuation instruction; the holder lifts its gate and
+///   retransmits the unconfirmed frames (its own ACK bookkeeping is the
+///   watermark).
+/// - `Unknown` — everything else: an open-but-complete slot
+///   (completed-but-undelivered — it awaits local consumption, needs
+///   nothing more from the holder) or no slot at all. The holder closes
+///   the transfer by its own adjudication (SPEC §5).
 ///
 /// Malformed payloads are logged and dropped — never guessed at.
 async fn on_resume_request_frame(
@@ -426,9 +446,16 @@ async fn on_resume_request_frame(
         .iter()
         .map(|entry| ResumeStatusEntry {
             transaction_id: entry.transaction_id,
-            status: if st.reassembler.contains_transaction(entry.transaction_id) {
+            status: if st.reassembler.contains_transaction(entry.transaction_id)
+                && !st.reassembler.is_complete(entry.transaction_id)
+            {
+                // Open incomplete slot: the continuation instruction.
                 ResumeStatus::Resumed
             } else {
+                // Completed-but-undelivered slot or no slot: unknown —
+                // with no terminal trace kept, a consumed-and-delivered
+                // transaction and a never-seen one are indistinguishable,
+                // and a complete slot needs nothing more from the holder.
                 ResumeStatus::Unknown
             },
         })
@@ -477,9 +504,11 @@ async fn on_resume_request_frame(
 /// RESUME response (`0x0008`, receiver → holder, recovery discipline):
 /// apply the receiver's verdicts to our pending sends. `Resumed` lifts
 /// the reconnect gate and retransmits every unconfirmed frame;
-/// `Unknown`/`Rejected` fails the transaction out — the copy is released
-/// and any completion waiter is released with a failure terminal (never a
-/// confirmation: completion remains final-ACK-only).
+/// `Unknown`/`Rejected` closes the transfer by **holder-side adjudication**
+/// (SPEC §5): a transaction whose frames were all sent (tail frame plus
+/// the completion announcement) ends **confirmed** — the copy is released
+/// and any completion waiter fires with a confirmation terminal; a
+/// transaction that still owes frames ends **failed** (failure terminal).
 async fn on_resume_response_frame(
     st: &mut SessionState,
     frame: &Frame,
@@ -501,6 +530,20 @@ async fn on_resume_response_frame(
             return;
         }
     }
+    // Confirmed closure (adjudicated fully-sent): same exact-once channel
+    // as the final ACK — the completion waiter fires confirmed.
+    for txid in verdicts.confirmed {
+        if let Some(cb) = st.completions.remove(&txid) {
+            completions.push((
+                cb,
+                BinarySendResult {
+                    transaction_id: txid,
+                    confirmed: true,
+                },
+            ));
+        }
+    }
+    // Failed closure (frames still owed): the failure terminal.
     for txid in verdicts.failed {
         if let Some(cb) = st.completions.remove(&txid) {
             completions.push((

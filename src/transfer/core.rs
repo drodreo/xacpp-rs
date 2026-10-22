@@ -143,6 +143,11 @@ pub struct TransferConfig {
     /// Receiver NACK feedback period for transactions with gaps (§5:
     /// receivers return NACK feedback; the wire has no push event for it).
     pub nack_feedback_interval_ms: u64,
+    /// RESUME declaration verdict timeout (§5 recovery discipline): a
+    /// declaration that stays unanswered past this timeout is
+    /// retransmitted — the handshake is the sole recovery entry, so its
+    /// own reliability is mandatory.
+    pub resume_verdict_timeout_ms: u64,
     /// Clock tick granularity (internal scheduling, not a SPEC value).
     pub tick_interval_ms: u64,
 }
@@ -156,6 +161,7 @@ impl Default for TransferConfig {
             ack_batch_frames: 64,
             ack_batch_interval_ms: 500,
             nack_feedback_interval_ms: 500,
+            resume_verdict_timeout_ms: 2_000,
             tick_interval_ms: 100,
         }
     }
@@ -377,7 +383,7 @@ impl TransferSession {
         //    peer is already wired — the responder's on_establish case).
         {
             let mut st = self.core.state.lock().await;
-            st.sender.declare_pending();
+            st.sender.declare_pending(now_ms());
         }
         // 5. Re-wire recovery (docs/streams.md): clear the flow stall on
         //    every surviving stream (back to its Active/Paused state — the
