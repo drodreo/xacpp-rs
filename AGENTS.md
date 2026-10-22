@@ -96,6 +96,50 @@ cargo test
 
 Must stay in sync with xacpp-ts test suite.
 
+## Transfer protocol invariants (SPEC §5)
+
+Four invariants govern the transfer layer; every change must preserve them:
+
+1. **Send-side pointer advances on ACK only** — unacknowledged bytes cap the
+   in-flight window (backpressure); copies release on ACK, terminal release on
+   final ACK or abort.
+2. **Receiver slots close on byte-count or control frame** — a transaction
+   completes when its bytes add up (`TRANSACTION_COMPLETED` announcement /
+   `TRANSACTION_ABORT` end it otherwise); no tombstones — a consumed slot
+   leaves no trace.
+3. **Everything outside the live lists is answered, never silently absorbed** —
+   a data frame for a slotless txid is not reassembled (late retransmission of
+   a settled transaction, or an unannounced stream); the holder's closure
+   signal is the RESUME verdict, never a data-frame reply.
+4. **Closure is adjudicated from local knowledge on both sides** — on an
+   `unknown`/`rejected` verdict the holder closes from its own state: all
+   frames sent (tail frame plus the announcement) ⇒ confirmed; frames still
+   owed ⇒ failed. The receiver never needs to explain why a transaction is
+   gone — no terminal trace is required for the loop to close.
+
+### Known misreadings (each caused a real defect)
+
+- **"A slotless data frame opens a fresh slot"** — wrong. The reassembler once
+  absorbed late retransmissions by opening resurrection slots; that path
+  produced both the RESUME deadlock (a resurrected slot never completes, the
+  final ACK never re-emerges) and a duplicate-delivery window. A txid reaches
+  the receiver only through the peer's explicit announcement (§8 causality
+  chain: metadata observed before any byte); a slotless frame is dropped.
+- **"`TRANSACTION_COMPLETED` is the receiver's final ACK"** — wrong direction.
+  It is holder → receiver: the sender declaring its data plane finished. The
+  final ACK is the receiver's cumulative ACK reaching the last frame.
+- **"An `unknown`/`rejected` verdict means the transfer failed"** — wrong as an
+  unconditional rule. The verdict only says "no open slot here"; the holder's
+  own completeness decides confirmed vs failed (invariant 4).
+- **"An expired transaction errors out"** — retired semantics. Copies carry no
+  retention deadline and no expiry sweep; error code `0x0002` stays registered
+  for pre-1.1 tolerance only.
+- **Design instinct check**: if a fix seems to need a new frame type, a new
+  verdict state, or memory of past transactions, re-read the invariants — the
+  recovery design closes its loops with pieces already in the protocol
+  (verdict + local knowledge). Complexity here has always meant a misread, not
+  a gap.
+
 ## Conventions
 
 - All comments and commit messages in English

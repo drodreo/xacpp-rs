@@ -25,9 +25,12 @@ xacpp defines the communication protocol between an agent and its peers. It prov
 └──────────────────────────────────────────────────────────────┘
 ```
 
-A session outlives individual connections: on disconnect the transfer state
-stays in the session; on reconnect the session wires itself onto the new
-transport and interrupted transfers resume from the breakpoint.
+A session outlives individual connections: on disconnect the session detaches
+its transfer mount from the dead transport immediately — frames still flushing
+through the dead connection are dropped, never absorbed into session state —
+and the transfer state stays in the session. On reconnect the session wires
+itself onto the new transport and interrupted transfers resume through the
+RESUME handshake (verdict-gated retransmission, SPEC §5).
 
 ## Usage
 
@@ -166,12 +169,16 @@ Declaration schemas are pass-through JSON; the protocol library does not enforce
 
 ## Performance
 
-Baseline measured by `cargo run --release --example bench_protocol` (TCP loopback, release build); scale via `XACPP_BENCH_N`, select a group via `XACPP_BENCH_ONLY`. These numbers are the reference for future optimization work.
+Measured by `cargo run --release --example bench_protocol` (TCP loopback, release build); scale via `XACPP_BENCH_N`, select a group via `XACPP_BENCH_ONLY`. These numbers are the reference for future optimization work.
 
-- Codec (pure encode/decode, no I/O): binary frames level with JSONL on small (~200 B) messages, +49% on medium (~2 KiB)
-- Request-response RTT: p50 0.070 ms at ~13.5k events/s
-- 64 MiB `sendBinary` (1 MiB working frames): 463–638 MB/s aggregate; 4 × 16 MiB concurrent: 638–732 MB/s
-- Control-frame insertion: heartbeat p50 under a bulk binary transfer is level with the idle connection (10 ms period)
+| Metric | Baseline 2026-10-14 | Re-verified 2026-10-23 |
+|---|---|---|
+| Codec ~200 B (frames vs JSONL) | level | frames 492.9 vs 315.1 MB/s |
+| Codec ~2 KiB (frames vs JSONL) | +49% | — |
+| Request-response RTT | p50 0.070 ms @ ~13.5k events/s | p50 0.071 ms @ ~13.3k events/s |
+| 64 MiB `sendBinary` (1 MiB frames) | 463–638 MB/s | 198–209 MB/s |
+| 4 × 16 MiB concurrent | 638–732 MB/s | 447 MB/s |
+| Heartbeat p50 under bulk | level with idle (10.2 ms) | 10.2 ms = idle |
 
 ## License
 

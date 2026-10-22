@@ -118,7 +118,13 @@ lifecycle contract (session-bound lifetime, terminal states) is pinned in
 
 - Senders retain unacknowledged transaction copies and retransmit on timeout.
 - Receivers reassemble per transaction and return `ACK` (receipt) / `NACK`
-  (gap list) feedback.
+  (gap list) feedback. A transaction id reaches the receiver through the
+  peer's explicit announcement — the §8 causality chain guarantees the
+  receiver observes the metadata before any byte of the transaction. A
+  data frame for a slotless txid (a late retransmission of a settled
+  transaction, or an unannounced stream — §8: the consumer's business)
+  is not reassembled; the holder's closure signal is the RESUME verdict,
+  never a data-frame reply.
 - Reconnection resume: on a new connection the holder gates its pending
   sends against retransmission and declares them (`RESUME`) once both
   transfer planes are wired, holding retransmission until the receiver's
@@ -174,9 +180,11 @@ receiver answers one verdict per entry
 sole retransmission trigger across a reconnect (blind retransmission of
 retained copies over a fresh connection is retired): the holder lifts the
 gate and retransmits every unconfirmed frame. An `unknown`/`rejected`
-verdict fails the transfer as a whole: the holder releases the copy and
-its completion waiters end unconfirmed (completion remains
-final-ACK-only). Distinct frame types — no payload-shape guessing.
+verdict closes the transfer by the holder-side adjudication (Reliability
+semantics below). A declaration that stays unanswered past the verdict
+timeout is retransmitted — the handshake is the sole recovery entry, so
+its own reliability is mandatory. Distinct frame types — no
+payload-shape guessing.
 
 ```text
 RESUME (holder → receiver):
@@ -196,16 +204,17 @@ RESUME_RESPONSE (receiver → holder):
     u8[16] transaction_id
     u8     status             (0x01 resumed — the transaction is still open
                                  inbound; the holder resumes transmission;
-                               0x03 unknown — not recognized; fail the
-                                 transfer;
+                               0x03 unknown — not recognized; closed by
+                                 the holder-side adjudication;
                                0x02 rejected — wire-compatibility value,
                                  same effect as unknown)
 ```
 
-Receiver adjudication: a declared transaction the receiver still holds
-open (incomplete) answers `resumed`; anything else answers `unknown` —
-with no terminal trace kept, a consumed-and-delivered transaction and a
-never-seen one are indistinguishable. Mirror cross-check: an inbound
+Receiver adjudication: a declared transaction with an open incomplete
+slot answers `resumed`; a completed-but-undelivered slot and anything
+else answer `unknown` — with no terminal trace kept, a
+consumed-and-delivered transaction and a never-seen one are
+indistinguishable. Mirror cross-check: an inbound
 transaction still open that the declaration does NOT cover can never
 complete (the holder released or aborted its copy while disconnected) —
 the receiver cancels its stream and drops the slot. Completed-but-
@@ -250,10 +259,12 @@ u8[] message                  (UTF-8, may be empty)
 ```
 
 Error code registry: `0x0001` protocol_version_unsupported,
-`0x0002` transaction_expired, `0x0003` backpressure_stall. The registry
-is append-only. For `0x0002`, the message field starts with the affected
-transaction id as 32 lowercase hex chars (the remainder is free-form);
-receivers parse it structurally.
+`0x0002` transaction_expired (retired — transaction copies carry no
+retention deadline and no expiry sweep, §5; the code stays registered
+for tolerance with pre-1.1 peers), `0x0003` backpressure_stall. The
+registry is append-only. For `0x0002`, the message field starts with
+the affected transaction id as 32 lowercase hex chars (the remainder is
+free-form); receivers parse it structurally.
 
 ### Reliability semantics
 
@@ -272,9 +283,14 @@ receivers parse it structurally.
   invalidates a copy on its own, and resumption is available whenever
   the connection returns. The holder keeps no terminal trace: after a
   reconnect, a declared transaction the receiver no longer holds open
-  (completed and consumed, or never seen) adjudicates `unknown` and the
-  transfer fails as a whole; `rejected` remains a wire value for
-  tolerance with the same effect.
+  (completed and consumed, or never seen) adjudicates `unknown`. The
+  holder then closes it from its own knowledge: a transaction whose
+  frames were all sent (tail frame plus the `TRANSACTION_COMPLETED`
+  announcement) ends confirmed; a transaction that still owes frames
+  ends failed. The never-seen corner (every DATA frame and every ACK
+  lost on the same connection) is the carrier's to rule out in
+  practice, and consumers remain idempotent by txid. `rejected`
+  remains a wire value for tolerance with the same adjudication.
 - Retransmission: RECOMMENDED initial timeout 2 s, exponential backoff
   ×2 up to 30 s (both configurable). A NACK triggers immediate
   retransmission of the listed frames.
@@ -315,18 +331,28 @@ receivers parse it structurally.
   `TRANSACTION_COMPLETED`) travel in wire order behind the
   transaction's own queued data frames (an abort that overtook the
   first data frame would be ignored by a receiver that never saw the
-  stream, leaving the late frame to open a stream that never
-  terminates; a completion that overtook the tail would fake a byte
+  stream, and the late data frames would then not be reassembled at
+  all; a completion that overtook the tail would fake a byte
   shortfall). A sender MAY expedite one only when nothing of that
   transaction is queued ahead of it.
 - Liveness: peers exchange HEARTBEAT frames; any inbound frame refreshes
   the peer-activity clock. RECOMMENDED heartbeat interval 30 s, silent
   timeout 90 s (both configurable); silence past the timeout declares the
   connection dead (teardown, resume on reconnect).
+- On disconnect the session detaches its transfer mount from the dead
+  transport immediately. Bytes still queued in the dead connection's
+  egress may keep arriving at the reader for a while (a TCP peer
+  flushes queued data after the local end has seen the drop) — a
+  detached mount means those frames are dropped, never absorbed into
+  session state. Nothing that travelled on a dead connection drives
+  the state machines afterwards: the RESUME handshake on the next
+  wire-up is the sole path by which any pending transaction
+  re-enters them.
 - On reconnection, the holder declares its pending sends (`RESUME`) on
   wire-up and holds their retransmission until the receiver's verdicts
   arrive (`RESUME_RESPONSE`); `resumed` lifts the gate and retransmits
-  the unconfirmed frames, `unknown`/`rejected` fails the transfer.
+  the unconfirmed frames; `unknown`/`rejected` closes the transfer by
+  the holder-side adjudication above.
   Connection-level traffic (HEARTBEAT/ACK/NACK) is not gated, and
   transactions opened on the new connection flow normally.
 - Reliability feature negotiation travels in the envelope Negotiate
@@ -503,6 +529,20 @@ is *truncated* (§5, incomplete terminal), not corrupted — the consumer
 must see that truncation explicitly (never a hang, never misreported as
 a digest mismatch), and the retry-or-otherwise decision belongs to the
 application.
+
+### 8.6 Response by reference (application convention)
+
+A message-semantics command response whose serialized envelope exceeds
+the `DATA_JSON` per-frame limit (§4, 1 MiB) cannot be carried as a single
+frame. Registered convention for such oversized responses: the response
+is delivered by reference — the payload carries a `fetchRef` object
+(`{ "sha256": "<64 hex>", "size": <bytes>, "uri": "<string>" }`) naming
+the response body, and the consumer retrieves the body through the §8
+fetch transaction, verifying it against `sha256`/`size`. The `uri`
+structure remains an application-layer convention between the two ends
+(§8.2). This is an application convention, not a kernel or extension
+obligation: the protocol imposes nothing about when references are
+issued or how the referenced bytes are staged and retired.
 
 ## 9. Versioning
 

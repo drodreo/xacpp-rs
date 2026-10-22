@@ -23,6 +23,8 @@ xacpp 定义了 Agent 与对端之间的通信协议。它提供了分层架构�
 └──────────────────────────────────────────────────────────────┘
 ```
 
+会话的生存期长于单条连接：断连时会话立即从失效 transport 摘除传输挂载——死链上仍在途的帧被丢弃，绝不进入会话状态机——传输状态保留在会话中；重连后会话挂载到新 transport，中断的传输经 RESUME 握手恢复（裁决门控重传，见 SPEC §5）。
+
 ## 使用
 
 在 `Cargo.toml` 中添加：
@@ -127,7 +129,7 @@ let server = SocketTransport::new(accepted_stream);
 
 ## 线路协议
 
-JSONL（每行一个 JSON 对象），信封结构：
+组帧采用 XACPP 二进制帧协议（docs/SPEC.md §3/§4）：每个信封作为 `DATA_JSON` 帧的载荷传输。信封结构：
 
 ```json
 {"type":"request","id":"r1","payload":{"kind":"command","payload":{"establish":{"credentials":null}}}}
@@ -145,6 +147,19 @@ Generic 命令携带可选的 `activity` 字段，形态为结构化 `{id}` 引�
 命令声明 schema 可携带 `dispatcher` 字段，取值 `"bridge"` 或 `"tool"`，缺省视为
 `"bridge"`。`bridge` 表示事件桥系统路径接入（不进模型工具面）；`tool` 表示注入
 接收方模型工具面（模型直调）。声明 schema 为透传 JSON，协议库不强制类型。
+
+## 性能
+
+基线由 `cargo run --release --example bench_protocol` 测得（TCP 回环，release 构建）；通过 `XACPP_BENCH_N` 调节规模、`XACPP_BENCH_ONLY` 选择分组。以下数字是后续优化工作的参照基准。
+
+| 指标 | 基线 2026-10-14 | 复测 2026-10-23 |
+|---|---|---|
+| 编解码 ~200 B（帧 vs JSONL） | 持平 | 帧 492.9 vs 315.1 MB/s |
+| 编解码 ~2 KiB（帧 vs JSONL） | +49% | — |
+| 请求-响应 RTT | p50 0.070 ms @ ~13.5k events/s | p50 0.071 ms @ ~13.3k events/s |
+| 64 MiB `sendBinary`（1 MiB 工作帧） | 463–638 MB/s | 198–209 MB/s |
+| 4 × 16 MiB 并发 | 638–732 MB/s | 447 MB/s |
+| 批量传输下心跳 p50 | 与空闲持平（10.2 ms） | 10.2 ms = 空闲 |
 
 ## 许可证
 

@@ -27,8 +27,8 @@ disconnect:
   delivered in order.
 - **Cancelled** — the transaction can never complete: holder
   `TRANSACTION_ABORT`, the recovery cross-check (a RESUME declaration that
-  did not cover this still-open transaction), a peer ERROR
-  `transaction_expired`, or session death. Partial bytes are discarded.
+  did not cover this still-open transaction), or session death. Partial
+  bytes are discarded.
 - **Incomplete** — the holder announced completion (`TRANSACTION_COMPLETED`)
   but the received bytes fall short of the declared total. The stream ends
   explicitly with the byte gap readable (`received`/`expected`) instead of
