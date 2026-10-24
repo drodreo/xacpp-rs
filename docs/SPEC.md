@@ -1,4 +1,4 @@
-# XACPP Binary Wire Protocol — Specification v1.1
+# XACPP Binary Wire Protocol — Specification v1.2
 
 ## 1. Overview
 
@@ -562,3 +562,46 @@ issued or how the referenced bytes are staged and retired.
   `transaction_id`); a different layer from round/pair.
 - **trust establishment** — security-layer trust-anchor exchange. Deliberately
   distinct from `pair`, which is reserved by the event vocabulary.
+
+## 11. Activity Event Payloads (application convention)
+
+Business events travel as generic `{ name, data }` envelopes inside
+`DATA_JSON` frames (§4). The payloads below are the registered vocabulary
+for the activity-event channel, serialized in camelCase. Required fields
+MUST be present; a missing required field is a contract violation.
+Optional fields carry no implied value: absent means unknown
+(unreported), and receivers MUST NOT substitute a concrete value for it.
+A field explicitly set to `false`, `0`, or `[]` is distinct from an
+absent field and MUST be preserved on the wire.
+
+### tool_result
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `requestId` | string | yes | ToolRequest id this result answers. |
+| `toolName` | string | yes | Tool name. |
+| `index` | number | yes | Tool call sequence number. |
+| `parts` | array | yes | Tool execution result content parts (empty array when there is no content). |
+| `auto` | boolean | yes | Result produced under the activity `auto` authorization mode (self-approved, no user interaction). |
+| `status` | string | no | Lifecycle status: `completed` (terminal success) / `running` (still executing in the background) / `cancelled` (cancelled before completion) / `error` (failed termination). Absent = unknown; receivers MUST NOT infer a specific status. |
+| `isBackground` | boolean | no | The tool keeps running in the background beyond this result (persistent process / timeout-to-background). Absent = unknown. |
+| `isError` | boolean | yes | This result is an error result (tool exception; orthogonal to `status`). |
+
+### pair_complete
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `pair` | string | yes | Loop iteration identity that completed. |
+| `contextWindow` | number | yes | Context window size (tokens) of the serving model. |
+| `tokenUsage` | object | yes | Token usage: `id`, `message`, `promptTokens`, `completionTokens`, `totalTokens` required; `cacheHitTokens` optional — absent = not reported by the provider, `0` = explicitly zero. |
+| `tier` | string | no | Model tier for this pair: `default` / `lite` / `expert`. Absent = unknown. |
+| `model` | string | no | Model display name. Absent = unknown. |
+
+### complete
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `round` | string | yes | Engine run identity (turn-level). |
+| `assistantReply` | array | yes | Final assistant reply content parts. |
+| `abortReason` | string | no | Present only when the run was aborted; carries the reason. Absence MUST NOT be used to infer `canceled`. |
+| `canceled` | boolean | yes | True when the run was canceled by the user; false on normal completion. |

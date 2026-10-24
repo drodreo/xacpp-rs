@@ -144,7 +144,7 @@ mod tests {
     use super::*;
     use crate::wire::commands::XacppCommand;
     use crate::wire::events::content::TextPart;
-    use crate::wire::events::payload::ToolResultEvent;
+    use crate::wire::events::payload::{ToolResultEvent, ToolResultStatus};
 
     #[test]
     fn test_new_activity_payload_serialization() {
@@ -303,17 +303,22 @@ mod tests {
             index: 0,
             parts: vec![],
             auto: true,
+            status: Some(ToolResultStatus::Completed),
+            is_background: Some(false),
+            is_error: false,
         };
         let s = serde_json::to_string(&event).unwrap();
         assert_eq!(
             s,
-            r#"{"requestId":"req-1","toolName":"shell","index":0,"parts":[],"auto":true}"#
+            r#"{"requestId":"req-1","toolName":"shell","index":0,"parts":[],"auto":true,"status":"completed","isBackground":false,"isError":false}"#
         );
 
-        // Old serve peers omit the auto flag; it reads as false (backward compatible).
-        let de: ToolResultEvent =
-            serde_json::from_str(r#"{"requestId":"req-1","toolName":"shell","index":0}"#).unwrap();
-        assert!(!de.auto);
+        // Under 1.2 the required fields (parts/auto/isError) must be present:
+        // omitting them is a hard error, not a silently applied default.
+        let missing_required = serde_json::from_str::<ToolResultEvent>(
+            r#"{"requestId":"req-1","toolName":"shell","index":0}"#,
+        );
+        assert!(missing_required.is_err());
     }
 
     #[test]

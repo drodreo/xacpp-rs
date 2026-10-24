@@ -29,4 +29,11 @@ pub struct TokenUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Cache-hit input tokens read from the provider-side prompt cache for
+    /// this call.
+    ///
+    /// `None` = the provider did not report cache data; `Some(0)` = the
+    /// provider explicitly reported zero cache hits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hit_tokens: Option<u32>,
 }

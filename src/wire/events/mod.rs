@@ -19,8 +19,9 @@ pub use interaction::{
     SensitiveInfoOperationResponse, SensitiveInfoResult, SensitiveInfoType,
 };
 pub use payload::{
-    ActivityInfo, ActivityMode, ActivityStartEvent, AlertLevel, ContentDeltaEvent,
-    ContentPartEvent, SecurityAlertEvent, ToolResultEvent, ToolUseEvent, TraceableEvent,
+    ActivityInfo, ActivityMode, ActivityStartEvent, AlertLevel, CompleteEvent, ContentDeltaEvent,
+    ContentPartEvent, ModelTier, PairCompleteEvent, SecurityAlertEvent, ToolResultEvent,
+    ToolResultStatus, ToolUseEvent, TraceableEvent,
 };
 pub use upload::{TokenUsage, UploadEvent};
 pub use xacpp_event::XacppEvent;

@@ -24,9 +24,9 @@ pub const MAGIC: [u8; 4] = *b"XACP";
 /// Wire protocol major version. Mismatch ⇒ connection refused (SPEC §9).
 pub const VERSION_MAJOR: u8 = 1;
 /// Wire protocol minor version (backward-compatible extensions). Advances
-/// with the library minor version (SPEC §9); fetch (1.1) is an envelope-level
-/// extension — frame format unchanged.
-pub const VERSION_MINOR: u8 = 1;
+/// with the library minor version (SPEC §9); fetch (1.1) and activity event
+/// payload extensions (1.2) are envelope-level — frame format unchanged.
+pub const VERSION_MINOR: u8 = 2;
 
 /// Fixed header size in bytes (§3).
 pub const HEADER_LEN: usize = 36;

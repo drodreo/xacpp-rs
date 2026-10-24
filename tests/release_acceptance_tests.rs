@@ -52,7 +52,8 @@ use xacpp::wire::events::content::{
 use xacpp::wire::events::interaction::NotifyPayload;
 use xacpp::wire::events::payload::{
     ActivityInfo, ActivityMode, ActivityStartEvent, AlertLevel, ContentDeltaEvent,
-    ContentPartEvent, SecurityAlertEvent, ToolResultEvent, ToolUseEvent, TraceableEvent,
+    ContentPartEvent, SecurityAlertEvent, ToolResultEvent, ToolResultStatus, ToolUseEvent,
+    TraceableEvent,
 };
 use xacpp::wire::events::upload::{TokenUsage, UploadEvent};
 use xacpp::wire::events::{XacppActivityEvent, XacppEvent};
@@ -1079,6 +1080,9 @@ fn event_sample(name: &str, idx: usize) -> XacppActivityEvent {
                 }),
             ],
             auto: true,
+            status: Some(ToolResultStatus::Completed),
+            is_background: Some(false),
+            is_error: false,
         })
         .unwrap(),
         "security_alert" => serde_json::to_value(SecurityAlertEvent {
@@ -1127,6 +1131,7 @@ fn event_sample(name: &str, idx: usize) -> XacppActivityEvent {
                 prompt_tokens: 10,
                 completion_tokens: 20,
                 total_tokens: 30,
+                cache_hit_tokens: None,
             })
             .unwrap()
         }),
