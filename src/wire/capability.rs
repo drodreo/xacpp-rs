@@ -6,6 +6,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The only fetch extension version defined so far (SPEC §8.7). Declaring
+/// sides advertise `fetchExt: 1`; a consumer enables fetching from a peer
+/// only when the peer's declared version falls within its own supported
+/// range — currently exactly this version.
+pub const FETCH_EXT_VERSION: u32 = 1;
+
 /// Capabilities declared by one side during Negotiate.
 ///
 /// Each side sends one `Capabilities` to the peer:
@@ -31,6 +37,14 @@ pub struct Capabilities {
     /// JSON Schemas for events this side can receive (accept).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accept_events: Vec<serde_json::Value>,
+
+    /// Fetch extension version supported by this side (SPEC §8.7, wire key
+    /// `fetchExt`). Declaration is the side's own decision — it is NOT
+    /// derived from whether a fetch responder happens to be assembled.
+    /// Absent (`None`) = no fetch support: accessing this side's fetch
+    /// functionality must fail loudly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_ext: Option<u32>,
 }
 
 /// Negotiate 完成后的生效能力（应用层可见的）。
@@ -45,6 +59,14 @@ pub struct EffectiveCapabilities {
     /// 我能发给对端的事件名列表（local.produce_events ∩ remote.accept_events）。
     /// sendEvent 时协议层会校验事件名是否在此列表中。
     pub emit_events: Vec<String>,
+
+    /// 对端声明的 fetch 扩展版本（SPEC §8.7）。`None` = 对端未声明（不支持）。
+    pub remote_fetch_ext: Option<u32>,
+
+    /// 协商后的 fetch 可用性（SPEC §8.7）：仅当本端与对端都声明了本库支持的
+    /// 版本时为 `true`。这是协商事实，不是 responder 装配映射；不成立时不阻断
+    /// negotiate，也不影响任何非 fetch 命令。
+    pub fetch_enabled: bool,
 }
 
 impl EffectiveCapabilities {
@@ -57,9 +79,17 @@ impl EffectiveCapabilities {
             .into_iter()
             .filter(|name| remote_accept.contains(&name))
             .collect();
+        let remote_fetch_ext = remote.fetch_ext;
+        // SPEC §8.7: fetch 启用要求双方都声明了本库支持的版本。任一方未声明、
+        // 或声明的版本不在支持范围内，fetch 保持禁用——这只禁用 fetch，不阻断
+        // negotiate，也不影响其他命令。
+        let fetch_enabled = local.fetch_ext == Some(FETCH_EXT_VERSION)
+            && remote_fetch_ext == Some(FETCH_EXT_VERSION);
         Self {
             remote_commands,
             emit_events,
+            remote_fetch_ext,
+            fetch_enabled,
         }
     }
 }
@@ -278,8 +308,11 @@ mod tests {
                     }
                 }
             })],
+            fetch_ext: Some(1),
         };
         let json = serde_json::to_string(&caps).unwrap();
+        // Wire key is camelCase `fetchExt` (SPEC §8.7).
+        assert!(json.contains(r#""fetchExt":1"#));
         let deserialized: Capabilities = serde_json::from_str(&json).unwrap();
         assert_eq!(caps, deserialized);
     }
@@ -291,6 +324,76 @@ mod tests {
         assert!(caps.commands.is_empty());
         assert!(caps.produce_events.is_empty());
         assert!(caps.accept_events.is_empty());
+        // Absent fetchExt = no fetch support (SPEC §8.7) — never UNKNOWN.
+        assert_eq!(caps.fetch_ext, None);
+    }
+
+    #[test]
+    fn test_capabilities_fetch_ext_wire_omitted_when_absent() {
+        let caps = Capabilities::default();
+        let json = serde_json::to_string(&caps).unwrap();
+        assert_eq!(json, "{}");
+        // A peer that declares no fetchExt parses with fetch_ext = None.
+        let from_peer: Capabilities = serde_json::from_str(r#"{"commands":[]}"#).unwrap();
+        assert_eq!(from_peer.fetch_ext, None);
+    }
+
+    // ---- fetchExt negotiation (SPEC §8.7) ----
+
+    #[test]
+    fn test_fetch_enabled_requires_both_sides_declaring_v1() {
+        let declaring = || Capabilities {
+            fetch_ext: Some(1),
+            ..Capabilities::default()
+        };
+        let silent = || Capabilities::default();
+        let effective = EffectiveCapabilities::from_capabilities(&declaring(), &declaring());
+        assert!(effective.fetch_enabled);
+        assert_eq!(effective.remote_fetch_ext, Some(1));
+        // Either side silent → disabled.
+        let effective = EffectiveCapabilities::from_capabilities(&declaring(), &silent());
+        assert!(!effective.fetch_enabled);
+        assert_eq!(effective.remote_fetch_ext, None);
+        let effective = EffectiveCapabilities::from_capabilities(&silent(), &declaring());
+        assert!(!effective.fetch_enabled);
+        let effective = EffectiveCapabilities::from_capabilities(&silent(), &silent());
+        assert!(!effective.fetch_enabled);
+    }
+
+    #[test]
+    fn test_fetch_unsupported_version_disables_without_blocking() {
+        // A peer declaring a future version does not enable fetch — but the
+        // declaration itself is preserved and negotiate is NOT rejected.
+        let local = Capabilities {
+            fetch_ext: Some(1),
+            ..Capabilities::default()
+        };
+        let remote = Capabilities {
+            fetch_ext: Some(2),
+            ..Capabilities::default()
+        };
+        let effective = EffectiveCapabilities::from_capabilities(&local, &remote);
+        assert!(!effective.fetch_enabled);
+        assert_eq!(effective.remote_fetch_ext, Some(2));
+    }
+
+    #[test]
+    fn test_fetch_declaration_independent_of_assembly() {
+        // fetch_enabled is a function of the two declarations ONLY — the
+        // same declaration pair always yields the same verdict regardless of
+        // what responder either side may (or may not) have assembled.
+        let a = Capabilities {
+            fetch_ext: Some(1),
+            ..Capabilities::default()
+        };
+        let b = Capabilities {
+            fetch_ext: Some(1),
+            ..Capabilities::default()
+        };
+        let first = EffectiveCapabilities::from_capabilities(&a, &b);
+        let second = EffectiveCapabilities::from_capabilities(&a, &b);
+        assert_eq!(first.fetch_enabled, second.fetch_enabled);
+        assert!(first.fetch_enabled);
     }
 
     #[test]
@@ -304,6 +407,7 @@ mod tests {
                 serde_json::json!({ "name": "info" }),
             ],
             accept_events: vec![],
+            fetch_ext: None,
         };
 
         // Remote: can accept content_delta, info, error
@@ -315,6 +419,7 @@ mod tests {
                 serde_json::json!({ "name": "info" }),
                 serde_json::json!({ "name": "error" }),
             ],
+            fetch_ext: None,
         };
 
         let effective = EffectiveCapabilities::from_capabilities(&local, &remote);
@@ -335,12 +440,14 @@ mod tests {
             commands: vec![],
             produce_events: vec![serde_json::json!({ "name": "think" })],
             accept_events: vec![],
+            fetch_ext: None,
         };
 
         let remote = Capabilities {
             commands: vec![],
             produce_events: vec![],
             accept_events: vec![serde_json::json!({ "name": "content_delta" })],
+            fetch_ext: None,
         };
 
         let effective = EffectiveCapabilities::from_capabilities(&local, &remote);
@@ -363,6 +470,7 @@ mod tests {
             commands: vec![],
             produce_events: vec![],
             accept_events: vec![],
+            fetch_ext: None,
         };
         let remote = Capabilities {
             commands: vec![serde_json::json!({
@@ -377,6 +485,7 @@ mod tests {
             })],
             produce_events: vec![],
             accept_events: vec![],
+            fetch_ext: None,
         };
 
         let effective = EffectiveCapabilities::from_capabilities(&local, &remote);

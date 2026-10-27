@@ -544,6 +544,35 @@ structure remains an application-layer convention between the two ends
 obligation: the protocol imposes nothing about when references are
 issued or how the referenced bytes are staged and retired.
 
+### 8.7 Fetch extension declaration (fetchExt)
+
+The Negotiate command's `Capabilities` object MAY carry one additional
+field:
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `fetchExt` | number | no | Version of the fetch extension (§8) supported by the declaring side. The only defined version is `1`. |
+
+Semantics:
+
+- **Declaration means support.** A side that declares `fetchExt` supports
+  the fetch extension at the declared version. Each side declares
+  independently; this is not a declaration of responder assembly or of any
+  particular session's runtime configuration.
+- **Absence means no fetch support.** If a side omits `fetchExt`, it does
+  not support the fetch extension. Accessing that side's fetch-extension
+  functionality MUST fail; absence is not an `UNKNOWN` state and does not
+  select a legacy fallback path.
+- **The consumer decides whether to enable fetch.** Given a declaration,
+  the side consuming it independently decides whether to enable fetching
+  from the declaring side, according to whether the declared version falls
+  within the consumer's own supported version range. This is not a simple
+  version-equality check and is not decided by the declaring side.
+- **An unsupported declared version disables fetch, not the connection.**
+  If the declared version is outside the consumer's supported range, the
+  consumer does not enable fetch from that side. This does not by itself
+  require negotiation of the connection or unrelated commands to fail.
+
 ## 9. Versioning
 
 - Library 1.x releases carry protocol major 1; the frame header version and
@@ -605,3 +634,52 @@ absent field and MUST be preserved on the wire.
 | `assistantReply` | array | yes | Final assistant reply content parts. |
 | `abortReason` | string | no | Present only when the run was aborted; carries the reason. Absence MUST NOT be used to infer `canceled`. |
 | `canceled` | boolean | yes | True when the run was canceled by the user; false on normal completion. |
+
+
+## 12. Activity User Input (application convention)
+
+Three lifecycle commands carry user input into an activity:
+`invoke_activity`, `steer_activity`, and `push_task`. They share ONE payload
+shape (implementation type name `InvokeActivityPayload` in both libraries):
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `activity` | string | yes | Target activity. |
+| `messages` | array | yes | Complete, ordered ContentPart list representing one logical user input. |
+
+### Input invariants
+
+- **One action, one command, one logical message.** A single user action
+  produces exactly one command whose `messages` is the complete ordered
+  part list. Receivers MUST project it as one logical user message.
+- **Ordered input is the unit of consumption.** Parts MUST NOT be reordered
+  or split into per-part commands or turns. Text and media MUST NOT be
+  separated into different logical user messages.
+- **No parallel payload types.** `steer_activity` and `push_task` reuse
+  `InvokeActivityPayload`; only consumption differs.
+- **References, not a second byte channel.** Media bytes are obtained by
+  the XACPP inbound layer through the §8 fetch channel when they are not
+  already available locally. The input path does not proactively use
+  `send_binary`.
+
+### XACPP owns media preparation
+
+Before the corresponding Activity operation, the XACPP inbound layer
+performs all required resource acquisition, SHA verification, local
+materialization, and reference rewriting. Activity and its TaskQueue only
+consume prepared parts; they MUST NOT perform network fetch, wait on a
+media-preparation future, or interpret sender-local resource paths.
+
+| Command | Required preparation and consumption order |
+|---|---|
+| `invoke_activity` | XACPP prepares the complete input, then invokes the Activity. |
+| `steer_activity` | XACPP prepares the complete input, then writes it as steering input. |
+| `push_task` | XACPP prepares the complete input, then delivers it to the Activity task queue. |
+
+`push_task` returns `task_enqueued { taskId }` only after the Activity has
+accepted the prepared task. It therefore means that a task eligible for
+consumption was accepted, not merely that some bytes or references arrived.
+`input_state` and queued entries expose only prepared parts. Queueing does
+not introduce a `media_not_ready` state or a queue-specific media admission
+model. Preparation failures use the command's common media-failure
+semantics; no new queue-specific state machine is introduced.

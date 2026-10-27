@@ -48,6 +48,8 @@ struct PeerInner {
     remote_capabilities: Capabilities,
     /// negotiate 后缓存的交集结果（local.produce_events ∩ remote.accept_events）
     emit_events: Vec<String>,
+    /// negotiate 后缓存的 fetch 可用性（SPEC §8.7，双方都声明支持版本才为 true）
+    fetch_enabled: bool,
 }
 
 /// XACPP protocol endpoint.
@@ -65,6 +67,11 @@ pub struct XacppPeer {
     /// Shared emit_events cache for Responder-side negotiation in connect closure.
     /// The closure cannot access `inner` directly, so we use this Arc to share state.
     emit_events: Arc<Mutex<Vec<String>>>,
+    /// Shared negotiated fetch_enabled (SPEC §8.7) for the connect closure —
+    /// the inbound fetch gate reads it per command; written by both the
+    /// initiator's `negotiate` path (via `inner`) and the responder's
+    /// negotiate branch in the closure.
+    fetch_enabled: Arc<Mutex<bool>>,
     sessions: Arc<RwLock<HashMap<String, Arc<dyn XacppSessionHandler>>>>,
     establish_handler: Arc<dyn EstablishHandler>,
     local_capabilities: Capabilities,
@@ -96,10 +103,13 @@ impl XacppPeer {
                     commands: Vec::new(),
                     produce_events: Vec::new(),
                     accept_events: Vec::new(),
+                    fetch_ext: None,
                 },
                 emit_events: Vec::new(),
+                fetch_enabled: false,
             })),
             emit_events: Arc::new(Mutex::new(Vec::new())),
+            fetch_enabled: Arc::new(Mutex::new(false)),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             establish_handler,
             local_capabilities: capabilities,
@@ -161,7 +171,12 @@ impl XacppPeer {
                 let mut inner = self.inner.lock().await;
                 inner.remote_capabilities = capabilities;
                 inner.emit_events = effective.emit_events;
+                inner.fetch_enabled = effective.fetch_enabled;
                 inner.state = PeerState::Negotiated;
+                drop(inner);
+                // Shared cache write happens outside the inner lock
+                // (short in-memory critical sections only).
+                *self.fetch_enabled.lock().await = effective.fetch_enabled;
                 Ok(())
             }
             XacppResponse::Error { code, message } => {
@@ -187,6 +202,7 @@ impl XacppPeer {
         let negotiate_handler = Arc::clone(&self.negotiate_handler);
         let local_capabilities = self.local_capabilities.clone();
         let emit_events = Arc::clone(&self.emit_events);
+        let fetch_enabled = Arc::clone(&self.fetch_enabled);
 
         self.transport
             .on_request(Arc::new(move |session_id, payload| {
@@ -196,6 +212,7 @@ impl XacppPeer {
                 let negotiate_handler = Arc::clone(&negotiate_handler);
                 let local_capabilities = local_capabilities.clone();
                 let emit_events = Arc::clone(&emit_events);
+                let fetch_enabled = Arc::clone(&fetch_enabled);
                 Box::pin(async move {
                     match (session_id, payload) {
                         // Pre-session Negotiate request
@@ -208,6 +225,8 @@ impl XacppPeer {
                             negotiate_handler.on_negotiate(effective.clone()).await?;
                             // 缓存 emit_events 交集结果（Responder 端无法直接访问 inner）
                             *emit_events.lock().await = effective.emit_events;
+                            // 缓存协商后的 fetch 可用性（SPEC §8.7），入站门控逐命令读取
+                            *fetch_enabled.lock().await = effective.fetch_enabled;
                             Ok(XacppResponse::Negotiated {
                                 capabilities: local_capabilities,
                             })
@@ -250,22 +269,26 @@ impl XacppPeer {
                         // Other requests without session_id are invalid
                         (None, _) => Err(XacppError::InvalidRequest("missing session_id".into())),
                         // Route to Session handler. Fetch-family commands are
-                        // gated (SPEC §8.2): with no loaded fetch responder
-                        // the library answers `fetch_unavailable` loudly —
-                        // never a silent fall-through to the consumer. A
-                        // loaded responder receives the commands untouched
-                        // (the fetch kernel stays stateless).
+                        // gated (SPEC §8.2/§8.7): the library answers
+                        // `fetch_unavailable` loudly — never a silent
+                        // fall-through to the consumer — unless the fetch
+                        // extension was enabled by negotiation AND a fetch
+                        // responder is actually loaded. A loaded responder
+                        // receives the commands untouched once negotiation
+                        // enabled fetch (the fetch kernel stays stateless).
                         (Some(sid), XacppRequest::Command(cmd)) => {
                             let handler = { sessions.read().await.get(&sid).cloned() };
                             match handler {
                                 Some(h) => {
-                                    if cmd.is_fetch_family() && !h.is_fetch_responder() {
+                                    let fetch_enabled = *fetch_enabled.lock().await;
+                                    if cmd.is_fetch_family()
+                                        && (!fetch_enabled || !h.is_fetch_responder())
+                                    {
                                         Ok(XacppResponse::Error {
                                             code: crate::wire::fetch::error_codes::FETCH_UNAVAILABLE
                                                 .into(),
-                                            message:
-                                                "fetch unsupported on this end (no fetch responder loaded)"
-                                                    .into(),
+                                            message: "fetch unavailable on this end (not enabled by negotiation, or no fetch responder loaded)"
+                                                .into(),
                                         })
                                     } else {
                                         h.on_command(cmd).await
@@ -379,12 +402,12 @@ impl XacppPeer {
                     .await
                     .insert(session_id.clone(), Arc::clone(&handler));
                 let session = self.session_for_establish(&session_id).await?;
+                let (emit_events, fetch_enabled) = {
+                    let inner = self.inner.lock().await;
+                    (inner.emit_events.clone(), inner.fetch_enabled)
+                };
                 session
-                    .backfill(
-                        session_id,
-                        credentials,
-                        self.inner.lock().await.emit_events.clone(),
-                    )
+                    .backfill(session_id, credentials, emit_events, fetch_enabled)
                     .await;
                 // Recovery discipline: the handshake is complete and the
                 // responder wired its transfer plane inside on_establish —
@@ -423,12 +446,12 @@ impl XacppPeer {
                             .await
                             .insert(session_id.clone(), Arc::clone(&handler));
                         let session = self.session_for_establish(&session_id).await?;
+                        let (emit_events, fetch_enabled) = {
+                            let inner = self.inner.lock().await;
+                            (inner.emit_events.clone(), inner.fetch_enabled)
+                        };
                         session
-                            .backfill(
-                                session_id,
-                                credentials,
-                                self.inner.lock().await.emit_events.clone(),
-                            )
+                            .backfill(session_id, credentials, emit_events, fetch_enabled)
                             .await;
                         // Recovery discipline: handshake complete (challenge
                         // path) — declare pending sends now that both
@@ -517,14 +540,22 @@ impl XacppPeer {
             session.unwire().await;
         }
         self.transport.disconnect().await?;
+        // Negotiated facts die with the connection: the next negotiate
+        // recomputes them (SPEC §8.7 — fetch availability is per-connection).
+        *self.fetch_enabled.lock().await = false;
+        if let Some(session) = &self.session {
+            session.set_fetch_enabled(false).await;
+        }
         let mut inner = self.inner.lock().await;
         inner.state = PeerState::Disconnected;
         inner.remote_capabilities = Capabilities {
             commands: Vec::new(),
             produce_events: Vec::new(),
             accept_events: Vec::new(),
+            fetch_ext: None,
         };
         inner.emit_events.clear();
+        inner.fetch_enabled = false;
         self.sessions.write().await.clear();
         Ok(())
     }

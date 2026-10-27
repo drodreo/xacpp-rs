@@ -270,11 +270,13 @@ async fn connected_peers() -> (XacppPeer, XacppPeer) {
             serde_json::json!({"name": "complete"}),
         ],
         accept_events: Vec::new(),
+        fetch_ext: None,
     };
     let caps_bot = Capabilities {
         commands: Vec::new(),
         produce_events: Vec::new(),
         accept_events: Vec::new(),
+        fetch_ext: None,
     };
 
     let peer_a = XacppPeer::new(
@@ -553,11 +555,13 @@ async fn test_negotiate_full_flow() {
             serde_json::json!({"name": "activity_done"}),
         ],
         accept_events: Vec::new(),
+        fetch_ext: None,
     };
     let caps_b = Capabilities {
         commands: Vec::new(),
         produce_events: Vec::new(),
         accept_events: Vec::new(),
+        fetch_ext: None,
     };
 
     let negotiate_a = Arc::new(AcceptNegotiateHandler::new());
@@ -621,6 +625,7 @@ async fn test_negotiate_responder_rejects() {
         commands: vec![serde_json::json!({"name": "new_activity"})],
         produce_events: vec![serde_json::json!({"name": "content_delta"})],
         accept_events: Vec::new(),
+        fetch_ext: None,
     };
     let peer_a = XacppPeer::new(
         caps_a,
@@ -634,6 +639,7 @@ async fn test_negotiate_responder_rejects() {
             commands: Vec::new(),
             produce_events: Vec::new(),
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
         transport_b,
         None,
@@ -671,6 +677,7 @@ async fn test_negotiate_initiator_rejects() {
             commands: Vec::new(),
             produce_events: Vec::new(),
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
         transport_a,
         Some(Arc::new(XacppSession::new(None))),
@@ -681,6 +688,7 @@ async fn test_negotiate_initiator_rejects() {
         commands: vec![serde_json::json!({"name": "new_activity"})],
         produce_events: vec![serde_json::json!({"name": "content_delta"})],
         accept_events: Vec::new(),
+        fetch_ext: None,
     };
     let peer_b = XacppPeer::new(
         caps_b,
@@ -723,6 +731,7 @@ async fn test_negotiate_capabilities_preserved() {
         ],
         produce_events: vec![serde_json::json!({"name": "content_delta"})],
         accept_events: Vec::new(),
+        fetch_ext: None,
     };
     let caps_b = Capabilities {
         commands: Vec::new(),
@@ -731,6 +740,7 @@ async fn test_negotiate_capabilities_preserved() {
             serde_json::json!({"name": "question"}),
         ],
         accept_events: Vec::new(),
+        fetch_ext: None,
     };
 
     let peer_a = XacppPeer::new(
@@ -781,6 +791,7 @@ async fn test_emit_events_intersection() {
             serde_json::json!({ "name": "think" }),
         ],
         accept_events: Vec::new(),
+        fetch_ext: None,
     };
     let caps_b = Capabilities {
         commands: vec![],
@@ -789,6 +800,7 @@ async fn test_emit_events_intersection() {
             serde_json::json!({ "name": "content_delta" }),
             serde_json::json!({ "name": "info" }),
         ],
+        fetch_ext: None,
     };
 
     let negotiate_a = Arc::new(AcceptNegotiateHandler::new());
@@ -837,11 +849,13 @@ async fn test_request_event_rejected_by_emit_events() {
         commands: vec![],
         produce_events: vec![serde_json::json!({ "name": "content_delta" })],
         accept_events: Vec::new(),
+        fetch_ext: None,
     };
     let caps_b = Capabilities {
         commands: vec![],
         produce_events: Vec::new(),
         accept_events: vec![serde_json::json!({ "name": "content_delta" })],
+        fetch_ext: None,
     };
 
     let peer_a = XacppPeer::new(
@@ -1127,6 +1141,7 @@ async fn test_multi_session_routing_isolation() {
             commands: Vec::new(),
             produce_events: Vec::new(),
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
         transport_a,
         Some(Arc::new(XacppSession::new(None))),
@@ -1138,6 +1153,7 @@ async fn test_multi_session_routing_isolation() {
             commands: Vec::new(),
             produce_events: Vec::new(),
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
         transport_b,
         None,
@@ -1252,6 +1268,7 @@ async fn test_establish_different_identity_binds_new_session() {
             commands: Vec::new(),
             produce_events: Vec::new(),
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
         transport_a,
         Some(Arc::new(XacppSession::new(None))),
@@ -1264,6 +1281,7 @@ async fn test_establish_different_identity_binds_new_session() {
             commands: Vec::new(),
             produce_events: Vec::new(),
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
         transport_b,
         None,
@@ -1333,6 +1351,7 @@ async fn test_peer_establish_challenge_flow() {
             commands: Vec::new(),
             produce_events: Vec::new(),
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
         transport_a,
         Some(Arc::new(XacppSession::new(None))),
@@ -1344,6 +1363,7 @@ async fn test_peer_establish_challenge_flow() {
             commands: Vec::new(),
             produce_events: Vec::new(),
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
         transport_b,
         None,
@@ -1376,6 +1396,7 @@ async fn test_peer_establish_challenge_issues_credentials() {
             commands: Vec::new(),
             produce_events: Vec::new(),
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
         transport_a,
         Some(Arc::new(XacppSession::new(None))),
@@ -1387,6 +1408,7 @@ async fn test_peer_establish_challenge_issues_credentials() {
             commands: Vec::new(),
             produce_events: Vec::new(),
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
         transport_b,
         None,
@@ -1542,6 +1564,7 @@ async fn test_action_request_command_lifecycle() {
             commands: Vec::new(),
             produce_events: Vec::new(),
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
         transport_a,
         Some(Arc::new(XacppSession::new(None))),
@@ -1554,6 +1577,7 @@ async fn test_action_request_command_lifecycle() {
             commands: Vec::new(),
             produce_events: Vec::new(),
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
         transport_b,
         None,
@@ -1603,6 +1627,7 @@ async fn test_question_command_lifecycle() {
             commands: Vec::new(),
             produce_events: Vec::new(),
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
         transport_a,
         Some(Arc::new(XacppSession::new(None))),
@@ -1615,6 +1640,7 @@ async fn test_question_command_lifecycle() {
             commands: Vec::new(),
             produce_events: Vec::new(),
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
         transport_b,
         None,
@@ -1662,6 +1688,7 @@ async fn test_sensitive_info_command_lifecycle() {
             commands: Vec::new(),
             produce_events: Vec::new(),
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
         transport_a,
         Some(Arc::new(XacppSession::new(None))),
@@ -1674,6 +1701,7 @@ async fn test_sensitive_info_command_lifecycle() {
             commands: Vec::new(),
             produce_events: Vec::new(),
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
         transport_b,
         None,

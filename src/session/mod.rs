@@ -61,6 +61,13 @@ pub struct XacppSession {
     /// after negotiation; responder: optional, consumer-injected). Empty
     /// disables event-name validation.
     emit_events: RwLock<Vec<String>>,
+    /// Negotiated fetch availability (SPEC §8.7): `true` only when both
+    /// sides declared the fetch extension at the supported version. A
+    /// negotiated fact — initiator: backfilled by the peer at establish;
+    /// responder: consumer-injected from the negotiated effective
+    /// capabilities. Default `false`: fetch-family outbound commands fail
+    /// loudly with `fetch_unavailable` instead of reaching the wire.
+    fetch_enabled: RwLock<bool>,
     /// Wired transport (present while a connection is attached).
     transport: RwLock<Option<Arc<dyn XacppTransport>>>,
 }
@@ -77,6 +84,7 @@ impl XacppSession {
             session_id: tokio::sync::RwLock::new(String::new()),
             credentials: tokio::sync::RwLock::new(String::new()),
             emit_events: RwLock::new(Vec::new()),
+            fetch_enabled: RwLock::new(false),
             transport: RwLock::new(None),
         }
     }
@@ -96,6 +104,20 @@ impl XacppSession {
     /// negotiated effective capabilities.
     pub async fn set_emit_events(&self, emit_events: Vec<String>) {
         *self.emit_events.write().await = emit_events;
+    }
+
+    /// Sets the negotiated fetch availability (SPEC §8.7). Responder side:
+    /// the consumer injects the value from the negotiated effective
+    /// capabilities (`NegotiateHandler.on_negotiate`) — it is the negotiated
+    /// fact, not an assembly decision. Initiator side: backfilled
+    /// automatically by the peer at establish.
+    pub async fn set_fetch_enabled(&self, enabled: bool) {
+        *self.fetch_enabled.write().await = enabled;
+    }
+
+    /// Negotiated fetch availability snapshot (SPEC §8.7).
+    pub async fn fetch_enabled(&self) -> bool {
+        *self.fetch_enabled.read().await
     }
 
     /// Wires the session to a **live** transport for the connection's
@@ -208,10 +230,23 @@ impl XacppSession {
     }
 
     /// Sends a command and waits for a response.
+    ///
+    /// Fetch-family commands are gated by the negotiated fetch availability
+    /// (SPEC §8.7): while fetch is not enabled, they fail loudly with
+    /// `fetch_unavailable` (the same error shape the peer's inbound gate
+    /// answers) and never reach the wire.
     pub async fn request_command(
         &self,
         command: XacppCommand,
     ) -> Result<XacppResponse, XacppError> {
+        if command.is_fetch_family() && !*self.fetch_enabled.read().await {
+            return Err(XacppError::Application {
+                code: crate::wire::fetch::error_codes::FETCH_UNAVAILABLE.into(),
+                message:
+                    "fetch unavailable on this end (fetch extension not enabled by negotiation)"
+                        .into(),
+            });
+        }
         let transport = self.transport().await?;
         transport
             .send(
@@ -367,16 +402,18 @@ impl XacppSession {
         Ok(())
     }
 
-    /// Backfills identity + negotiated emit_events after the establish
-    /// handshake completes (initiator side; peer-internal).
+    /// Backfills identity + negotiated facts after the establish handshake
+    /// completes (initiator side; peer-internal).
     pub(crate) async fn backfill(
         &self,
         session_id: String,
         credentials: String,
         emit_events: Vec<String>,
+        fetch_enabled: bool,
     ) {
         *self.session_id.write().await = session_id;
         *self.credentials.write().await = credentials;
         *self.emit_events.write().await = emit_events;
+        *self.fetch_enabled.write().await = fetch_enabled;
     }
 }

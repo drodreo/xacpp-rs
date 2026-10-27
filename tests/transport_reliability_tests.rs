@@ -1674,6 +1674,7 @@ mod establish_topo {
             commands: vec![],
             produce_events: vec![],
             accept_events: vec![],
+            fetch_ext: None,
         }
     }
 

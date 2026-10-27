@@ -400,15 +400,22 @@ async fn connect_fixture(
     })));
     let b_slot: Arc<AsyncMutex<Option<Arc<XacppSession>>>> = Arc::new(AsyncMutex::new(None));
 
+    // Both sides declare the fetch extension (SPEC §8.7): every ext case in
+    // this file negotiates fetch enabled before exercising real transfers.
+    let fetch_caps = Capabilities {
+        fetch_ext: Some(1),
+        ..Capabilities::default()
+    };
+
     let peer_a = XacppPeer::new(
-        Capabilities::default(),
+        fetch_caps.clone(),
         ta.clone() as Arc<dyn XacppTransport>,
         Some(Arc::clone(&session_a)),
         Arc::new(AcceptNegotiate),
         Arc::new(NoEstablish),
     );
     let peer_b = XacppPeer::new(
-        Capabilities::default(),
+        fetch_caps,
         tb.clone() as Arc<dyn XacppTransport>,
         None,
         Arc::new(AcceptNegotiate),
@@ -901,10 +908,12 @@ async fn ext10_completed_replay_not_redelivered() {
 }
 
 // ===========================================================================
-// Matrix 11: fetch_unavailable gate — a peer whose session has NO fetch
-// responder loaded answers every fetch-family command with
-// `fetch_unavailable` (SPEC §8.2), loudly and without touching the consumer
-// handler. Non-fetch commands pass through untouched.
+// Matrix 11: fetch_unavailable gate — NEITHER side declares the fetch
+// extension (SPEC §8.7: absent = no support), so negotiation leaves fetch
+// disabled: the initiator's outbound gate answers `fetch_unavailable`
+// before anything reaches the wire, and the responder (whose session has
+// NO fetch responder loaded either) answers the same loudly per SPEC §8.2.
+// Non-fetch commands pass through untouched.
 // ===========================================================================
 
 /// Bare establish: the responder session runs WITHOUT the fetch extension
@@ -987,7 +996,8 @@ async fn ext11_fetch_unavailable_gate() {
     assert_eq!(err.code(), error_codes::FETCH_UNAVAILABLE);
 
     // The gate covers the whole fetch family — begin/pause/resume/abort get
-    // the same loud answer.
+    // the same loud answer. Under SPEC §8.7 the initiator-side outbound gate
+    // fails them locally (same error shape) without touching the wire.
     for cmd in [
         XacppCommand::FetchBegin {
             txid: "0".repeat(32),
@@ -1002,12 +1012,8 @@ async fn ext11_fetch_unavailable_gate() {
             txid: "0".repeat(32),
         },
     ] {
-        match timeout(session_a.request_command(cmd)).await.unwrap() {
-            XacppResponse::Error { code, .. } => {
-                assert_eq!(code, error_codes::FETCH_UNAVAILABLE)
-            }
-            other => panic!("fetch-family command must be gated, got {other:?}"),
-        }
+        let err = timeout(session_a.request_command(cmd)).await.unwrap_err();
+        assert_eq!(err.code(), error_codes::FETCH_UNAVAILABLE);
     }
 
     // Non-fetch commands are not the gate's business: they reach the

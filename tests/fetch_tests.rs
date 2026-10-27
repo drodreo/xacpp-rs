@@ -336,15 +336,21 @@ async fn connect_pair(
 
     let mut resources = HashMap::new();
     resources.insert("file:///tmp/a.png".to_string(), vec![1u8; 200_000]);
+    // Both sides declare the fetch extension (SPEC §8.7): the fetch flows in
+    // this file negotiate it enabled.
+    let fetch_caps = Capabilities {
+        fetch_ext: Some(1),
+        ..Capabilities::default()
+    };
     let peer_a = XacppPeer::new(
-        Capabilities::default(),
+        fetch_caps.clone(),
         Arc::clone(&ta),
         Some(Arc::clone(&session_a)),
         Arc::new(AcceptNegotiate),
         Arc::new(NoEstablish),
     );
     let peer_b = XacppPeer::new(
-        Capabilities::default(),
+        fetch_caps,
         tb,
         None,
         Arc::new(AcceptNegotiate),

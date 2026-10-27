@@ -167,6 +167,7 @@ fn test_command_negotiate_roundtrip() {
             commands: vec![json!({ "name": "new_activity" })],
             produce_events: vec![json!({ "name": "content_delta" })],
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
     };
 
@@ -283,6 +284,7 @@ fn test_response_negotiated_roundtrip() {
             commands: vec![json!({ "name": "new_activity" })],
             produce_events: vec![],
             accept_events: Vec::new(),
+            fetch_ext: None,
         },
     };
 

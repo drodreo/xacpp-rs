@@ -595,6 +595,7 @@ fn initiator_caps() -> Capabilities {
             .map(|n| json!({"name": n}))
             .collect(),
         accept_events: Vec::new(),
+        fetch_ext: None,
     }
 }
 
@@ -606,6 +607,7 @@ fn responder_caps() -> Capabilities {
             .into_iter()
             .map(|n| json!({"name": n}))
             .collect(),
+        fetch_ext: None,
     }
 }
 
