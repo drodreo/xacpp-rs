@@ -4,9 +4,8 @@
 //!
 //! Real TCP only: `tokio::io::duplex` dies instantly with no kernel
 //! buffer, so the egress-flush window (a dead connection's queued bytes
-//! keep arriving at the peer's reader) physically cannot occur there —
-//! see `xacpp-tcp-resume-coverage-gap.md` for the six-link deadlock chain
-//! these tests pin shut.
+//! keep arriving at the peer's reader) physically cannot occur there.
+//! These tests pin that window's deadlock chain shut.
 
 use std::sync::Arc;
 use std::time::Duration;
