@@ -38,7 +38,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-xacpp = "1.1"
+xacpp = "1.2"
 ```
 
 ### Establish a session (initiator side)
@@ -64,6 +64,8 @@ let caps = Capabilities {
     commands: vec![/* JSON Schemas this side handles */],
     produce_events: vec![],
     accept_events: vec![],
+    // Declare fetch-extension support (SPEC §8.7); omit (None) to disable fetch.
+    fetch_ext: None,
 };
 let peer = XacppPeer::new(
     caps,

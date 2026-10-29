@@ -10,16 +10,18 @@ xacpp 定义了 Agent 与对端之间的通信协议。它提供了分层架构�
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  Peer（协议层）                                                │
-│  类型化操作 + 会话路由                                          │
+│  Peer（生命周期编排，发起方）                                    │
+│  negotiate → connect → establish → disconnect                │
 ├──────────────────────────────────────────────────────────────┤
-│  Session（会话层）                                             │
-│  独立会话上下文，直达 Transport 收发                              │
+│  Session（通信门面 + 传输状态）                                  │
+│  request_command / send_event / send_binary；                 │
+│  持有 TransferSession（ACK/NACK/RESUME/心跳），                 │
+│  自行挂载到当前 transport                                       │
 ├──────────────────────────────────────────────────────────────┤
-│  Transport（传输层）                                           │
-│  信封装拆、id 关联、pending 匹配                                 │
+│  Transport（连接实体）                                         │
+│  物理 IO、二进制组帧、单一 FIFO 出口                             │
 ├──────────────────────────────────────────────────────────────┤
-│  Stdio / TCP / WebSocket                                     │
+│  Stdio / TCP                                                  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -31,62 +33,73 @@ xacpp 定义了 Agent 与对端之间的通信协议。它提供了分层架构�
 
 ```toml
 [dependencies]
-xacpp = "0.1"
+xacpp = "1.2"
 ```
 
 ### 建立会话（发起方）
 
 ```rust
 use std::sync::Arc;
-use xacpp::commands::XacppCommand;
-use xacpp::events::XacppEvent;
-use xacpp::handler::{EstablishHandler, XacppSessionHandler};
-use xacpp::message::{XacppRequest, XacppResponse};
+use xacpp::capability::Capabilities;
+use xacpp::handler::{EstablishHandler, NegotiateHandler, XacppSessionHandler};
 use xacpp::peer::XacppPeer;
-use xacpp::transport::stdio::StdioTransport;
+use xacpp::session::XacppSession;
+use xacpp::transport::socket::SocketTransport;
 use xacpp::transport::XacppTransport;
 
-// 创建 Transport + Peer
-let transport: Arc<dyn XacppTransport> = Arc::new(StdioTransport::new(/* ... */));
+// 会话持有自己的传输状态：独立于任何连接创建，随连接的建立与断开
+// 自行挂载到传输上。
+let session = Arc::new(XacppSession::new(None)); // None = TransferConfig::default()
 
-struct MyEstablishHandler;
-#[async_trait::async_trait]
-impl EstablishHandler for MyEstablishHandler {
-    async fn on_establish(
-        &self,
-        transport: Arc<dyn XacppTransport>,
-        credentials: Option<String>,
-    ) -> Result<(String, Arc<dyn XacppSessionHandler>), xacpp::error::XacppError> {
-        Ok(("session-1".into(), Arc::new(MySessionHandler)))
-    }
-}
+let transport: Arc<dyn XacppTransport> =
+    Arc::new(SocketTransport::connect_to("127.0.0.1:8080".into()));
 
-let peer = XacppPeer::new(transport, Arc::new(MyEstablishHandler));
+// Peer 编排生命周期，并在 connect 时自动挂载会话。
+let caps = Capabilities {
+    commands: vec![/* 本端可处理的 JSON Schemas */],
+    produce_events: vec![],
+    accept_events: vec![],
+    // 声明 fetch 扩展支持（SPEC §8.7）；省略（None）则禁用 fetch。
+    fetch_ext: None,
+};
+let peer = XacppPeer::new(
+    caps,
+    transport,
+    Some(Arc::clone(&session)),
+    Arc::new(MyNegotiateHandler),
+    Arc::new(MyEstablishHandler),
+);
 peer.connect().await?;
 
-// 建立逻辑会话
-let session = peer.establish(None, Arc::new(my_session_handler)).await?;
+// 建立逻辑会话（向会话填充身份/可发事件）。
+peer.establish(None, Arc::new(my_session_handler), |_| Ok(())).await?;
 
-// 通过会话发送命令/事件
-let response = session.request_command(XacppCommand::NewActivity).await?;
-session.request_event(XacppEvent::Think { content: "Hello!".into() }).await?;
+// 经会话门面发送命令/事件/二进制。
+let response = session.request_command(cmd).await?;
+session.send_event(event).await?;
+let txid = session
+    .send_binary(payload, Some(Arc::new(|result| { /* BinarySendResult */ })))
+    .await?;
 ```
 
-### 处理入站请求（响应方）
+### 处理入站连接（响应方）
 
 ```rust
-struct MySessionHandler;
+// 响应方没有 Peer：accept 连接、创建会话、重连时恢复身份，
+// 然后把会话挂载到传输上。
+let transport: Arc<dyn XacppTransport> = Arc::new(SocketTransport::new(stream));
+let session = Arc::new(
+    XacppSession::new(None)
+        .with_identity("session-1".into(), credentials),
+);
+session.wire(Arc::clone(&transport)).await?;
+session.on_binary(Arc::new(|txid, payload| { /* 消费二进制 */ }));
 
-#[async_trait::async_trait]
-impl XacppSessionHandler for MySessionHandler {
-    async fn on_command(&self, command: XacppCommand) -> Result<XacppResponse, XacppError> {
-        Ok(XacppResponse::Acknowledge)
-    }
-
-    async fn on_event(&self, event: XacppEvent) -> Result<XacppResponse, XacppError> {
-        Ok(XacppResponse::Acknowledge)
-    }
-}
+transport
+    .on_request(Arc::new(move |_sid, payload| {
+        // 对入站命令/事件返回 XacppResponse
+    }))
+    .expect("connect 之前必须注册请求处理器");
 ```
 
 ### TCP 传输（网络通信）
@@ -107,15 +120,15 @@ let server = SocketTransport::new(accepted_stream);
 
 | 类型 | 说明 |
 |------|------|
-| `XacppTransport` | 传输层 trait（`connect`、`disconnect`、`send`、`on_request`） |
-| `XacppPeer` | 协议端点，含会话路由 |
-| `XacppSession` | 逻辑会话，直达 Transport 收发 |
+| `XacppPeer` | 生命周期编排（negotiate/connect/establish/disconnect）；connect 时自动把会话挂载到传输（发起方） |
+| `XacppSession` | 通信门面（`request_command`/`send_event`/`send_binary`）；持有传输状态、跨重连存活，`wire`/`unwire` 挂载到传输 |
+| `TransferSession` | 传输事务状态机（ACK/NACK/RESUME/心跳/背压）；由 `XacppSession` 持有 |
+| `TransferConfig` | 传输调优（心跳间隔、静默超时、ACK 批量、tick） |
+| `XacppTransport` | 连接实体：物理 IO、二进制组帧、单一 FIFO 出口 |
 | `XacppSessionHandler` | 处理会话内的入站 Command/Event |
-| `EstablishHandler` | 处理 Establish 握手请求 |
-| `XacppCommand` | 协议命令（`Establish`、`NewActivity` 等） |
-| `XacppEvent` | 协议事件（Think、ActionRequest、Question 等） |
+| `NegotiateHandler` / `EstablishHandler` | 握手处理器 |
+| `XacppCommand` / `XacppEvent` | 协议命令与事件 |
 | `ActivityRef` | 命令/事件信封共用的活动标识引用 |
-| `XacppRequest` | 请求载荷（Command 或 Event） |
 | `XacppResponse` | 响应载荷（Established、Acknowledge、Action 等） |
 | `XacppError` | 错误枚举，含机器可读错误码 |
 | `PeerState` | Peer 状态枚举（Disconnected、Connected） |
@@ -124,7 +137,7 @@ let server = SocketTransport::new(accepted_stream);
 
 | 类型 | 说明 |
 |------|------|
-| `StdioTransport` | 异步 stdin/stdout JSONL 管道 |
+| `StdioTransport` | 子进程管道，二进制组帧 |
 | `SocketTransport` | TCP 传输（`TcpStream`），spawn-per-request 并发模型 |
 
 ## 线路协议
