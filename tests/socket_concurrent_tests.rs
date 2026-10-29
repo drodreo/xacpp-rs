@@ -18,19 +18,22 @@ use xacpp::wire::commands::XacppCommand;
 use xacpp::wire::error::XacppError;
 use xacpp::wire::message::{XacppRequest, XacppResponse};
 
+/// Server request handler: async closure boxed for transport-level dispatch.
+type ServerHandler = Arc<
+    dyn Fn(
+            Option<String>,
+            XacppRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<XacppResponse, XacppError>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 /// Creates a pair of SocketTransport connected via TCP (client + server).
 ///
 /// Server-side handler is specified by parameter, client handler returns acknowledge.
 async fn socket_pair(
-    server_handler: Arc<
-        dyn Fn(
-                Option<String>,
-                XacppRequest,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<XacppResponse, XacppError>> + Send>,
-            > + Send
-            + Sync,
-    >,
+    server_handler: ServerHandler,
 ) -> (Arc<dyn XacppTransport>, Arc<dyn XacppTransport>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

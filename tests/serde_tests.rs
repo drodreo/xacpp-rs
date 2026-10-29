@@ -1049,7 +1049,7 @@ fn test_fileref_deserialize_legacy_format() {
     assert_eq!(de.local_uri, "/tmp/old.png");
     assert_eq!(de.remote_expires_at, None);
     assert_eq!(de.mime_type, "image/png");
-    assert_eq!(de.require_organized, false);
+    assert!(!de.require_organized);
     assert_eq!(de.size_bytes, 512);
     assert_eq!(de.sha256, "");
 }

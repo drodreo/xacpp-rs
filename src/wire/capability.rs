@@ -77,7 +77,7 @@ impl EffectiveCapabilities {
         let remote_accept = extract_names(&remote.accept_events);
         let emit_events = local_produce
             .into_iter()
-            .filter(|name| remote_accept.contains(&name))
+            .filter(|name| remote_accept.contains(name))
             .collect();
         let remote_fetch_ext = remote.fetch_ext;
         // SPEC §8.7: fetch 启用要求双方都声明了本库支持的版本。任一方未声明、
