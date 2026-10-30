@@ -27,13 +27,13 @@
 //! is only ever locked from async contexts.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{Notify, oneshot};
 
 use crate::reliability::stream::{BinaryMeta, BinarySink, BinaryStream, StreamState};
@@ -529,29 +529,37 @@ async fn run_serving(
     let serve_uri = uri.clone();
     let mut join = tokio::spawn(async move { serve_provider.serve(&serve_uri, serve_sink).await });
     let mut aborted = false;
+
+    enum ServingEvent {
+        Control(Option<ServeControl>),
+        Done(Result<Result<(), XacppError>, tokio::task::JoinError>),
+    }
+
     loop {
-        tokio::select! {
-            ctrl = control_rx.recv() => match ctrl {
-                Some(ServeControl::Pause) => {
-                    if let Err(e) = sink.pause().await {
-                        log::warn!("fetch serving: sink pause failed (best effort): {e}");
-                    }
+        let event = tokio::select! {
+            ctrl = control_rx.recv() => ServingEvent::Control(ctrl),
+            done = &mut join => ServingEvent::Done(done),
+        };
+        match event {
+            ServingEvent::Control(Some(ServeControl::Pause)) => {
+                if let Err(e) = sink.pause().await {
+                    log::warn!("fetch serving: sink pause failed (best effort): {e}");
                 }
-                Some(ServeControl::Resume) => {
-                    if let Err(e) = sink.resume().await {
-                        log::warn!("fetch serving: sink resume failed (best effort): {e}");
-                    }
+            }
+            ServingEvent::Control(Some(ServeControl::Resume)) => {
+                if let Err(e) = sink.resume().await {
+                    log::warn!("fetch serving: sink resume failed (best effort): {e}");
                 }
-                // Abort command (or defensive channel death): kill the serve
-                // task, wait for it to release its sink reference, then abort.
-                Some(ServeControl::Abort) | None => {
-                    join.abort();
-                    let _ = join.await;
-                    aborted = true;
-                    break;
-                }
-            },
-            done = &mut join => {
+            }
+            // Abort command (or defensive channel death): kill the serve
+            // task, wait for it to release its sink reference, then abort.
+            ServingEvent::Control(Some(ServeControl::Abort)) | ServingEvent::Control(None) => {
+                join.abort();
+                let _ = join.await;
+                aborted = true;
+                break;
+            }
+            ServingEvent::Done(done) => {
                 match done {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
@@ -991,8 +999,8 @@ impl FetchProvider for BytesProvider {
 /// File resource: resolve pre-scans the file streaming (never loads it whole)
 /// for sha256+size; serve re-reads and writes in 64 KiB chunks.
 ///
-/// `tokio`'s `fs` feature is not part of this crate's dependency set, so the
-/// blocking reads run on `spawn_blocking` (std::fs handles are `Send`).
+/// Both passes go through `tokio::fs`, which runs the blocking syscalls on
+/// the blocking pool — the async runtime is never held by a file read.
 pub fn file(path: PathBuf, mime: &str) -> Arc<dyn FetchProvider> {
     Arc::new(FileProvider {
         path,
@@ -1005,40 +1013,26 @@ struct FileProvider {
     mime: String,
 }
 
-/// One blocking read pass: returns the filled prefix of `buf`.
-/// `file` moves in and out so the caller can keep reading.
-fn read_chunk_blocking(
-    mut file: std::fs::File,
-    mut buf: Vec<u8>,
-) -> std::io::Result<(std::fs::File, Vec<u8>, usize)> {
-    let n = file.read(&mut buf)?;
-    buf.truncate(n);
-    Ok((file, buf, n))
-}
-
-/// Streaming pre-scan: sha256 + byte count in one pass (spawn_blocking).
+/// Streaming pre-scan: sha256 + byte count in one pass.
 async fn prescan_file(path: &Path) -> Result<(String, u64), XacppError> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let mut file = std::fs::File::open(&path)
-            .map_err(|e| XacppError::Internal(format!("fetch file open failed: {e}")))?;
-        let mut hasher = Sha256::new();
-        let mut size: u64 = 0;
-        let mut buf = vec![0u8; CANNED_CHUNK];
-        loop {
-            let n = file
-                .read(&mut buf)
-                .map_err(|e| XacppError::Internal(format!("fetch file read failed: {e}")))?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            size += n as u64;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| XacppError::Internal(format!("fetch file open failed: {e}")))?;
+    let mut hasher = Sha256::new();
+    let mut size: u64 = 0;
+    let mut buf = vec![0u8; CANNED_CHUNK];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| XacppError::Internal(format!("fetch file read failed: {e}")))?;
+        if n == 0 {
+            break;
         }
-        Ok((format!("{:x}", hasher.finalize()), size))
-    })
-    .await
-    .map_err(|e| XacppError::Internal(format!("fetch prescan join failed: {e}")))?
+        hasher.update(&buf[..n]);
+        size += n as u64;
+    }
+    Ok((format!("{:x}", hasher.finalize()), size))
 }
 
 #[async_trait]
@@ -1053,25 +1047,19 @@ impl FetchProvider for FileProvider {
     }
 
     async fn serve(&self, _uri: &str, sink: Arc<BinarySink>) -> Result<(), XacppError> {
-        let path = self.path.clone();
-        let mut file = tokio::task::spawn_blocking(move || std::fs::File::open(&path))
+        let mut file = tokio::fs::File::open(&self.path)
             .await
-            .map_err(|e| XacppError::Internal(format!("fetch serve join failed: {e}")))?
             .map_err(|e| XacppError::Internal(format!("fetch file open failed: {e}")))?;
+        let mut buf = vec![0u8; CANNED_CHUNK];
         loop {
-            // Blocking read off the async path; the sink write itself is async
-            // (backpressure/pause park inside the kernel).
-            let (f, buf, n) = tokio::task::spawn_blocking(move || {
-                read_chunk_blocking(file, vec![0u8; CANNED_CHUNK])
-            })
-            .await
-            .map_err(|e| XacppError::Internal(format!("fetch serve join failed: {e}")))?
-            .map_err(|e| XacppError::Internal(format!("fetch file read failed: {e}")))?;
-            file = f;
+            let n = file
+                .read(&mut buf)
+                .await
+                .map_err(|e| XacppError::Internal(format!("fetch file read failed: {e}")))?;
             if n == 0 {
                 break;
             }
-            sink.write(&buf).await?;
+            sink.write(&buf[..n]).await?;
         }
         Ok(())
     }

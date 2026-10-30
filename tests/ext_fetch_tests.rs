@@ -1940,3 +1940,55 @@ async fn ext24_short_write_never_produces_an_integrity_verdict() {
         "a transaction that never completed must not produce an integrity verdict"
     );
 }
+
+// ===========================================================================
+// Boundary 25: a file that does not exist fails explicitly at resolve —
+// the tokio::fs open error surfaces as a fetch error, never a hang.
+// ===========================================================================
+
+#[tokio::test]
+async fn ext25_missing_file_fails_explicitly() {
+    let path = std::env::temp_dir().join(format!(
+        "xacpp-ext-fetch-{}-does-not-exist.bin",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let fixture = connect_fixture(canned_file(path, "application/octet-stream"), None).await;
+    let puller = FetchPuller::new(Arc::clone(&fixture.session_a)).await;
+
+    let outcome = timeout(puller.pull_to_vec("res://missing")).await;
+    assert!(
+        outcome.is_err(),
+        "a missing file must fail the pull, not hang or succeed"
+    );
+}
+
+// ===========================================================================
+// Boundary 26: two concurrent file pulls over one session keep their own
+// streams — no cross-talk, both digests verify.
+// ===========================================================================
+
+#[tokio::test]
+async fn ext26_concurrent_file_streams_stay_isolated() {
+    let data = pattern(300_000);
+    let path = temp_file("concurrent.bin", &data);
+    let fixture =
+        connect_fixture(canned_file(path.clone(), "application/octet-stream"), None).await;
+    let puller = Arc::new(FetchPuller::new(Arc::clone(&fixture.session_a)).await);
+
+    let (ra, rb) = tokio::join!(
+        timeout(puller.pull_to_vec("res://a")),
+        timeout(puller.pull_to_vec("res://b")),
+    );
+
+    let (da, ma) = ra.expect("pull a must succeed");
+    let (db, mb) = rb.expect("pull b must succeed");
+    assert_eq!(da, data, "stream a must carry the whole file");
+    assert_eq!(db, data, "stream b must carry the whole file");
+    assert_eq!(ma.sha256, mb.sha256);
+    verify(&ma, &sha256_hex(&data)).unwrap();
+    verify(&mb, &sha256_hex(&data)).unwrap();
+
+    let _ = std::fs::remove_file(&path);
+}

@@ -155,24 +155,32 @@ pub(crate) fn spawn_egress(
     let task_closed = closed_tx.clone();
     let handle = tokio::spawn(async move {
         let mut control_open = true;
+
+        enum DrainEvent {
+            Control(Option<EgressItem>),
+            Item(Option<EgressItem>),
+        }
+
         loop {
-            tokio::select! {
+            let event = tokio::select! {
                 biased;
-                control = control_rx.recv(), if control_open => match control {
-                    Some(EgressItem::Frame { frame, write_ack: _ }) => {
-                        if write_frame(&mut writer, &frame).await.is_err() {
-                            // Connection dead: fail fast everything, now and later.
-                            task_connected.store(false, Ordering::Release);
-                            task_closed.send_replace(true);
-                            pending.lock().await.clear();
-                            break;
-                        }
+                control = control_rx.recv(), if control_open => DrainEvent::Control(control),
+                item = rx.recv() => DrainEvent::Item(item),
+            };
+            match event {
+                DrainEvent::Control(Some(EgressItem::Frame { frame, write_ack: _ })) => {
+                    if write_frame(&mut writer, &frame).await.is_err() {
+                        // Connection dead: fail fast everything, now and later.
+                        task_connected.store(false, Ordering::Release);
+                        task_closed.send_replace(true);
+                        pending.lock().await.clear();
+                        break;
                     }
-                    // Never enqueued (teardown rides `tx`); defensive.
-                    Some(EgressItem::Close) => {}
-                    None => control_open = false,
-                },
-                item = rx.recv() => {
+                }
+                // Never enqueued (teardown rides `tx`); defensive.
+                DrainEvent::Control(Some(EgressItem::Close)) => {}
+                DrainEvent::Control(None) => control_open = false,
+                DrainEvent::Item(item) => {
                     let (frame, write_ack) = match item {
                         None | Some(EgressItem::Close) => break,
                         Some(EgressItem::Frame { frame, write_ack }) => (frame, write_ack),
@@ -219,4 +227,86 @@ pub(crate) fn spawn_egress(
 async fn write_frame(writer: &mut Pin<Box<dyn AsyncWrite + Send>>, frame: &[u8]) -> Result<(), ()> {
     writer.write_all(frame).await.map_err(|_| ())?;
     writer.flush().await.map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWrite, duplex};
+
+    /// Park the writer with a frame larger than the pipe buffer, queue data and
+    /// control frames behind it, then assert the control frame is drained first
+    /// — SPEC §5 performance invariant 4 (connection-level control frames take
+    /// scheduling priority over queued data frames).
+    #[tokio::test]
+    async fn control_frames_jump_queued_data_frames() {
+        const BLOCK: usize = 8192;
+        let (writer, mut reader) = duplex(1024);
+        let boxed: Pin<Box<dyn AsyncWrite + Send>> = Box::pin(writer);
+        let connected = Arc::new(AtomicBool::new(true));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (closed_tx, _closed_rx) = watch::channel(false);
+        let (egress, _handle) =
+            spawn_egress(boxed, Arc::clone(&connected), Arc::clone(&pending), closed_tx);
+
+        // Larger than the pipe buffer: the drain task parks inside write_frame.
+        egress.send_faf(vec![0xAA; BLOCK]).unwrap();
+        tokio::task::yield_now().await;
+
+        // While it is parked, queue data frames and one control frame.
+        for i in 1..=5u8 {
+            egress.send_faf(vec![i; 100]).unwrap();
+        }
+        egress.send_control(vec![0xFF; 10]).unwrap();
+
+        let mut block = vec![0u8; BLOCK];
+        reader.read_exact(&mut block).await.unwrap();
+        assert!(block.iter().all(|&b| b == 0xAA), "blocking frame comes first");
+
+        let mut ctrl = vec![0u8; 10];
+        reader.read_exact(&mut ctrl).await.unwrap();
+        assert!(
+            ctrl.iter().all(|&b| b == 0xFF),
+            "control frame must jump the queued data frames"
+        );
+
+        for i in 1..=5u8 {
+            let mut data = vec![0u8; 100];
+            reader.read_exact(&mut data).await.unwrap();
+            assert!(data.iter().all(|&b| b == i), "data frame {i} out of order");
+        }
+    }
+
+    /// A dead reader makes the next write fail: the drain task must mark the
+    /// connection dead, terminate, and reject later sends fast instead of
+    /// queueing them into a drain that no longer exists.
+    #[tokio::test]
+    async fn write_failure_marks_dead_and_rejects_later_sends() {
+        let (writer, reader) = duplex(64);
+        let boxed: Pin<Box<dyn AsyncWrite + Send>> = Box::pin(writer);
+        let connected = Arc::new(AtomicBool::new(true));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (closed_tx, _closed_rx) = watch::channel(false);
+        let (egress, handle) =
+            spawn_egress(boxed, Arc::clone(&connected), Arc::clone(&pending), closed_tx);
+
+        drop(reader);
+        let _ = egress.send_faf(vec![1u8; 1024]);
+
+        let finished = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(
+            finished.is_ok(),
+            "drain task must terminate after a write failure"
+        );
+        assert!(
+            !connected.load(Ordering::Acquire),
+            "connection must be marked dead"
+        );
+        assert!(
+            egress.send_faf(vec![2u8; 16]).is_err(),
+            "later sends must fail fast"
+        );
+    }
 }

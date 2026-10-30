@@ -58,19 +58,23 @@ pub(super) async fn run_clock(session: TransferSession, transport: Arc<dyn Xacpp
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(tick_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut closed = transport.closed();
+    let mut connection_closed = false;
     loop {
         tokio::select! {
             _ = interval.tick() => {}
-            // Connection dead (peer disconnect / write failure / local
-            // disconnect): drop the wiring side and stall the receive-side
-            // streams (docs/streams.md — the objects survive with the
-            // session), then exit — the session's transaction state
-            // survives for the next wire.
             _ = closed.changed() => {
-                session.detach_connection().await;
-                session.stall_streams().await;
-                break;
+                connection_closed = true;
             }
+        }
+        // Connection dead (peer disconnect / write failure / local
+        // disconnect): drop the wiring side and stall the receive-side
+        // streams (docs/streams.md — the objects survive with the
+        // session), then exit — the session's transaction state
+        // survives for the next wire.
+        if connection_closed {
+            session.detach_connection().await;
+            session.stall_streams().await;
+            break;
         }
         let now = now_ms();
         let silent = clock_tick(&session, transport.as_ref(), now).await;
